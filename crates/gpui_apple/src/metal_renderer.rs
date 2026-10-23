@@ -2078,6 +2078,21 @@ mod tests {
             renderer.renderer.retained_shapes[&shapes.id()].version,
             shapes.version()
         );
+
+        // The dense scene the wgpu test compares against.
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            let dense = gpui::RetainedShapes::new();
+            let (scene, (w, h)) = t::random_scene(&dense, 400, 7);
+            let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+                &mut renderer,
+                &scene,
+                gpui::size(DevicePixels(w), DevicePixels(h)),
+            )
+            .expect("render");
+            image
+                .save(std::path::Path::new(&dir).join("retained_random_metal.png"))
+                .expect("dump");
+        }
     }
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{

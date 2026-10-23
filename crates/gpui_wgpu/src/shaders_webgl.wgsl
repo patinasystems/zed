@@ -261,3 +261,23 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_transformation(&cursor),
     );
 }
+
+// Retained shapes: 13 words per record, read from the buffer's own texture
+// (bound in place of the frame's instance texture).
+fn load_retained_shape(instance_id: u32) -> RetainedShape {
+    var cursor = instance_cursor(instance_id * 13u);
+    let a = read_f32(&cursor);
+    let b = read_f32(&cursor);
+    let c = read_f32(&cursor);
+    let d = read_f32(&cursor);
+    let tx = read_f32(&cursor);
+    let ty = read_f32(&cursor);
+    let width = read_f32(&cursor);
+    let height = read_f32(&cursor);
+    let corner_radius = read_f32(&cursor);
+    let stroke_width = read_f32(&cursor);
+    let fill = read_word(&cursor);
+    let stroke = read_word(&cursor);
+    let kind = read_word(&cursor);
+    return RetainedShape(a, b, c, d, tx, ty, width, height, corner_radius, stroke_width, fill, stroke, kind);
+}

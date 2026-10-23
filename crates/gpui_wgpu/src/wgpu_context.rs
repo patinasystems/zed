@@ -202,7 +202,19 @@ impl WgpuContext {
         any(test, feature = "bench-support", feature = "test-support")
     ))]
     fn create_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
-        let instance = Self::instance(None);
+        // Windows use Vulkan or GL only; offscreen tests and benchmarks also take
+        // Metal on macOS, so the wgpu renderer can be exercised there.
+        let instance = if cfg!(target_os = "macos") {
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::GL,
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            })
+        } else {
+            Self::instance(None)
+        };
         let device_id_filter = Self::device_id_filter();
         let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
             gpui::block_on(async {
