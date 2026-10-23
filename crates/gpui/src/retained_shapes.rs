@@ -52,6 +52,19 @@ impl ShapeInstance {
     pub const RECT: u32 = 0;
     /// An ellipse inscribed in the local rectangle.
     pub const ELLIPSE: u32 = 1;
+    /// A line from (0, 0) to (`width`, 0), `stroke_width` thick with round caps,
+    /// in the stroke color.
+    pub const SEGMENT: u32 = 2;
+    /// A quadratic curve from (0, 0) through control point (`width` / 2,
+    /// `height`) to (`width`, 0), stroked like a segment (an arrow's bent body).
+    pub const ARC: u32 = 3;
+    /// A triangle (0, 0), (`width`, `height` / 2), (0, `height`): an arrowhead
+    /// pointing along +x, with fill and stroke.
+    pub const TRIANGLE: u32 = 4;
+    /// A rounded bar (radius `height` / 2, fill only) standing in for a line of
+    /// text. Drawn only while its on-screen height is inside the paint's
+    /// [text bar band](RetainedShapesPaint::text_bar_band_px).
+    pub const TEXT_BAR: u32 = 5;
     /// Not drawn; keeps its slot so ranges stay stable.
     pub const HIDDEN: u32 = 1 << 8;
     /// Drawn through the paint's layer transformation (for example a live drag).
@@ -237,6 +250,10 @@ pub struct RetainedShapesPaint {
     /// Shapes whose longer side is below this many device pixels draw as a
     /// solid quad of at least one pixel, with alpha carrying their coverage.
     pub lod_min_device_px: f32,
+    /// [`ShapeInstance::TEXT_BAR`]s draw while their height on screen, in
+    /// device pixels, is at least the first value and below the second; the
+    /// caller draws real glyphs above the band and nothing below it.
+    pub text_bar_band_px: [f32; 2],
 }
 
 impl RetainedShapesPaint {
@@ -247,6 +264,7 @@ impl RetainedShapesPaint {
             transformation,
             layer_transformation: TransformationMatrix::unit(),
             lod_min_device_px: 1.5,
+            text_bar_band_px: [4.0, 8.0],
         }
     }
 
@@ -294,7 +312,7 @@ impl RetainedShapesDraw {
             ],
             opacity: self.opacity,
             lod_min_px: self.paint.lod_min_device_px,
-            greek_band: [0.0, 0.0],
+            greek_band: self.paint.text_bar_band_px,
             layer1: m(&self.paint.layer_transformation),
             _pad: [0.0; 2],
         }
@@ -428,8 +446,83 @@ pub mod retained_shapes_test_scene {
         (scene, probes)
     }
 
-    /// A denser scene for comparing backends pixel by pixel: `n` random rects
-    /// and ellipses (rotated, stroked, translucent, some below one pixel, some on
+    /// Segment, arc, triangle and text bars (one inside the default 4-8 px band,
+    /// one above it), with probes.
+    pub fn kinds_scene(shapes: &RetainedShapes) -> (Scene, Vec<Probe>) {
+        let at = |x: f32, y: f32| [1.0, 0.0, 0.0, 1.0, x, y];
+        shapes.set_all(vec![
+            ShapeInstance {
+                transform: at(4.0, 8.0),
+                width: 40.0,
+                stroke_width: 4.0,
+                stroke: 0xffffffff,
+                kind: ShapeInstance::SEGMENT,
+                ..Default::default()
+            },
+            ShapeInstance {
+                transform: at(4.0, 20.0),
+                width: 40.0,
+                height: 16.0,
+                stroke_width: 4.0,
+                stroke: 0xff0000ff,
+                kind: ShapeInstance::ARC,
+                ..Default::default()
+            },
+            ShapeInstance {
+                transform: at(4.0, 36.0),
+                width: 20.0,
+                height: 20.0,
+                fill: 0x00ff00ff,
+                kind: ShapeInstance::TRIANGLE,
+                ..Default::default()
+            },
+            ShapeInstance {
+                transform: at(34.0, 40.0),
+                width: 24.0,
+                height: 6.0,
+                fill: 0xffff00ff,
+                kind: ShapeInstance::TEXT_BAR,
+                ..Default::default()
+            },
+            ShapeInstance {
+                transform: at(34.0, 50.0),
+                width: 24.0,
+                height: 12.0,
+                fill: 0x00ffffff,
+                kind: ShapeInstance::TEXT_BAR,
+                ..Default::default()
+            },
+        ]);
+        let full = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(RetainedShapesDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask { bounds: full },
+            shapes: shapes.clone(),
+            paint: RetainedShapesPaint::new(0..5, TransformationMatrix::unit()),
+            opacity: 1.0,
+        });
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let probes = vec![
+            probe("segment", 24, 8, [255, 255, 255, 255]),
+            probe("beside the segment", 24, 13, [0, 0, 0, 255]),
+            probe("arc apex", 24, 27, [255, 0, 0, 255]),
+            probe("inside the arc's bend", 24, 22, [0, 0, 0, 255]),
+            probe("triangle", 10, 46, [0, 255, 0, 255]),
+            probe("outside the triangle", 22, 38, [0, 0, 0, 255]),
+            probe("text bar in band", 46, 43, [255, 255, 0, 255]),
+            probe("text bar above band", 46, 56, [0, 0, 0, 255]),
+        ];
+        (scene, probes)
+    }
+
+    /// A denser scene for comparing backends pixel by pixel: `n` random shapes
+    /// of every kind (rotated, stroked, translucent, some below one pixel, some on
     /// layer 1) on a 256x256 target.
     pub fn random_scene(shapes: &RetainedShapes, n: usize, seed: u64) -> (Scene, (i32, i32)) {
         let mut state = seed | 1;
@@ -466,15 +559,19 @@ pub mod retained_shapes_test_scene {
                         0
                     },
                     stroke: stroke_rgb | 255,
-                    kind: (if unit() < 0.5 {
-                        ShapeInstance::ELLIPSE
-                    } else {
-                        ShapeInstance::RECT
-                    }) | if i % 7 == 0 {
-                        ShapeInstance::LAYER_1
-                    } else {
-                        0
-                    },
+                    kind: [
+                        ShapeInstance::RECT,
+                        ShapeInstance::ELLIPSE,
+                        ShapeInstance::SEGMENT,
+                        ShapeInstance::ARC,
+                        ShapeInstance::TRIANGLE,
+                        ShapeInstance::TEXT_BAR,
+                    ][(unit() * 5.999) as usize]
+                        | if i % 7 == 0 {
+                            ShapeInstance::LAYER_1
+                        } else {
+                            0
+                        },
                 }
             })
             .collect();

@@ -1396,6 +1396,10 @@ struct RetainedShapesUniforms {
 @group(2) @binding(0) var<uniform> retained_uniforms: RetainedShapesUniforms;
 
 const RETAINED_ELLIPSE: u32 = 1u;
+const RETAINED_SEGMENT: u32 = 2u;  // (0,0)-(width,0), stroked
+const RETAINED_ARC: u32 = 3u;      // quadratic (0,0)-(width/2,height)-(width,0), stroked
+const RETAINED_TRIANGLE: u32 = 4u; // (0,0)-(width,height/2)-(0,height)
+const RETAINED_TEXT_BAR: u32 = 5u; // a text line at low zoom; drawn inside greek_band
 const RETAINED_SOLID: u32 = 255u;
 
 struct RetainedShapeVarying {
@@ -1444,11 +1448,28 @@ fn vs_retained_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_in
     let sy = max(length(col_y), 1e-6);
 
     var kind = s.kind & 0xffu;
-    let half_stroke = s.stroke_width * 0.5;
+    if kind == RETAINED_TEXT_BAR {
+        // Text bars stand in for text only inside their device-pixel height band.
+        let height_px = s.height * sy;
+        if height_px < u.greek_band.x || height_px >= u.greek_band.y {
+            out.position = vec4<f32>(-2.0, -2.0, 0.0, 1.0);
+            return out;
+        }
+    }
+    let half_stroke = select(s.stroke_width * 0.5, 0.0, kind == RETAINED_TEXT_BAR);
     var fill = retained_unpack_rgba8(s.fill);
     let stroke = retained_unpack_rgba8(s.stroke);
-    let lo = vec2<f32>(0.0);
-    let hi = vec2<f32>(s.width, s.height);
+    if kind == RETAINED_SEGMENT || kind == RETAINED_ARC {
+        fill = vec4<f32>(0.0);
+    }
+    var lo = vec2<f32>(0.0);
+    var hi = vec2<f32>(s.width, s.height);
+    if kind == RETAINED_SEGMENT {
+        hi.y = 0.0;
+    } else if kind == RETAINED_ARC {
+        lo.y = min(0.0, 0.5 * s.height);
+        hi.y = max(0.0, 0.5 * s.height);
+    }
     let size_px = (hi - lo) * vec2<f32>(sx, sy);
     var pad: vec2<f32>;
     if max(size_px.x, size_px.y) + s.stroke_width * max(sx, sy) < u.lod_min_px {
@@ -1468,13 +1489,79 @@ fn vs_retained_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_in
     out.position = vec4<f32>(device_px / u.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     out.local = local;
     out.size = vec2<f32>(s.width, s.height);
-    out.corner_radius = min(s.corner_radius, 0.5 * min(s.width, s.height));
+    out.corner_radius = select(min(s.corner_radius, 0.5 * min(s.width, s.height)), 0.5 * s.height, kind == RETAINED_TEXT_BAR);
     out.half_stroke = half_stroke;
     out.px_per_unit = 0.5 * (sx + sy);
     out.fill = fill;
     out.stroke = stroke;
     out.kind = kind;
     return out;
+}
+
+
+fn retained_dot2(v: vec2<f32>) -> f32 {
+    return dot(v, v);
+}
+
+// Distance to the segment (0,0)-(len,0).
+fn retained_segment_distance(p: vec2<f32>, len: f32) -> f32 {
+    return length(p - vec2<f32>(clamp(p.x, 0.0, len), 0.0));
+}
+
+// Distance to the quadratic Bezier A-B-C (closed-form cubic roots, after
+// Inigo Quilez, "2D distance functions", MIT).
+fn retained_bezier_distance(pos: vec2<f32>, A: vec2<f32>, B: vec2<f32>, C: vec2<f32>) -> f32 {
+    let a = B - A;
+    let b = A - 2.0 * B + C;
+    if dot(b, b) < 1e-8 {
+        let e = C - A;
+        let h = clamp(dot(pos - A, e) / max(dot(e, e), 1e-8), 0.0, 1.0);
+        return length(pos - A - e * h);
+    }
+    let c = a * 2.0;
+    let d = A - pos;
+    let kk = 1.0 / dot(b, b);
+    let kx = kk * dot(a, b);
+    let ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
+    let kz = kk * dot(d, a);
+    let p = ky - kx * kx;
+    let p3 = p * p * p;
+    let q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+    var h = q * q + 4.0 * p3;
+    var res: f32;
+    if h >= 0.0 {
+        h = sqrt(h);
+        let x = (vec2<f32>(h, -h) - q) / 2.0;
+        let uv = sign(x) * pow(abs(x), vec2<f32>(1.0 / 3.0));
+        let t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+        res = retained_dot2(d + (c + b * t) * t);
+    } else {
+        let z = sqrt(-p);
+        let v = acos(clamp(q / (p * z * 2.0), -1.0, 1.0)) / 3.0;
+        let m = cos(v);
+        let n = sin(v) * 1.732050808;
+        let t = clamp(vec3<f32>(m + m, -n - m, n - m) * z - kx, vec3<f32>(0.0), vec3<f32>(1.0));
+        res = min(retained_dot2(d + (c + b * t.x) * t.x), retained_dot2(d + (c + b * t.y) * t.y));
+    }
+    return sqrt(res);
+}
+
+// Signed distance to the triangle p0-p1-p2 (after Inigo Quilez, MIT).
+fn retained_triangle_sdf(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>) -> f32 {
+    let e0 = p1 - p0;
+    let e1 = p2 - p1;
+    let e2 = p0 - p2;
+    let v0 = p - p0;
+    let v1 = p - p1;
+    let v2 = p - p2;
+    let pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+    let pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+    let pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+    let s = sign(e0.x * e2.y - e0.y * e2.x);
+    let d = min(min(vec2<f32>(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)),
+                    vec2<f32>(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))),
+                vec2<f32>(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+    return -sqrt(d.x) * sign(d.y);
 }
 
 fn retained_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
@@ -1524,6 +1611,12 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     var d: f32;
     if input.kind == RETAINED_ELLIPSE {
         d = retained_ellipse_sdf(p, half_size);
+    } else if input.kind == RETAINED_SEGMENT {
+        d = retained_segment_distance(input.local, input.size.x);
+    } else if input.kind == RETAINED_ARC {
+        d = retained_bezier_distance(input.local, vec2<f32>(0.0), vec2<f32>(0.5 * input.size.x, input.size.y), vec2<f32>(input.size.x, 0.0));
+    } else if input.kind == RETAINED_TRIANGLE {
+        d = retained_triangle_sdf(input.local, vec2<f32>(0.0), vec2<f32>(input.size.x, 0.5 * input.size.y), vec2<f32>(0.0, input.size.y));
     } else {
         d = retained_rect_sdf(p, half_size, input.corner_radius);
     }
