@@ -15,14 +15,15 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, RetainedShapes,
+    RetainedShapesDraw, RetainedShapesPaint, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4782,6 +4783,40 @@ impl Window {
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
+    }
+
+    /// Paint shapes from a retained buffer: `paint.range` under
+    /// `paint.transformation` (buffer space to window pixels). `bounds` is the
+    /// window area the shapes may cover; it orders the draw against other
+    /// primitives and clips it, together with the current content mask.
+    /// Nothing is uploaded unless the buffer changed since the renderer last
+    /// drew it, so moving the transformation (pan, zoom) or the layer
+    /// transformation (a drag) costs one uniform.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_retained_shapes(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shapes: &RetainedShapes,
+        mut paint: RetainedShapesPaint,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if paint.range.is_empty() {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        paint.transformation = TransformationMatrix::unit()
+            .scale(size(scale_factor, scale_factor))
+            .compose(paint.transformation);
+        let draw = RetainedShapesDraw {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: self.content_mask().scale(scale_factor),
+            shapes: shapes.clone(),
+            paint,
+            opacity: self.element_opacity(),
+        };
+        self.next_frame.scene.insert_primitive(draw);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.

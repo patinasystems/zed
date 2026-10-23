@@ -4,11 +4,13 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, RetainedShapesDraw, RetainedUpload, ScaledPixels, Scene, ShapeInstance, Size,
+    point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
+use std::collections::HashMap;
 
 use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -126,6 +128,12 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    retained_shapes_pipeline_state: metal::RenderPipelineState,
+    /// GPU copies of retained shape buffers, by buffer id.
+    retained_shapes: HashMap<u64, RetainedGpu>,
+    frame_index: u64,
+    /// Bytes of retained shape instances uploaded so far (for tests and stats).
+    retained_uploaded_bytes: u64,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -388,6 +396,15 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let retained_shapes_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "retained_shapes",
+            "retained_shape_vertex",
+            "retained_shape_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
@@ -427,6 +444,10 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            retained_shapes_pipeline_state,
+            retained_shapes: HashMap::new(),
+            frame_index: 0,
+            retained_uploaded_bytes: 0,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -542,6 +563,7 @@ impl MetalRenderer {
             return;
         };
 
+        let encode_started = std::time::Instant::now();
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -558,6 +580,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        retained_stats::record_encode(encode_started.elapsed().as_secs_f64() * 1e3);
     }
 
     fn render_frame(
@@ -593,9 +616,20 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
-        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+        let block = RcBlock::new(move |command_buffer: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            if retained_stats::enabled() {
+                // SAFETY: Metal passes the completed command buffer.
+                let (start, end): (f64, f64) = unsafe {
+                    let cb = command_buffer.as_ref();
+                    (
+                        objc2::msg_send![cb, GPUStartTime],
+                        objc2::msg_send![cb, GPUEndTime],
+                    )
+                };
+                retained_stats::record_gpu((end - start) * 1e3);
             }
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
@@ -748,6 +782,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
+        self.sync_retained_shapes(scene, writer, command_buffer)?;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -820,6 +855,11 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::RetainedShapes(range) => self.draw_retained_shapes(
+                    &scene.retained_shapes[range],
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -827,6 +867,146 @@ impl MetalRenderer {
         command_encoder.end_encoding();
 
         Ok(command_buffer.to_owned())
+    }
+
+    /// Bring each retained buffer drawn this frame up to date: changed ranges are
+    /// staged in this frame's instance buffer and blitted into the retained GPU
+    /// buffer, ordered before the render pass on the GPU timeline, so frames still
+    /// in flight never see a half-written buffer.
+    fn sync_retained_shapes(
+        &mut self,
+        scene: &Scene,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        self.frame_index += 1;
+        if scene.retained_shapes.is_empty() {
+            return Ok(());
+        }
+        let mut blit: Option<&metal::BlitCommandEncoderRef> = None;
+        let mut uploaded = 0usize;
+        for draw in &scene.retained_shapes {
+            let id = draw.shapes.id();
+            let frame = self.frame_index;
+            let entry = self
+                .retained_shapes
+                .entry(id)
+                .or_insert_with(|| RetainedGpu {
+                    buffer: None,
+                    capacity: 0,
+                    len: 0,
+                    version: 0,
+                    last_frame: frame,
+                });
+            if entry.last_frame == frame && entry.version != 0 {
+                continue;
+            }
+            entry.last_frame = frame;
+            let mut result: Result<()> = Ok(());
+            let device = &self.device;
+            let version = draw.shapes.sync(entry.version, |upload| {
+                let (data, ranges): (&[ShapeInstance], Vec<std::ops::Range<usize>>) = match upload {
+                    RetainedUpload::None => return,
+                    RetainedUpload::All(data) => (data, vec![0..data.len()]),
+                    RetainedUpload::Ranges(data, ranges) => (data, ranges.to_vec()),
+                };
+                entry.len = data.len();
+                let bytes = mem::size_of_val(data);
+                if bytes == 0 {
+                    return;
+                }
+                if entry.capacity < bytes {
+                    // Grow (by half again) and copy everything into the new buffer.
+                    let capacity = (bytes + bytes / 2).next_multiple_of(4096);
+                    entry.buffer = Some(
+                        device.new_buffer(capacity as u64, MTLResourceOptions::StorageModePrivate),
+                    );
+                    entry.capacity = capacity;
+                    return copy_ranges(
+                        writer,
+                        command_buffer,
+                        &mut blit,
+                        entry,
+                        data,
+                        &[0..data.len()],
+                        &mut uploaded,
+                        &mut result,
+                    );
+                }
+                copy_ranges(
+                    writer,
+                    command_buffer,
+                    &mut blit,
+                    entry,
+                    data,
+                    &ranges,
+                    &mut uploaded,
+                    &mut result,
+                );
+            });
+            if let Err(error) = result {
+                // The copy is incomplete: upload everything next time.
+                entry.version = 0;
+                if let Some(blit) = blit {
+                    blit.end_encoding();
+                }
+                return Err(error);
+            }
+            entry.version = version;
+        }
+        if let Some(blit) = blit {
+            blit.end_encoding();
+        }
+        // Drop GPU copies not drawn for a while (their buffers were dropped or hidden).
+        let frame = self.frame_index;
+        self.retained_shapes
+            .retain(|_, e| frame - e.last_frame < 600);
+        self.retained_uploaded_bytes += uploaded as u64;
+        retained_stats::record_upload(uploaded);
+        Ok(())
+    }
+
+    fn draw_retained_shapes(
+        &self,
+        draws: &[RetainedShapesDraw],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        command_encoder.set_render_pipeline_state(&self.retained_shapes_pipeline_state);
+        command_encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        for draw in draws {
+            let Some(gpu) = self.retained_shapes.get(&draw.shapes.id()) else {
+                continue;
+            };
+            let Some(buffer) = &gpu.buffer else {
+                continue;
+            };
+            let count = gpu.len as u32;
+            let range = draw.paint.range.start.min(count)..draw.paint.range.end.min(count);
+            if range.is_empty() {
+                continue;
+            }
+            let uniforms =
+                draw.uniforms([viewport_size.width.0 as f32, viewport_size.height.0 as f32]);
+            command_encoder.set_vertex_buffer(1, Some(buffer), 0);
+            command_encoder.set_vertex_bytes(
+                2,
+                mem::size_of_val(&uniforms) as u64,
+                &uniforms as *const gpui::RetainedShapesUniforms as *const _,
+            );
+            command_encoder.set_fragment_bytes(
+                2,
+                mem::size_of_val(&uniforms) as u64,
+                &uniforms as *const gpui::RetainedShapesUniforms as *const _,
+            );
+            command_encoder.draw_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                range.len() as u64,
+                range.start as u64,
+            );
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -1728,6 +1908,177 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frame cost of 100k retained shapes under a moving camera, offscreen at
+    /// 2800x1800: CPU to encode, GPU time, and bytes uploaded after the first
+    /// frame. `cargo test -p gpui_apple --release --lib retained_shapes_100k -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn retained_shapes_100k_frame_cost() {
+        use gpui::{RetainedShapes, RetainedShapesDraw, RetainedShapesPaint, TransformationMatrix};
+        let n: usize = std::env::var("RETAINED_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let cols = ((n as f32 * 1.6).sqrt().ceil() as usize).max(1);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let instances: Vec<ShapeInstance> = (0..n)
+            .map(|i| {
+                let angle = if unit() < 0.15 {
+                    (unit() - 0.5) * 1.2
+                } else {
+                    0.0
+                };
+                let (s, c) = angle.sin_cos();
+                ShapeInstance {
+                    transform: [
+                        c,
+                        s,
+                        -s,
+                        c,
+                        (i % cols) as f32 * 64.0,
+                        (i / cols) as f32 * 64.0,
+                    ],
+                    width: 24.0 + unit() * 30.0,
+                    height: 20.0 + unit() * 30.0,
+                    corner_radius: if i % 7 == 0 { 6.0 } else { 0.0 },
+                    stroke_width: 2.0,
+                    fill: if unit() < 0.25 { 0x569cff5a } else { 0 },
+                    stroke: 0xa78bfaff,
+                    kind: if unit() < 0.45 {
+                        ShapeInstance::ELLIPSE
+                    } else {
+                        ShapeInstance::RECT
+                    },
+                }
+            })
+            .collect();
+        let shapes = RetainedShapes::new();
+        shapes.set_all(instances);
+        let (w, h) = (2800, 1800);
+        let page_w = cols as f32 * 64.0;
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(w as u64);
+        descriptor.set_height(h as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let texture = renderer.device.new_texture(&descriptor);
+        let size = size(DevicePixels(w), DevicePixels(h));
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            gpui::size(ScaledPixels(w as f32), ScaledPixels(h as f32)),
+        );
+        let (mut scene_ms, mut encode_ms, mut gpu_ms) = (vec![], vec![], vec![]);
+        let mut uploaded_after_first = 0;
+        for frame in 0..240 {
+            let t = frame as f32 / 60.0;
+            let z = w as f32 / page_w * (1.0 + 1.5 * (0.5 + 0.5 * t.sin()));
+            let camera = TransformationMatrix {
+                rotation_scale: [[z, 0.0], [0.0, z]],
+                translation: [-(t * 37.0) % 500.0, -(t * 23.0) % 300.0],
+            };
+            let started = std::time::Instant::now();
+            let mut scene = Scene::default();
+            scene.insert_primitive(RetainedShapesDraw {
+                order: 0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                shapes: shapes.clone(),
+                paint: RetainedShapesPaint::new(0..n as u32, camera),
+                opacity: 1.0,
+            });
+            scene.finish();
+            let scene_done = started.elapsed();
+            let before = renderer.retained_uploaded_bytes;
+            objc2::rc::autoreleasepool(|_| {
+                let started = std::time::Instant::now();
+                let mut writer = InstanceBufferWriter::new(
+                    &renderer.device,
+                    &renderer.instance_buffer_pool,
+                    renderer.is_unified_memory,
+                );
+                let bindings = write_instances(&scene, &mut writer).unwrap();
+                let cb = renderer
+                    .draw_primitives_to_texture(&scene, &bindings, &mut writer, &texture, size)
+                    .unwrap();
+                let encoded = started.elapsed();
+                cb.commit();
+                cb.wait_until_completed();
+                let (start, end): (f64, f64) = unsafe {
+                    let cb = &*(cb.as_ptr() as *const AnyObject);
+                    (
+                        objc2::msg_send![cb, GPUStartTime],
+                        objc2::msg_send![cb, GPUEndTime],
+                    )
+                };
+                drop(writer);
+                if frame >= 20 {
+                    scene_ms.push(scene_done.as_secs_f64() * 1e3);
+                    encode_ms.push(encoded.as_secs_f64() * 1e3);
+                    gpu_ms.push((end - start) * 1e3);
+                }
+            });
+            if frame > 0 {
+                uploaded_after_first += renderer.retained_uploaded_bytes - before;
+            }
+        }
+        let q = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+        };
+        println!(
+            "RETAINED_100K n {n} target {w}x{h} scene_build_ms p50 {:.3} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} first_upload_bytes {} later_upload_bytes {uploaded_after_first}",
+            q(&mut scene_ms, 0.5),
+            q(&mut encode_ms, 0.5),
+            q(&mut encode_ms, 0.95),
+            q(&mut gpu_ms, 0.5),
+            q(&mut gpu_ms, 0.95),
+            n * mem::size_of::<ShapeInstance>(),
+        );
+        assert_eq!(uploaded_after_first, 0, "pan frames must upload nothing");
+    }
+
+    #[test]
+    fn retained_shapes_render_and_upload_only_changes() {
+        use gpui::retained_shapes_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let shapes = gpui::RetainedShapes::new();
+        let (scene, probes) = t::scene(&shapes);
+        let size = size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1));
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("retained_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        let gpu = &renderer.renderer.retained_shapes[&shapes.id()];
+        assert_eq!((gpu.len, gpu.version), (5, shapes.version()));
+
+        // A range write: the next frame shows it.
+        let mut red = t::instances()[0];
+        red.fill = 0x0000ffff;
+        shapes.write(0, &[red]);
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        assert_eq!(image.get_pixel(16, 16).0, [0, 0, 255, 255]);
+        assert_eq!(
+            renderer.renderer.retained_shapes[&shapes.id()].version,
+            shapes.version()
+        );
+    }
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
         CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
@@ -1798,5 +2149,115 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+}
+
+/// A retained shape buffer's GPU copy.
+struct RetainedGpu {
+    buffer: Option<metal::Buffer>,
+    capacity: usize,
+    /// Instances in the GPU copy.
+    len: usize,
+    version: u64,
+    last_frame: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_ranges<'a>(
+    writer: &mut InstanceBufferWriter,
+    command_buffer: &'a metal::CommandBufferRef,
+    blit: &mut Option<&'a metal::BlitCommandEncoderRef>,
+    entry: &RetainedGpu,
+    data: &[ShapeInstance],
+    ranges: &[std::ops::Range<usize>],
+    uploaded: &mut usize,
+    result: &mut Result<()>,
+) {
+    let stride = mem::size_of::<ShapeInstance>();
+    let Some(dst) = &entry.buffer else { return };
+    let encoder = *blit.get_or_insert_with(|| command_buffer.new_blit_command_encoder());
+    for range in ranges {
+        let range = range.start.min(data.len())..range.end.min(data.len());
+        if range.is_empty() {
+            continue;
+        }
+        let staged = match writer.write(&data[range.clone()]) {
+            Ok(b) => b,
+            Err(e) => {
+                *result = Err(e);
+                return;
+            }
+        };
+        encoder.copy_from_buffer(
+            &staged.buffer,
+            staged.offset as u64,
+            dst,
+            (range.start * stride) as u64,
+            (range.len() * stride) as u64,
+        );
+        *uploaded += range.len() * stride;
+    }
+}
+
+/// Opt-in frame statistics for retained shapes (`GPUI_RETAINED_SHAPES_STATS=1`):
+/// every 120 frames, stderr gets CPU encode time, GPU time and bytes uploaded.
+mod retained_stats {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+
+    #[derive(Default)]
+    struct Stats {
+        encode: Vec<f64>,
+        gpu: Vec<f64>,
+        uploaded: Vec<usize>,
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("GPUI_RETAINED_SHAPES_STATS").is_some())
+    }
+
+    fn with(f: impl FnOnce(&mut Stats)) {
+        if enabled() {
+            f(STATS.lock().get_or_insert_with(Stats::default));
+        }
+    }
+
+    pub fn record_upload(bytes: usize) {
+        with(|s| s.uploaded.push(bytes));
+    }
+
+    pub fn record_gpu(ms: f64) {
+        with(|s| s.gpu.push(ms));
+    }
+
+    pub fn record_encode(ms: f64) {
+        with(|s| {
+            s.encode.push(ms);
+            if s.encode.len() >= 120 {
+                let q = |v: &mut Vec<f64>, p: f64| {
+                    if v.is_empty() {
+                        return 0.0;
+                    }
+                    v.sort_by(f64::total_cmp);
+                    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+                };
+                let uploads = s.uploaded.iter().filter(|b| **b > 0).count();
+                let bytes: usize = s.uploaded.iter().sum();
+                eprintln!(
+                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {}",
+                    s.encode.len(),
+                    q(&mut s.encode, 0.5),
+                    q(&mut s.encode, 0.95),
+                    q(&mut s.gpu, 0.5),
+                    q(&mut s.gpu, 0.95),
+                    uploads,
+                    bytes
+                );
+                *s = Stats::default();
+            }
+        });
     }
 }
