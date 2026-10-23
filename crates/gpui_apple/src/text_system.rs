@@ -17,8 +17,8 @@ use core_text::{
     font::CTFont,
     font_collection::CTFontCollectionRef,
     font_descriptor::{
-        CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
-        kCTFontWidthTrait,
+        CTFontDescriptor, kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait,
+        kCTFontWeightTrait, kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -26,7 +26,6 @@ use core_text::{
 use font_kit::{
     font::Font as FontKitFont,
     handle::Handle,
-    hinting::HintingOptions,
     metrics::Metrics,
     properties::{Style as FontkitStyle, Weight as FontkitWeight},
     source::SystemSource,
@@ -427,15 +426,26 @@ impl AppleTextSystemState {
     }
 
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        let font = &self.fonts[params.font_id.0];
+        // Measure the glyph with a font at the size `rasterize_glyph` draws it at. Fonts with
+        // optical sizes, such as the system font, change their outlines with the point size, so
+        // bounds measured at another size and scaled can be too small and clip the glyph.
+        let font = self.fonts[params.font_id.0]
+            .native_font()
+            .clone_with_font_size(f32::from(params.font_size) as CGFloat);
+        let rect = font.get_bounding_rects_for_glyphs(
+            kCTFontOrientationDefault,
+            &[params.glyph_id.0 as CGGlyph],
+        );
+        // Core Text's y axis points up; raster bounds have their origin at the top left.
+        let rect = RectF::new(
+            Vector2F::new(
+                rect.origin.x as f32,
+                -(rect.origin.y + rect.size.height) as f32,
+            ),
+            Vector2F::new(rect.size.width as f32, rect.size.height as f32),
+        );
         let scale = Transform2F::from_scale(params.scale_factor);
-        let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
-            params.glyph_id.0,
-            params.font_size.into(),
-            scale,
-            HintingOptions::None,
-            font_kit::canvas::RasterizationOptions::GrayscaleAa,
-        )?);
+        let bounds = bounds_from_rect_i((scale * rect).round_out().to_i32());
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
         Ok(bounds.dilate(DevicePixels(1)))
@@ -775,7 +785,10 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::AppleTextSystem;
-    use gpui::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem,
+        RenderGlyphParams, font, point, px,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -932,5 +945,58 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_raster_bounds_contain_glyph_at_every_font_size() {
+        let fonts = AppleTextSystem::new();
+        // The system font has optical sizes: its outlines differ between point sizes.
+        let font_id = fonts.font_id(&font(".SystemUIFont")).unwrap();
+        let margin = 16;
+        for ch in ['o', 'e', 't', 'n', 'g', 'W'] {
+            let glyph_id = fonts.glyph_for_char(font_id, ch).unwrap();
+            for font_size in [9., 12., 16., 24., 48., 96.] {
+                for scale_factor in [1., 2., 8., 32.] {
+                    for subpixel_variant in [point(0, 0), point(3, 0)] {
+                        let params = RenderGlyphParams {
+                            font_id,
+                            glyph_id,
+                            font_size: px(font_size),
+                            subpixel_variant,
+                            scale_factor,
+                            is_emoji: false,
+                            subpixel_rendering: false,
+                            dilation: 0,
+                        };
+                        let bounds = fonts.glyph_raster_bounds(&params).unwrap();
+                        let (size, _) = fonts.rasterize_glyph(&params, bounds).unwrap();
+                        // Rasterize again with room to spare and look for ink outside the
+                        // part of the canvas the raster bounds cover.
+                        let (canvas_size, alpha) = fonts
+                            .rasterize_glyph(&params, bounds.dilate(DevicePixels(margin)))
+                            .unwrap();
+                        let canvas_width = canvas_size.width.0 as usize;
+                        let inside = Bounds::new(
+                            point(margin as usize, margin as usize),
+                            gpui::size(size.width.0 as usize, size.height.0 as usize),
+                        );
+                        let clipped = alpha
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, &a)| {
+                                a > 0
+                                    && !inside.contains(&point(i % canvas_width, i / canvas_width))
+                            })
+                            .count();
+                        assert_eq!(
+                            clipped, 0,
+                            "{ch:?} at {font_size}pt, scale {scale_factor}, \
+                             subpixel variant {subpixel_variant:?}: \
+                             inked pixels outside the raster bounds {bounds:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
