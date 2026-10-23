@@ -3082,7 +3082,7 @@ impl From<usize> for DevicePixels {
 /// a single logical pixel may correspond to multiple physical pixels. By using `ScaledPixels`,
 /// dimensions and positions can be specified in a way that scales appropriately across different
 /// display resolutions.
-#[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, PartialEq)]
+#[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, Neg, PartialEq)]
 #[repr(transparent)]
 pub struct ScaledPixels(pub f32);
 

@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    SharedString, StrikethroughStyle, TextAlign, TransformationMatrix, UnderlineStyle, Window,
+    WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -150,9 +150,44 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            TransformationMatrix::unit(),
             window,
             cx,
             &mut paint_underline,
+        )
+    }
+
+    /// Paint the line of text to the window, applying `transformation` to the line as a unit.
+    ///
+    /// Glyphs are laid out exactly as [`ShapedLine::paint`] lays them out, then every glyph
+    /// sprite is transformed by the same matrix. `transformation` maps window coordinates in
+    /// device pixels to window coordinates in device pixels; see
+    /// [`Window::paint_glyph_with_transformation`] for how to build a rotation about a point.
+    ///
+    /// Underlines and strikethroughs are not painted when `transformation` is not the identity,
+    /// because those primitives cannot be transformed yet.
+    pub fn paint_with_transformation(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        transformation: TransformationMatrix,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line(
+            origin,
+            &self.layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &[],
+            transformation,
+            window,
+            cx,
+            &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
         )
     }
 
@@ -403,6 +438,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            TransformationMatrix::unit(),
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -479,6 +515,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            TransformationMatrix::unit(),
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -526,6 +563,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    transformation: TransformationMatrix,
     window: &mut Window,
     cx: &mut App,
     paint_underline: &mut dyn FnMut(
@@ -544,7 +582,18 @@ fn paint_line(
         align_width,
         wrap_boundaries,
     );
-    window.paint_layer(line_bounds, |window| {
+    let is_transformed = transformation != TransformationMatrix::unit();
+    let scale_factor = window.scale_factor();
+    let transform_bounds = |bounds: Bounds<Pixels>| {
+        if is_transformed {
+            transformation
+                .transform_bounds(bounds.scale(scale_factor))
+                .map(|value| px(value.0 / scale_factor))
+        } else {
+            bounds
+        }
+    };
+    window.paint_layer(transform_bounds(line_bounds), |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
@@ -656,7 +705,9 @@ fn paint_line(
                                 underline_range.end = style_run_start + style_run.len as usize;
                             }
                         }
-                        if let Some(run_underline) = style_run.underline.as_ref() {
+                        if let Some(run_underline) = style_run.underline.as_ref()
+                            && !is_transformed
+                        {
                             current_underline.get_or_insert((
                                 point(glyph_origin.x, glyph_origin.y + underline_y_offset),
                                 UnderlineStyle {
@@ -672,7 +723,9 @@ fn paint_line(
                         {
                             finished_strikethrough = current_strikethrough.take();
                         }
-                        if let Some(run_strikethrough) = style_run.strikethrough.as_ref() {
+                        if let Some(run_strikethrough) = style_run.strikethrough.as_ref()
+                            && !is_transformed
+                        {
                             current_strikethrough.get_or_insert((
                                 point(
                                     glyph_origin.x,
@@ -729,22 +782,24 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if transform_bounds(max_glyph_bounds).intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji(
+                        window.paint_emoji_with_transformation(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
+                            transformation,
                         )?;
                     } else {
-                        window.paint_glyph(
+                        window.paint_glyph_with_transformation(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                             color,
+                            transformation,
                         )?;
                     }
                 }
@@ -1113,6 +1168,55 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_paint_with_transformation_skips_decorations(cx: &mut TestAppContext) {
+        test_underline_handler_at_scales(cx, |window, cx| {
+            let decoration = DecorationRun {
+                len: 3,
+                color: black(),
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: None,
+                }),
+            };
+            let line = underline_test_line("abc", &[decoration], false, window);
+            let origin = point(px(20.), px(30.));
+            let line_height = px(20.);
+            let paint = |transformation, window: &mut Window, cx: &mut App| {
+                window.next_frame.scene.clear();
+                line.paint_with_transformation(
+                    origin,
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    transformation,
+                    window,
+                    cx,
+                )
+                .unwrap();
+                let underline_count = window.next_frame.scene.underlines.len();
+                window.next_frame.scene.clear();
+                underline_count
+            };
+
+            // One underline and one strikethrough.
+            assert_eq!(paint(TransformationMatrix::unit(), window, cx), 2);
+
+            let pivot = origin.scale(window.scale_factor());
+            let rotation = TransformationMatrix::unit()
+                .translate(pivot)
+                .rotate(crate::radians(0.5))
+                .translate(-pivot);
+            assert_eq!(paint(rotation, window, cx), 0);
+        });
+    }
+
+    #[gpui::test]
     fn test_underline_handler_matches_default_paint(cx: &mut TestAppContext) {
         test_underline_handler_at_scales(cx, |window, cx| {
             let first_style = UnderlineStyle {
@@ -1396,6 +1500,7 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    TransformationMatrix::unit(),
                     window,
                     cx,
                     &mut |range, origin, width, style, window| {
