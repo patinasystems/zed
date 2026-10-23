@@ -1284,3 +1284,171 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// ---- Retained shapes (instanced SDF rectangles and ellipses) ----
+//
+// Layouts match `ShapeInstance` and `RetainedShapesUniforms` in
+// gpui/src/retained_shapes.rs. Instances live in a retained GPU buffer; only the
+// per-draw uniforms (buffer space -> device pixels) change while panning.
+
+struct RetainedShape {
+  float a, b, c, d, tx, ty; // local -> buffer space: x' = a x + c y + tx
+  float width, height;
+  float corner_radius;
+  float stroke_width;
+  uint fill;   // 0xRRGGBBAA
+  uint stroke; // 0xRRGGBBAA
+  uint kind;   // low byte: 0 rect, 1 ellipse; bit 8 hidden
+};
+
+struct RetainedShapesUniforms {
+  float m00, m01, m10, m11, mtx, mty; // buffer space -> device px, row-major
+  float2 viewport_size;
+  float4 content_mask; // x, y, w, h (device px)
+  float opacity;
+  float lod_min_px;
+  float2 _pad;
+  float l00, l01, l10, l11, ltx, lty; // layer 1, buffer space, row-major
+  float2 _pad2;
+};
+
+struct RetainedShapeVarying {
+  float4 position [[position]];
+  float2 local;            // shape-local point, origin at the shape's center
+  float2 half_size [[flat]];
+  float corner_radius [[flat]];
+  float half_stroke [[flat]];   // local units
+  float px_per_unit [[flat]];
+  float4 fill [[flat]];
+  float4 stroke [[flat]];
+  uint kind [[flat]];      // 0 rect, 1 ellipse, 2 greeked (solid)
+};
+
+RetainedShapeVarying retained_shape_emit(RetainedShape s, float2 unit, float2 col_x, float2 col_y,
+                                         float2 origin, constant RetainedShapesUniforms *u);
+
+float4 unpack_rgba8(uint c) {
+  return float4(float((c >> 24) & 0xff), float((c >> 16) & 0xff),
+                float((c >> 8) & 0xff), float(c & 0xff)) / 255.0;
+}
+
+vertex RetainedShapeVarying retained_shape_vertex(
+    uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    const device RetainedShape *shapes [[buffer(1)]],
+    constant RetainedShapesUniforms *u [[buffer(2)]]) {
+  RetainedShape s = shapes[instance_id];
+  RetainedShapeVarying out;
+  if ((s.kind & 0x100u) != 0u) {
+    out.position = float4(-2.0, -2.0, 0.0, 1.0); // degenerate: culled
+    return out;
+  }
+  float2 unit = unit_vertices[vertex_id];
+  // Combined local -> device: U * S.
+  float2 ux = float2(u->m00, u->m10);
+  float2 uy = float2(u->m01, u->m11);
+  if (((s.kind >> 16) & 0xffu) == 1u) {
+    // Layer 1 (a live drag): U = U * L.
+    float2 lx = float2(u->l00, u->l10);
+    float2 ly = float2(u->l01, u->l11);
+    float2 lt = float2(u->ltx, u->lty);
+    float2 nx = ux * lx.x + uy * lx.y;
+    float2 ny = ux * ly.x + uy * ly.y;
+    float2 nt = ux * lt.x + uy * lt.y;
+    ux = nx;
+    uy = ny;
+    float2 base = nt;
+    float2 col_x = ux * s.a + uy * s.b;
+    float2 col_y = ux * s.c + uy * s.d;
+    return retained_shape_emit(s, unit, col_x, col_y, ux * s.tx + uy * s.ty + base + float2(u->mtx, u->mty), u);
+  }
+  float2 col_x = ux * s.a + uy * s.b;
+  float2 col_y = ux * s.c + uy * s.d;
+  float2 origin = ux * s.tx + uy * s.ty + float2(u->mtx, u->mty);
+  return retained_shape_emit(s, unit, col_x, col_y, origin, u);
+}
+
+RetainedShapeVarying retained_shape_emit(RetainedShape s, float2 unit, float2 col_x, float2 col_y,
+                                         float2 origin, constant RetainedShapesUniforms *u) {
+  RetainedShapeVarying out;
+  float sx = max(length(col_x), 1e-6);
+  float sy = max(length(col_y), 1e-6);
+  float2 half_size = float2(s.width, s.height) * 0.5;
+  float half_stroke = s.stroke_width * 0.5;
+  float4 fill = unpack_rgba8(s.fill);
+  float4 stroke = unpack_rgba8(s.stroke);
+  uint kind = s.kind & 0xffu;
+  float extent_px = max((s.width + s.stroke_width) * sx, (s.height + s.stroke_width) * sy);
+  float2 pad;
+  if (extent_px < u->lod_min_px) {
+    // Level of detail: a tiny shape becomes a solid quad of at least one
+    // pixel whose alpha carries its coverage.
+    kind = 2u;
+    float4 dominant = fill.a > 0.0 ? fill : stroke;
+    float area = (s.width * sx) * (s.height * sy);
+    dominant.a *= clamp(area, 0.25, 1.0);
+    fill = dominant;
+    pad = max(float2(0.0), (float2(1.0) - float2(s.width * sx, s.height * sy)) * 0.5) / float2(sx, sy);
+  } else {
+    // Room for the stroke and one pixel of antialiasing.
+    pad = float2(half_stroke) + float2(1.0 / sx, 1.0 / sy);
+  }
+  float2 local = mix(-half_size - pad, half_size + pad, unit);
+  float2 center = half_size; // shape-local center
+  float2 device_px = origin + col_x * (local.x + center.x) + col_y * (local.y + center.y);
+  float2 ndc = device_px / u->viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+  out.position = float4(ndc, 0.0, 1.0);
+  out.local = local;
+  out.half_size = half_size;
+  out.corner_radius = min(s.corner_radius, min(half_size.x, half_size.y));
+  out.half_stroke = half_stroke;
+  out.px_per_unit = 0.5 * (sx + sy);
+  out.fill = fill;
+  out.stroke = stroke;
+  out.kind = kind;
+  return out;
+}
+
+float retained_rect_sdf(float2 p, float2 half_size, float radius) {
+  float2 q = abs(p) - half_size + radius;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+// Approximate distance to an ellipse (first-order: implicit value over its gradient).
+float retained_ellipse_sdf(float2 p, float2 r) {
+  r = max(r, float2(1e-4));
+  float k0 = length(p / r);
+  float k1 = length(p / (r * r));
+  return k1 > 0.0 ? k0 * (k0 - 1.0) / k1 : -min(r.x, r.y);
+}
+
+fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
+                                        constant RetainedShapesUniforms *u [[buffer(2)]]) {
+  float4 mask = u->content_mask;
+  float2 pos = in.position.xy;
+  if (pos.x < mask.x || pos.y < mask.y || pos.x > mask.x + mask.z || pos.y > mask.y + mask.w) {
+    discard_fragment();
+  }
+  if (in.kind == 2u) {
+    return float4(in.fill.rgb, in.fill.a * u->opacity);
+  }
+  float d = in.kind == 1u ? retained_ellipse_sdf(in.local, in.half_size)
+                          : retained_rect_sdf(in.local, in.half_size, in.corner_radius);
+  float d_px = d * in.px_per_unit;
+  float fill_cov = clamp(0.5 - d_px, 0.0, 1.0);
+  float half_stroke_px = in.half_stroke * in.px_per_unit;
+  // Hairlines below one pixel keep one pixel of width and fade by their width.
+  float stroke_cov = 0.0;
+  if (in.half_stroke > 0.0) {
+    float w = max(half_stroke_px, 0.5);
+    stroke_cov = clamp(w + 0.5 - abs(d_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
+  }
+  float fa = in.fill.a * fill_cov;
+  float sa = in.stroke.a * stroke_cov;
+  float a = sa + fa * (1.0 - sa);
+  if (a <= 0.0) {
+    discard_fragment();
+  }
+  float3 rgb = (in.stroke.rgb * sa + in.fill.rgb * fa * (1.0 - sa)) / a;
+  return float4(rgb, a * u->opacity);
+}

@@ -4,8 +4,10 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, RetainedShapesDraw, RetainedShapesUniforms, RetainedUpload, ScaledPixels,
+    Scene, ShapeInstance, Size, point, size,
 };
+use std::collections::HashMap;
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
@@ -126,6 +128,10 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    retained_shapes_pipeline_state: metal::RenderPipelineState,
+    /// GPU copies of retained shape buffers, by buffer id.
+    retained_shapes: HashMap<u64, RetainedGpu>,
+    frame_index: u64,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -388,6 +394,15 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let retained_shapes_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "retained_shapes",
+            "retained_shape_vertex",
+            "retained_shape_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
@@ -427,6 +442,9 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            retained_shapes_pipeline_state,
+            retained_shapes: HashMap::new(),
+            frame_index: 0,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -542,6 +560,7 @@ impl MetalRenderer {
             return;
         };
 
+        let encode_started = std::time::Instant::now();
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -558,6 +577,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        retained_stats::record_encode(encode_started.elapsed().as_secs_f64() * 1e3);
     }
 
     fn render_frame(
@@ -593,9 +613,17 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
-        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+        let block = RcBlock::new(move |command_buffer: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            if retained_stats::enabled() {
+                // SAFETY: Metal passes the completed command buffer.
+                let (start, end): (f64, f64) = unsafe {
+                    let cb = command_buffer.as_ref();
+                    (objc2::msg_send![cb, GPUStartTime], objc2::msg_send![cb, GPUEndTime])
+                };
+                retained_stats::record_gpu((end - start) * 1e3);
             }
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
@@ -748,6 +776,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
+        self.sync_retained_shapes(scene, writer, command_buffer)?;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -820,6 +849,11 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::RetainedShapes(range) => self.draw_retained_shapes(
+                    &scene.retained_shapes[range],
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -827,6 +861,126 @@ impl MetalRenderer {
         command_encoder.end_encoding();
 
         Ok(command_buffer.to_owned())
+    }
+
+    /// Bring each retained buffer drawn this frame up to date: changed ranges are
+    /// staged in this frame's instance buffer and blitted into the retained GPU
+    /// buffer, ordered before the render pass on the GPU timeline, so frames still
+    /// in flight never see a half-written buffer.
+    fn sync_retained_shapes(
+        &mut self,
+        scene: &Scene,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        self.frame_index += 1;
+        if scene.retained_shapes.is_empty() {
+            return Ok(());
+        }
+        let stride = mem::size_of::<ShapeInstance>();
+        let mut blit: Option<&metal::BlitCommandEncoderRef> = None;
+        let mut uploaded = 0usize;
+        for draw in &scene.retained_shapes {
+            let id = draw.shapes.id();
+            let frame = self.frame_index;
+            let entry = self.retained_shapes.entry(id).or_insert_with(|| RetainedGpu {
+                buffer: None,
+                capacity: 0,
+                version: 0,
+                last_frame: frame,
+            });
+            if entry.last_frame == frame && entry.version != 0 {
+                continue;
+            }
+            entry.last_frame = frame;
+            let mut result: Result<()> = Ok(());
+            let device = &self.device;
+            entry.version = draw.shapes.sync(entry.version, |upload| {
+                let (data, ranges): (&[ShapeInstance], Vec<std::ops::Range<usize>>) = match upload {
+                    RetainedUpload::None => return,
+                    RetainedUpload::All(data) => (data, vec![0..data.len()]),
+                    RetainedUpload::Ranges(data, ranges) => (data, ranges.to_vec()),
+                };
+                let bytes = data.len() * stride;
+                if bytes == 0 {
+                    return;
+                }
+                if entry.capacity < bytes {
+                    // Grow (by half again) and copy everything into the new buffer.
+                    let capacity = (bytes + bytes / 2).next_multiple_of(4096);
+                    entry.buffer = Some(device.new_buffer(
+                        capacity as u64,
+                        MTLResourceOptions::StorageModePrivate,
+                    ));
+                    entry.capacity = capacity;
+                    return copy_ranges(writer, command_buffer, &mut blit, entry, data, &[0..data.len()], &mut uploaded, &mut result);
+                }
+                copy_ranges(writer, command_buffer, &mut blit, entry, data, &ranges, &mut uploaded, &mut result);
+            });
+            result?;
+        }
+        if let Some(blit) = blit {
+            blit.end_encoding();
+        }
+        // Drop GPU copies not drawn for a while (their buffers were dropped or hidden).
+        let frame = self.frame_index;
+        self.retained_shapes.retain(|_, e| frame - e.last_frame < 600);
+        retained_stats::record_upload(uploaded);
+        Ok(())
+    }
+
+    fn draw_retained_shapes(
+        &self,
+        draws: &[RetainedShapesDraw],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        command_encoder.set_render_pipeline_state(&self.retained_shapes_pipeline_state);
+        command_encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        for draw in draws {
+            let Some(gpu) = self.retained_shapes.get(&draw.shapes.id()) else { continue };
+            let Some(buffer) = &gpu.buffer else { continue };
+            let count = (gpu.capacity / mem::size_of::<ShapeInstance>()) as u32;
+            let range = draw.range.start.min(count)..draw.range.end.min(count);
+            if range.is_empty() {
+                continue;
+            }
+            let mask = draw.content_mask.bounds.intersect(&draw.bounds);
+            let [[m00, m01], [m10, m11]] = draw.transformation.rotation_scale;
+            let [mtx, mty] = draw.transformation.translation;
+            let uniforms = RetainedShapesUniforms {
+                transform: [m00, m01, m10, m11, mtx, mty],
+                viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+                content_mask: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
+                opacity: draw.opacity,
+                lod_min_px: 1.5,
+                _pad: [0.0; 2],
+                layer1: {
+                    let [[a, b], [c, d]] = draw.layer_transform.rotation_scale;
+                    let [x, y] = draw.layer_transform.translation;
+                    [a, b, c, d, x, y]
+                },
+                _pad2: [0.0; 2],
+            };
+            command_encoder.set_vertex_buffer(1, Some(buffer), 0);
+            command_encoder.set_vertex_bytes(
+                2,
+                mem::size_of_val(&uniforms) as u64,
+                &uniforms as *const RetainedShapesUniforms as *const _,
+            );
+            command_encoder.set_fragment_bytes(
+                2,
+                mem::size_of_val(&uniforms) as u64,
+                &uniforms as *const RetainedShapesUniforms as *const _,
+            );
+            command_encoder.draw_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                range.len() as u64,
+                range.start as u64,
+            );
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -1798,5 +1952,113 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+}
+
+/// A retained shape buffer's GPU copy.
+struct RetainedGpu {
+    buffer: Option<metal::Buffer>,
+    capacity: usize,
+    version: u64,
+    last_frame: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_ranges<'a>(
+    writer: &mut InstanceBufferWriter,
+    command_buffer: &'a metal::CommandBufferRef,
+    blit: &mut Option<&'a metal::BlitCommandEncoderRef>,
+    entry: &RetainedGpu,
+    data: &[ShapeInstance],
+    ranges: &[std::ops::Range<usize>],
+    uploaded: &mut usize,
+    result: &mut Result<()>,
+) {
+    let stride = mem::size_of::<ShapeInstance>();
+    let Some(dst) = &entry.buffer else { return };
+    let encoder = *blit.get_or_insert_with(|| command_buffer.new_blit_command_encoder());
+    for range in ranges {
+        let range = range.start.min(data.len())..range.end.min(data.len());
+        if range.is_empty() {
+            continue;
+        }
+        let staged = match writer.write(&data[range.clone()]) {
+            Ok(b) => b,
+            Err(e) => {
+                *result = Err(e);
+                return;
+            }
+        };
+        encoder.copy_from_buffer(
+            &staged.buffer,
+            staged.offset as u64,
+            dst,
+            (range.start * stride) as u64,
+            (range.len() * stride) as u64,
+        );
+        *uploaded += range.len() * stride;
+    }
+}
+
+/// Opt-in frame statistics for retained shapes (`GPUI_RETAINED_STATS=1`):
+/// every 120 frames, stderr gets CPU encode time, GPU time and bytes uploaded.
+pub mod retained_stats {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+
+    #[derive(Default)]
+    struct Stats {
+        encode: Vec<f64>,
+        gpu: Vec<f64>,
+        uploaded: Vec<usize>,
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("GPUI_RETAINED_STATS").is_some())
+    }
+
+    fn with(f: impl FnOnce(&mut Stats)) {
+        if enabled() {
+            f(STATS.lock().get_or_insert_with(Stats::default));
+        }
+    }
+
+    pub fn record_upload(bytes: usize) {
+        with(|s| s.uploaded.push(bytes));
+    }
+
+    pub fn record_gpu(ms: f64) {
+        with(|s| s.gpu.push(ms));
+    }
+
+    pub fn record_encode(ms: f64) {
+        with(|s| {
+            s.encode.push(ms);
+            if s.encode.len() >= 120 {
+                let q = |v: &mut Vec<f64>, p: f64| {
+                    if v.is_empty() {
+                        return 0.0;
+                    }
+                    v.sort_by(f64::total_cmp);
+                    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+                };
+                let uploads = s.uploaded.iter().filter(|b| **b > 0).count();
+                let bytes: usize = s.uploaded.iter().sum();
+                eprintln!(
+                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {}",
+                    s.encode.len(),
+                    q(&mut s.encode, 0.5),
+                    q(&mut s.encode, 0.95),
+                    q(&mut s.gpu, 0.5),
+                    q(&mut s.gpu, 0.95),
+                    uploads,
+                    bytes
+                );
+                *s = Stats::default();
+            }
+        });
     }
 }

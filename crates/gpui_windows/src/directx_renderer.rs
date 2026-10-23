@@ -385,6 +385,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Spike: not implemented on DirectX.
+                PrimitiveBatch::RetainedShapes(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

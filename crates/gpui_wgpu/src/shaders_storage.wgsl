@@ -40,3 +40,9 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return b_poly_sprites[instance_id];
 }
+
+@group(1) @binding(0) var<storage, read> b_retained_shapes: array<RetainedShape>;
+
+fn load_retained_shape(instance_id: u32) -> RetainedShape {
+    return b_retained_shapes[instance_id];
+}

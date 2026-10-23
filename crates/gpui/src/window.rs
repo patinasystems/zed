@@ -20,7 +20,7 @@ use crate::{
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    RetainedShapes, RetainedShapesDraw, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
@@ -4782,6 +4782,42 @@ impl Window {
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
+    }
+
+    /// Paint `range` of a retained shape buffer. `transformation` maps the
+    /// buffer's space to window pixels (logical); `bounds` is the window area the
+    /// shapes may cover, used for draw ordering against other primitives and
+    /// clipped by the current content mask. Nothing is uploaded unless the
+    /// buffer changed since the renderer last saw it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_retained_shapes(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shapes: &RetainedShapes,
+        range: std::ops::Range<u32>,
+        transformation: TransformationMatrix,
+        layer_transform: TransformationMatrix,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if range.is_empty() {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let transformation = TransformationMatrix::unit()
+            .scale(size(scale_factor, scale_factor))
+            .compose(transformation);
+        let draw = RetainedShapesDraw {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: self.content_mask().scale(scale_factor),
+            shapes: shapes.clone(),
+            range,
+            transformation,
+            opacity: self.element_opacity(),
+            layer_transform,
+        };
+        self.next_frame.scene.insert_primitive(draw);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
