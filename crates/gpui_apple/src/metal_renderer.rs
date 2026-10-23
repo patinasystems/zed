@@ -2079,6 +2079,14 @@ mod tests {
             shapes.version()
         );
 
+        // Arrow parts and text bars.
+        let kinds = gpui::RetainedShapes::new();
+        let (scene, probes) = t::kinds_scene(&kinds);
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+
         // The dense scene the wgpu test compares against.
         if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
             let dense = gpui::RetainedShapes::new();

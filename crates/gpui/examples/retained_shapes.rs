@@ -1,6 +1,7 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
-//! 100,000 retained, instanced shapes (rectangles and ellipses, fill and stroke)
+//! 100,000 retained, instanced shapes (rectangles and ellipses, fill and stroke,
+//! plus 2% bent arrows and 4% text bars)
 //! under an animated pan and zoom. The instances upload once; each frame only the
 //! camera transformation changes.
 //!
@@ -78,6 +79,46 @@ fn make(n: usize) -> (Vec<ShapeInstance>, f32, f32) {
                 ShapeInstance::RECT
             },
         });
+        // 4% carry a label, drawn as a text bar at low zoom.
+        if i % 25 == 3 {
+            out.push(ShapeInstance {
+                transform: [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    col * PITCH + 4.0,
+                    row * PITCH + h * 0.5 - 3.0,
+                ],
+                width: (w - 8.0).max(4.0),
+                height: 6.0,
+                fill: 0xd0d4dcff,
+                kind: ShapeInstance::TEXT_BAR,
+                ..Default::default()
+            });
+        }
+        // 2% are joined to the next cell by a bent arrow: an arc and a head.
+        if i % 50 == 25 && (i + 1) % cols != 0 {
+            let (x, y) = (col * PITCH + w, row * PITCH + h * 0.5);
+            let length = PITCH - w + 4.0;
+            out.push(ShapeInstance {
+                transform: [1.0, 0.0, 0.0, 1.0, x, y],
+                width: length,
+                height: -10.0,
+                stroke_width: 1.5,
+                stroke: 0xe8e8e8ff,
+                kind: ShapeInstance::ARC,
+                ..Default::default()
+            });
+            out.push(ShapeInstance {
+                transform: [1.0, 0.0, 0.0, 1.0, x + length - 7.0, y - 3.5],
+                width: 7.0,
+                height: 7.0,
+                fill: 0xe8e8e8ff,
+                kind: ShapeInstance::TRIANGLE,
+                ..Default::default()
+            });
+        }
     }
     (out, cols as f32 * PITCH, rows as f32 * PITCH)
 }

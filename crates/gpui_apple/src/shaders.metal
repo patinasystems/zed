@@ -1314,6 +1314,10 @@ struct RetainedShapesUniforms {
 
 constant uint RETAINED_RECT = 0u;
 constant uint RETAINED_ELLIPSE = 1u;
+constant uint RETAINED_SEGMENT = 2u;  // (0,0)-(width,0), stroked
+constant uint RETAINED_ARC = 3u;      // quadratic (0,0)-(width/2,height)-(width,0), stroked
+constant uint RETAINED_TRIANGLE = 4u; // (0,0)-(width,height/2)-(0,height)
+constant uint RETAINED_TEXT_BAR = 5u; // a text line at low zoom; drawn inside greek_band
 constant uint RETAINED_SOLID = 255u; // level of detail: a flat quad
 
 struct RetainedShapeVarying {
@@ -1365,11 +1369,28 @@ vertex RetainedShapeVarying retained_shape_vertex(
   float sy = max(length(col_y), 1e-6);
 
   uint kind = s.kind & 0xffu;
-  float half_stroke = s.stroke_width * 0.5;
+  if (kind == RETAINED_TEXT_BAR) {
+    // Text bars stand in for text only inside their device-pixel height band.
+    float height_px = s.height * sy;
+    if (height_px < u->greek_band.x || height_px >= u->greek_band.y) {
+      out.position = float4(-2.0, -2.0, 0.0, 1.0);
+      return out;
+    }
+  }
+  float half_stroke = kind == RETAINED_TEXT_BAR ? 0.0 : s.stroke_width * 0.5;
   float4 fill = retained_unpack_rgba8(s.fill);
   float4 stroke = retained_unpack_rgba8(s.stroke);
+  if (kind == RETAINED_SEGMENT || kind == RETAINED_ARC) {
+    fill = float4(0.0); // lines are their stroke
+  }
   float2 lo = float2(0.0);
   float2 hi = float2(s.width, s.height);
+  if (kind == RETAINED_SEGMENT) {
+    hi.y = 0.0;
+  } else if (kind == RETAINED_ARC) {
+    lo.y = min(0.0, 0.5 * s.height);
+    hi.y = max(0.0, 0.5 * s.height);
+  }
   float2 size_px = (hi - lo) * float2(sx, sy);
   float2 pad;
   if (max(size_px.x, size_px.y) + s.stroke_width * max(sx, sy) < u->lod_min_px) {
@@ -1389,13 +1410,74 @@ vertex RetainedShapeVarying retained_shape_vertex(
   out.position = float4(device_px / u->viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
   out.local = local;
   out.size = float2(s.width, s.height);
-  out.corner_radius = min(s.corner_radius, 0.5 * min(s.width, s.height));
+  out.corner_radius = kind == RETAINED_TEXT_BAR ? 0.5 * s.height
+                                               : min(s.corner_radius, 0.5 * min(s.width, s.height));
   out.half_stroke = half_stroke;
   out.px_per_unit = 0.5 * (sx + sy);
   out.fill = fill;
   out.stroke = stroke;
   out.kind = kind;
   return out;
+}
+
+
+float retained_dot2(float2 v) { return dot(v, v); }
+
+// Distance to the segment (0,0)-(len,0).
+float retained_segment_distance(float2 p, float len) {
+  return length(p - float2(clamp(p.x, 0.0, len), 0.0));
+}
+
+// Distance to the quadratic Bezier A-B-C (closed-form cubic roots, after
+// Inigo Quilez, "2D distance functions", MIT).
+float retained_bezier_distance(float2 pos, float2 A, float2 B, float2 C) {
+  float2 a = B - A;
+  float2 b = A - 2.0 * B + C;
+  if (dot(b, b) < 1e-8) {
+    float2 e = C - A;
+    float h = clamp(dot(pos - A, e) / max(dot(e, e), 1e-8), 0.0, 1.0);
+    return length(pos - A - e * h);
+  }
+  float2 c = a * 2.0;
+  float2 d = A - pos;
+  float kk = 1.0 / dot(b, b);
+  float kx = kk * dot(a, b);
+  float ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
+  float kz = kk * dot(d, a);
+  float p = ky - kx * kx;
+  float p3 = p * p * p;
+  float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+  float h = q * q + 4.0 * p3;
+  float res;
+  if (h >= 0.0) {
+    h = sqrt(h);
+    float2 x = (float2(h, -h) - q) / 2.0;
+    float2 uv = sign(x) * pow(abs(x), float2(1.0 / 3.0));
+    float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+    res = retained_dot2(d + (c + b * t) * t);
+  } else {
+    float z = sqrt(-p);
+    float v = acos(clamp(q / (p * z * 2.0), -1.0, 1.0)) / 3.0;
+    float m = cos(v);
+    float n = sin(v) * 1.732050808;
+    float3 t = clamp(float3(m + m, -n - m, n - m) * z - kx, 0.0, 1.0);
+    res = min(retained_dot2(d + (c + b * t.x) * t.x), retained_dot2(d + (c + b * t.y) * t.y));
+  }
+  return sqrt(res);
+}
+
+// Signed distance to the triangle p0-p1-p2 (after Inigo Quilez, MIT).
+float retained_triangle_sdf(float2 p, float2 p0, float2 p1, float2 p2) {
+  float2 e0 = p1 - p0, e1 = p2 - p1, e2 = p0 - p2;
+  float2 v0 = p - p0, v1 = p - p1, v2 = p - p2;
+  float2 pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+  float2 pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+  float2 pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+  float s = sign(e0.x * e2.y - e0.y * e2.x);
+  float2 d = min(min(float2(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)),
+                     float2(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))),
+                 float2(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+  return -sqrt(d.x) * sign(d.y);
 }
 
 float retained_rect_sdf(float2 p, float2 half_size, float radius) {
@@ -1443,8 +1525,20 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   }
   float2 half_size = in.size * 0.5;
   float2 p = in.local - half_size;
-  float d = in.kind == RETAINED_ELLIPSE ? retained_ellipse_sdf(p, half_size)
-                                        : retained_rect_sdf(p, half_size, in.corner_radius);
+  float d;
+  if (in.kind == RETAINED_ELLIPSE) {
+    d = retained_ellipse_sdf(p, half_size);
+  } else if (in.kind == RETAINED_SEGMENT) {
+    d = retained_segment_distance(in.local, in.size.x);
+  } else if (in.kind == RETAINED_ARC) {
+    d = retained_bezier_distance(in.local, float2(0.0), float2(0.5 * in.size.x, in.size.y),
+                                 float2(in.size.x, 0.0));
+  } else if (in.kind == RETAINED_TRIANGLE) {
+    d = retained_triangle_sdf(in.local, float2(0.0), float2(in.size.x, 0.5 * in.size.y),
+                              float2(0.0, in.size.y));
+  } else {
+    d = retained_rect_sdf(p, half_size, in.corner_radius);
+  }
   float4 color = retained_fill_and_stroke(d * in.px_per_unit, in.half_stroke, in.px_per_unit,
                                           in.fill, in.stroke);
   if (color.a <= 0.0) {
