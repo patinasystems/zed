@@ -87,7 +87,7 @@ impl Scene {
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
-            .bounds()
+            .transformed_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -242,6 +242,25 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// The bounds this primitive covers once its transformation, if any, is applied.
+    ///
+    /// Content masks are applied after the transformation, so culling and draw ordering
+    /// must use these bounds rather than [`Primitive::bounds`].
+    pub fn transformed_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.transformation.transform_bounds(sprite.bounds)
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.transformation.transform_bounds(sprite.bounds)
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.transformation.transform_bounds(sprite.bounds)
+            }
+            primitive => *primitive.bounds(),
         }
     }
 
@@ -686,6 +705,40 @@ impl TransformationMatrix {
         }
     }
 
+    /// Returns the smallest axis-aligned bounds that contain `bounds` after this
+    /// transformation is applied to it.
+    pub fn transform_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return bounds;
+        }
+        let corners = [
+            bounds.origin,
+            bounds.top_right(),
+            bounds.bottom_right(),
+            bounds.bottom_left(),
+        ]
+        .map(|corner| {
+            let [[a, b], [c, d]] = self.rotation_scale;
+            let [tx, ty] = self.translation;
+            (
+                a * corner.x.0 + b * corner.y.0 + tx,
+                c * corner.x.0 + d * corner.y.0 + ty,
+            )
+        });
+        let (mut min_x, mut min_y) = corners[0];
+        let (mut max_x, mut max_y) = corners[0];
+        for (x, y) in &corners[1..] {
+            min_x = min_x.min(*x);
+            min_y = min_y.min(*y);
+            max_x = max_x.max(*x);
+            max_y = max_y.max(*y);
+        }
+        Bounds::from_corners(
+            point(ScaledPixels(min_x), ScaledPixels(min_y)),
+            point(ScaledPixels(max_x), ScaledPixels(max_y)),
+        )
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -755,6 +808,7 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -945,5 +999,124 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AtlasTextureId, AtlasTextureKind, DevicePixels, TileId, radians, size};
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    fn rotation_about(angle: f32, pivot: Point<ScaledPixels>) -> TransformationMatrix {
+        TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(radians(angle))
+            .translate(-pivot)
+    }
+
+    fn polychrome_sprite(
+        bounds: Bounds<ScaledPixels>,
+        content_mask: Bounds<ScaledPixels>,
+        transformation: TransformationMatrix,
+    ) -> PolychromeSprite {
+        PolychromeSprite {
+            order: 0,
+            pad: 0,
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(DevicePixels(0), DevicePixels(0)),
+                    size(DevicePixels(1), DevicePixels(1)),
+                ),
+            },
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds,
+            content_mask: ContentMask {
+                bounds: content_mask,
+            },
+            corner_radii: Corners::default(),
+            transformation,
+        }
+    }
+
+    fn assert_bounds_eq(actual: Bounds<ScaledPixels>, expected: Bounds<ScaledPixels>) {
+        let close = |a: ScaledPixels, b: ScaledPixels| (a.0 - b.0).abs() < 1e-4;
+        assert!(
+            close(actual.origin.x, expected.origin.x)
+                && close(actual.origin.y, expected.origin.y)
+                && close(actual.size.width, expected.size.width)
+                && close(actual.size.height, expected.size.height),
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn test_transform_bounds() {
+        let bounds = scaled_bounds(0., 0., 20., 10.);
+        assert_eq!(
+            TransformationMatrix::unit().transform_bounds(bounds),
+            bounds
+        );
+
+        let quarter_turn = rotation_about(
+            std::f32::consts::FRAC_PI_2,
+            point(ScaledPixels(10.), ScaledPixels(5.)),
+        );
+        assert_bounds_eq(
+            quarter_turn.transform_bounds(bounds),
+            scaled_bounds(5., -5., 10., 20.),
+        );
+
+        let scale_and_translate = TransformationMatrix::unit()
+            .translate(point(ScaledPixels(100.), ScaledPixels(50.)))
+            .scale(size(2., 3.));
+        assert_bounds_eq(
+            scale_and_translate.transform_bounds(bounds),
+            scaled_bounds(100., 50., 40., 30.),
+        );
+    }
+
+    #[test]
+    fn test_insert_primitive_culls_transformed_sprites_by_transformed_bounds() {
+        let content_mask = scaled_bounds(0., 0., 100., 100.);
+        let move_right =
+            TransformationMatrix::unit().translate(point(ScaledPixels(200.), ScaledPixels(0.)));
+        let move_left =
+            TransformationMatrix::unit().translate(point(ScaledPixels(-200.), ScaledPixels(0.)));
+
+        let mut scene = Scene::default();
+        // Painted outside the mask, but transformed into it.
+        scene.insert_primitive(polychrome_sprite(
+            scaled_bounds(-190., 10., 20., 20.),
+            content_mask,
+            move_right,
+        ));
+        // Painted inside the mask, but transformed out of it.
+        scene.insert_primitive(polychrome_sprite(
+            scaled_bounds(10., 10., 20., 20.),
+            content_mask,
+            move_left,
+        ));
+        scene.finish();
+
+        assert_eq!(scene.polychrome_sprites.len(), 1);
+        assert_eq!(scene.polychrome_sprites[0].transformation, move_right);
+        assert_eq!(
+            scene.polychrome_sprites[0].bounds,
+            scaled_bounds(-190., 10., 20., 20.)
+        );
     }
 }

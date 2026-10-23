@@ -260,6 +260,10 @@ name = "tab_stop"
 path = "examples/tab_stop.rs"
 
 [[example]]
+name = "transformed_paint"
+path = "examples/transformed_paint.rs"
+
+[[example]]
 name = "text"
 path = "examples/text.rs"
 

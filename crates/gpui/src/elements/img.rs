@@ -802,7 +802,10 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
+    use crate::{
+        Corners, ParentElement as _, TestAppContext, TransformationMatrix, canvas, div, point, px,
+        size,
+    };
     use image::{Frame, ImageBuffer, Rgba};
 
     const TEST_IMG_ID: &str = "test-img";
@@ -895,6 +898,61 @@ mod tests {
                 rendered_tile_bounds.size.height.0,
             ),
             (50, 0, 100, 100),
+        );
+    }
+
+    #[gpui::test]
+    fn paint_image_with_transformation_keeps_layout_and_records_transformation(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_empty_window();
+        let image = test_image_with_size(40, 20);
+        let bounds = Bounds::new(point(px(30.), px(40.)), size(px(40.), px(20.)));
+        let transformation = window.update(|window, _| {
+            let pivot = bounds.center().scale(window.scale_factor());
+            TransformationMatrix::unit()
+                .translate(pivot)
+                .rotate(crate::radians(std::f32::consts::FRAC_PI_4))
+                .translate(-pivot)
+        });
+
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    window
+                        .paint_image_with_transformation(
+                            bounds,
+                            bounds,
+                            Corners::all(px(4.)),
+                            image.clone(),
+                            0,
+                            false,
+                            transformation,
+                        )
+                        .unwrap();
+                },
+            )
+            .size_full()
+            .into_any_element()
+        });
+
+        let (sprite, scale_factor) = window.update(|window, _| {
+            (
+                *window
+                    .rendered_frame
+                    .scene
+                    .polychrome_sprites
+                    .last()
+                    .expect("transformed image should paint a sprite"),
+                window.scale_factor(),
+            )
+        });
+        assert_eq!(sprite.transformation, transformation);
+        assert_eq!(sprite.bounds, bounds.scale(scale_factor));
+        assert_eq!(
+            sprite.corner_radii,
+            Corners::all(px(4.)).scale(scale_factor)
         );
     }
 

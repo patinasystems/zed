@@ -4844,11 +4844,57 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        self.paint_glyph_with_transformation(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            color,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paints a monochrome (non-emoji) glyph like [`Window::paint_glyph`], then applies
+    /// `transformation` to the painted sprite.
+    ///
+    /// `transformation` maps window coordinates in device pixels to window coordinates in
+    /// device pixels, the same space [`Window::paint_svg`] uses. It is applied to the glyph
+    /// after it has been placed at `origin`, so passing one matrix to every glyph of a line
+    /// transforms the line as a unit. To rotate by `angle` about `pivot`, use
+    /// `TransformationMatrix::unit().translate(p).rotate(angle).translate(-p)` with
+    /// `p = pivot.scale(window.scale_factor())`.
+    ///
+    /// The transformation may scale as well as rotate. The glyph is rasterized at the
+    /// transformation's uniform scale (the square root of its determinant), rounded to
+    /// eighth-octave steps so continuous zooming reuses atlas entries, and only the
+    /// remaining transformation is applied to the sprite. Rotated and uniformly scaled text
+    /// therefore stays as crisp as untransformed text. Non-uniform scale, the rounding
+    /// remainder (at most about 4.5%), and any scale beyond a 512 device pixel font size
+    /// are applied by resampling the rasterized glyph.
+    ///
+    /// The content mask is applied after the transformation. Subpixel antialiasing is
+    /// disabled for transformed glyphs, because its color fringes assume an axis-aligned
+    /// pixel grid.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_with_transformation(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let Some((raster_scale_factor, transformation)) =
+            glyph_raster_transformation(transformation, font_size, self.scale_factor())
+        else {
+            return Ok(());
+        };
+        let glyph_origin = origin.scale(raster_scale_factor);
 
         let quantized_origin = Point::new(
             round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
@@ -4861,14 +4907,15 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        let subpixel_rendering = transformation == TransformationMatrix::unit()
+            && self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant,
-            scale_factor,
+            scale_factor: raster_scale_factor,
             is_emoji: false,
             subpixel_rendering,
             dilation,
@@ -4897,7 +4944,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation,
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4907,7 +4954,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation,
                 });
             }
         }
@@ -4948,17 +4995,44 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_with_transformation(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paints an emoji glyph like [`Window::paint_emoji`], then applies `transformation` to
+    /// the painted sprite.
+    ///
+    /// `transformation` is interpreted as in [`Window::paint_glyph_with_transformation`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_emoji_with_transformation(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let Some((raster_scale_factor, transformation)) =
+            glyph_raster_transformation(transformation, font_size, self.scale_factor())
+        else {
+            return Ok(());
+        };
+        let glyph_origin = origin.scale(raster_scale_factor);
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant: Default::default(),
-            scale_factor,
+            scale_factor: raster_scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
@@ -4990,6 +5064,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation,
             });
         }
         Ok(())
@@ -5077,6 +5152,35 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_transformation(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paints an image like [`Window::paint_image`], then applies `transformation` to the
+    /// painted sprite, including its rounded corners.
+    ///
+    /// `transformation` maps window coordinates in device pixels to window coordinates in
+    /// device pixels, the same space [`Window::paint_svg`] uses. The content mask is applied
+    /// after the transformation. Hit testing is unaffected.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_image_with_transformation(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -5162,6 +5266,7 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation,
         });
         Ok(())
     }
@@ -7913,6 +8018,42 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
+/// The largest font size, in device pixels, at which a transformed glyph is rasterized.
+/// Larger effective sizes are reached by resampling, which bounds atlas usage.
+const MAX_TRANSFORMED_GLYPH_RASTER_SIZE: f32 = 512.;
+
+/// Rasterization steps per doubling of a transformed glyph's scale. Rounding the scale
+/// keeps a continuous zoom from inserting a new atlas entry every frame.
+const TRANSFORMED_GLYPH_SCALE_STEPS_PER_OCTAVE: f32 = 8.;
+
+/// Splits a glyph transformation into the scale factor to rasterize the glyph at and the
+/// transformation that remains to be applied to the rasterized sprite.
+///
+/// Returns `None` when the transformation collapses the glyph to nothing.
+fn glyph_raster_transformation(
+    transformation: TransformationMatrix,
+    font_size: Pixels,
+    scale_factor: f32,
+) -> Option<(f32, TransformationMatrix)> {
+    if transformation == TransformationMatrix::unit() {
+        return Some((scale_factor, transformation));
+    }
+    let [[a, b], [c, d]] = transformation.rotation_scale;
+    let uniform_scale = (a * d - b * c).abs().sqrt();
+    if !uniform_scale.is_normal() {
+        return None;
+    }
+    let rounded_scale = ((uniform_scale.log2() * TRANSFORMED_GLYPH_SCALE_STEPS_PER_OCTAVE).round()
+        / TRANSFORMED_GLYPH_SCALE_STEPS_PER_OCTAVE)
+        .exp2();
+    let max_scale = MAX_TRANSFORMED_GLYPH_RASTER_SIZE / (font_size.0 * scale_factor).max(1.);
+    let raster_scale = rounded_scale.min(max_scale.max(1.));
+    Some((
+        scale_factor * raster_scale,
+        transformation.scale(size(1. / raster_scale, 1. / raster_scale)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7932,6 +8073,73 @@ mod tests {
         TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
         WindowOptions, canvas, div, hsla, point, px, size,
     };
+
+    #[test]
+    fn test_glyph_raster_transformation() {
+        use super::{TransformationMatrix, glyph_raster_transformation};
+        use crate::radians;
+
+        let font_size = px(16.);
+        let scale_factor = 2.;
+        let assert_matrix_eq = |actual: TransformationMatrix, expected: TransformationMatrix| {
+            let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+            assert!(
+                (0..2).all(|row| (0..2).all(|column| close(
+                    actual.rotation_scale[row][column],
+                    expected.rotation_scale[row][column]
+                ))) && (0..2).all(|i| close(actual.translation[i], expected.translation[i])),
+                "{actual:?} != {expected:?}"
+            );
+        };
+
+        let unit = TransformationMatrix::unit();
+        assert_eq!(
+            glyph_raster_transformation(unit, font_size, scale_factor),
+            Some((scale_factor, unit))
+        );
+
+        let pivot = point(ScaledPixels(40.), ScaledPixels(30.));
+        let rotation = TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(radians(0.7))
+            .translate(-pivot);
+        let (raster_scale_factor, remaining) =
+            glyph_raster_transformation(rotation, font_size, scale_factor).unwrap();
+        assert_eq!(raster_scale_factor, scale_factor);
+        assert_matrix_eq(remaining, rotation);
+
+        // Scaled glyphs are rasterized near the target size, and the remainder of the
+        // transformation maps the larger raster back onto the requested geometry.
+        for zoom in [0.3, 1.1, 3., 7.5] {
+            let zoomed = rotation.scale(size(zoom, zoom));
+            let (raster_scale_factor, remaining) =
+                glyph_raster_transformation(zoomed, font_size, scale_factor).unwrap();
+            let raster_scale = raster_scale_factor / scale_factor;
+            assert!(
+                (raster_scale / zoom - 1.).abs() < 0.045,
+                "zoom {zoom} rasterized at {raster_scale}"
+            );
+            assert_matrix_eq(remaining.scale(size(raster_scale, raster_scale)), zoomed);
+        }
+
+        // Rasterization stops growing at the maximum glyph size.
+        let (raster_scale_factor, _) = glyph_raster_transformation(
+            TransformationMatrix::unit().scale(size(100., 100.)),
+            font_size,
+            scale_factor,
+        )
+        .unwrap();
+        assert_eq!(raster_scale_factor * font_size.0, 512.);
+
+        assert_eq!(
+            glyph_raster_transformation(
+                TransformationMatrix::unit().scale(size(0., 1.)),
+                font_size,
+                scale_factor
+            ),
+            None
+        );
+    }
 
     #[gpui::test]
     async fn test_focus_handle_release(cx: &mut TestAppContext) {
