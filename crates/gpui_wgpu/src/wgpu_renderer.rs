@@ -1606,6 +1606,9 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Spike: the WGSL entry points (`vs_retained_shape`) exist and
+                    // validate; the wgpu pipeline and retained buffer cache do not yet.
+                    PrimitiveBatch::RetainedShapes(_draws) => {}
                 }
             }
         }
