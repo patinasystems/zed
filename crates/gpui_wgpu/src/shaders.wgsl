@@ -1364,3 +1364,172 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- retained shapes --- //
+// Instanced SDF shapes from a retained buffer. Layouts match `ShapeInstance` and
+// `RetainedShapesUniforms` in gpui/src/retained_shapes.rs and the Metal shader.
+
+struct RetainedShape {
+    a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32,
+    width: f32,
+    height: f32,
+    corner_radius: f32,
+    stroke_width: f32,
+    fill: u32,
+    stroke: u32,
+    kind: u32,
+}
+
+struct RetainedShapesUniforms {
+    m00: f32, m01: f32, m10: f32, m11: f32, mtx: f32, mty: f32,
+    viewport_size: vec2<f32>,
+    content_mask: vec4<f32>,
+    opacity: f32,
+    lod_min_px: f32,
+    greek_band: vec2<f32>,
+    l00: f32, l01: f32, l10: f32, l11: f32, ltx: f32, lty: f32,
+    pad: vec2<f32>,
+}
+
+// Bound per draw with a dynamic offset. Group 2 is the sprite texture for other
+// pipelines; no entry point uses both.
+@group(2) @binding(0) var<uniform> retained_uniforms: RetainedShapesUniforms;
+
+const RETAINED_ELLIPSE: u32 = 1u;
+const RETAINED_SOLID: u32 = 255u;
+
+struct RetainedShapeVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) @interpolate(flat) size: vec2<f32>,
+    @location(2) @interpolate(flat) corner_radius: f32,
+    @location(3) @interpolate(flat) half_stroke: f32,
+    @location(4) @interpolate(flat) px_per_unit: f32,
+    @location(5) @interpolate(flat) fill: vec4<f32>,
+    @location(6) @interpolate(flat) stroke: vec4<f32>,
+    @location(7) @interpolate(flat) kind: u32,
+}
+
+fn retained_unpack_rgba8(c: u32) -> vec4<f32> {
+    return vec4<f32>(f32((c >> 24u) & 0xffu), f32((c >> 16u) & 0xffu), f32((c >> 8u) & 0xffu), f32(c & 0xffu)) / 255.0;
+}
+
+@vertex
+fn vs_retained_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> RetainedShapeVarying {
+    let s = load_retained_shape(instance_id);
+    let u = retained_uniforms;
+    var out = RetainedShapeVarying();
+    if (s.kind & 0x100u) != 0u {
+        out.position = vec4<f32>(-2.0, -2.0, 0.0, 1.0);
+        return out;
+    }
+    let unit = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+
+    // Buffer space -> device px, through layer 1 when flagged: U, or U * L.
+    var ux = vec2<f32>(u.m00, u.m10);
+    var uy = vec2<f32>(u.m01, u.m11);
+    var ut = vec2<f32>(u.mtx, u.mty);
+    if ((s.kind >> 16u) & 0xffu) == 1u {
+        let nx = ux * u.l00 + uy * u.l10;
+        let ny = ux * u.l01 + uy * u.l11;
+        ut = ut + ux * u.ltx + uy * u.lty;
+        ux = nx;
+        uy = ny;
+    }
+    // Local -> device px.
+    let col_x = ux * s.a + uy * s.b;
+    let col_y = ux * s.c + uy * s.d;
+    let origin = ux * s.tx + uy * s.ty + ut;
+    let sx = max(length(col_x), 1e-6);
+    let sy = max(length(col_y), 1e-6);
+
+    var kind = s.kind & 0xffu;
+    let half_stroke = s.stroke_width * 0.5;
+    var fill = retained_unpack_rgba8(s.fill);
+    let stroke = retained_unpack_rgba8(s.stroke);
+    let lo = vec2<f32>(0.0);
+    let hi = vec2<f32>(s.width, s.height);
+    let size_px = (hi - lo) * vec2<f32>(sx, sy);
+    var pad: vec2<f32>;
+    if max(size_px.x, size_px.y) + s.stroke_width * max(sx, sy) < u.lod_min_px {
+        // A tiny shape: a solid quad of at least one pixel whose alpha carries
+        // its coverage.
+        kind = RETAINED_SOLID;
+        var dominant = select(stroke, fill, fill.a > 0.0);
+        dominant.a = dominant.a * clamp(size_px.x * size_px.y, 0.25, 1.0);
+        fill = dominant;
+        pad = max(vec2<f32>(0.0), (vec2<f32>(1.0) - size_px) * 0.5) / vec2<f32>(sx, sy);
+    } else {
+        // Room for the stroke and one pixel of antialiasing.
+        pad = vec2<f32>(half_stroke) + vec2<f32>(1.0 / sx, 1.0 / sy);
+    }
+    let local = mix(lo - pad, hi + pad, unit);
+    let device_px = origin + col_x * local.x + col_y * local.y;
+    out.position = vec4<f32>(device_px / u.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    out.local = local;
+    out.size = vec2<f32>(s.width, s.height);
+    out.corner_radius = min(s.corner_radius, 0.5 * min(s.width, s.height));
+    out.half_stroke = half_stroke;
+    out.px_per_unit = 0.5 * (sx + sy);
+    out.fill = fill;
+    out.stroke = stroke;
+    out.kind = kind;
+    return out;
+}
+
+fn retained_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    let q = abs(p) - half_size + radius;
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+// Approximate distance to an ellipse: the implicit value over its gradient.
+fn retained_ellipse_sdf(p: vec2<f32>, radii: vec2<f32>) -> f32 {
+    let r = max(radii, vec2<f32>(1e-4));
+    let k0 = length(p / r);
+    let k1 = length(p / (r * r));
+    return select(-min(r.x, r.y), k0 * (k0 - 1.0) / k1, k1 > 0.0);
+}
+
+// Coverage of fill and stroke for a closed outline at signed distance `d_px`.
+fn retained_fill_and_stroke(d_px: f32, half_stroke: f32, px_per_unit: f32, fill: vec4<f32>, stroke: vec4<f32>) -> vec4<f32> {
+    let fill_cov = clamp(0.5 - d_px, 0.0, 1.0);
+    var stroke_cov = 0.0;
+    if half_stroke > 0.0 {
+        let half_stroke_px = half_stroke * px_per_unit;
+        // Hairlines keep one pixel of width and fade by their width.
+        let w = max(half_stroke_px, 0.5);
+        stroke_cov = clamp(w + 0.5 - abs(d_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
+    }
+    let fa = fill.a * fill_cov;
+    let sa = stroke.a * stroke_cov;
+    let a = sa + fa * (1.0 - sa);
+    if a <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>((stroke.rgb * sa + fill.rgb * fa * (1.0 - sa)) / a, a);
+}
+
+@fragment
+fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
+    let mask = retained_uniforms.content_mask;
+    let pos = input.position.xy;
+    if pos.x < mask.x || pos.y < mask.y || pos.x >= mask.x + mask.z || pos.y >= mask.y + mask.w {
+        discard;
+    }
+    if input.kind == RETAINED_SOLID {
+        return blend_color(input.fill, retained_uniforms.opacity);
+    }
+    let half_size = input.size * 0.5;
+    let p = input.local - half_size;
+    var d: f32;
+    if input.kind == RETAINED_ELLIPSE {
+        d = retained_ellipse_sdf(p, half_size);
+    } else {
+        d = retained_rect_sdf(p, half_size, input.corner_radius);
+    }
+    let color = retained_fill_and_stroke(d * input.px_per_unit, input.half_stroke, input.px_per_unit, input.fill, input.stroke);
+    if color.a <= 0.0 {
+        discard;
+    }
+    return blend_color(color, retained_uniforms.opacity);
+}

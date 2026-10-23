@@ -428,6 +428,79 @@ pub mod retained_shapes_test_scene {
         (scene, probes)
     }
 
+    /// A denser scene for comparing backends pixel by pixel: `n` random rects
+    /// and ellipses (rotated, stroked, translucent, some below one pixel, some on
+    /// layer 1) on a 256x256 target.
+    pub fn random_scene(shapes: &RetainedShapes, n: usize, seed: u64) -> (Scene, (i32, i32)) {
+        let mut state = seed | 1;
+        let mut unit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let instances = (0..n)
+            .map(|i| {
+                let angle = (unit() - 0.5) * 3.0;
+                let (sin, cos) = angle.sin_cos();
+                let tiny = i % 10 == 0;
+                let (w, h) = if tiny {
+                    (0.3 + unit(), 0.3 + unit())
+                } else {
+                    (4.0 + unit() * 56.0, 4.0 + unit() * 56.0)
+                };
+                let fill_rgb = ((unit() * 16777215.0) as u32) << 8;
+                let stroke_rgb = ((unit() * 16777215.0) as u32) << 8;
+                let (x, y) = (unit() * 256.0, unit() * 256.0);
+                let radius = unit() * 10.0;
+                let stroke_width = 0.5 + unit() * 4.0;
+                ShapeInstance {
+                    transform: [cos, sin, -sin, cos, x, y],
+                    width: w,
+                    height: h,
+                    corner_radius: if i % 3 == 0 { radius } else { 0.0 },
+                    stroke_width: if i % 4 == 0 { 0.0 } else { stroke_width },
+                    fill: if i % 2 == 0 {
+                        fill_rgb | if i % 6 == 0 { 120 } else { 255 }
+                    } else {
+                        0
+                    },
+                    stroke: stroke_rgb | 255,
+                    kind: (if unit() < 0.5 {
+                        ShapeInstance::ELLIPSE
+                    } else {
+                        ShapeInstance::RECT
+                    }) | if i % 7 == 0 {
+                        ShapeInstance::LAYER_1
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect();
+        shapes.set_all(instances);
+        let full = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(256.0), ScaledPixels(256.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(RetainedShapesDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask { bounds: full },
+            shapes: shapes.clone(),
+            paint: RetainedShapesPaint::new(0..n as u32, TransformationMatrix::unit()).layer(
+                TransformationMatrix {
+                    rotation_scale: [[0.9, 0.2], [-0.2, 0.9]],
+                    translation: [12.0, -7.0],
+                },
+            ),
+            opacity: 0.9,
+        });
+        scene.finish();
+        (scene, (256, 256))
+    }
+
     /// Panics with every failing probe (channels within `tolerance`).
     pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4], probes: &[Probe], tolerance: u8) {
         let failures: Vec<String> = probes

@@ -16,6 +16,9 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[path = "retained_shapes.rs"]
+mod retained_shapes;
+
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
@@ -134,6 +137,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    retained_shapes: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -161,6 +165,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    /// Per-draw retained shape uniforms, at a dynamic offset.
+    retained_uniforms: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -194,6 +200,7 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    retained: retained_shapes::RetainedState,
 }
 
 struct CachedTextureBindGroup {
@@ -615,11 +622,28 @@ impl WgpuRendererCore {
             ],
         });
 
+        let retained_uniforms = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("retained_shapes_uniforms_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<
+                        gpui::RetainedShapesUniforms,
+                    >() as u64),
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
             surfaces,
+            retained_uniforms,
         }
     }
 
@@ -919,12 +943,26 @@ impl WgpuRendererCore {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let retained_shapes = create_pipeline(
+            "retained_shapes",
+            "vs_retained_shape",
+            "fs_retained_shape",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.retained_uniforms),
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
         );
 
         WgpuPipelines {
+            retained_shapes,
             quads,
             shadows,
             path_rasterization,
@@ -1347,6 +1385,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                retained: Default::default(),
             },
             atlas,
             path_globals_offset,
@@ -1462,7 +1501,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1473,8 +1512,12 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
+        let retained_stride = self
+            .prepare_retained_shapes(scene, [size.width.0 as f32, size.height.0 as f32])
+            .context("retained shapes")?;
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1606,9 +1649,12 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    // Spike: the WGSL entry points (`vs_retained_shape`) exist and
-                    // validate; the wgpu pipeline and retained buffer cache do not yet.
-                    PrimitiveBatch::RetainedShapes(_draws) => {}
+                    PrimitiveBatch::RetainedShapes(range) => self.draw_retained_shapes(
+                        &scene.retained_shapes[range.clone()],
+                        range.start,
+                        retained_stride,
+                        &mut pass,
+                    ),
                 }
             }
         }
@@ -1983,6 +2029,20 @@ impl WgpuRendererCore {
         else {
             return;
         };
+        Self::write_texture_bytes(&resources.queue, texture, *width, *height, offset, data);
+    }
+
+    /// Write `data` into an instance texture starting at byte `offset` (a whole
+    /// texel), padding the final texel.
+    fn write_texture_bytes(
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        offset: u64,
+        data: &[u8],
+    ) {
+        let (width, height) = (&width, &height);
         let mut byte_offset = 0usize;
         let mut texel_offset = offset / INSTANCE_TEXTURE_TEXEL_SIZE;
         while byte_offset < data.len() {
@@ -2009,7 +2069,7 @@ impl WgpuRendererCore {
             let texels = complete_texels.min(available_texels);
             if texels > 0 {
                 let byte_count = (texels * INSTANCE_TEXTURE_TEXEL_SIZE) as usize;
-                resources.queue.write_texture(
+                queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture,
                         mip_level: 0,
@@ -2035,7 +2095,7 @@ impl WgpuRendererCore {
 
             let mut final_texel = [0; INSTANCE_TEXTURE_TEXEL_SIZE as usize];
             final_texel[..remaining_bytes].copy_from_slice(&data[byte_offset..]);
-            resources.queue.write_texture(
+            queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture,
                     mip_level: 0,
@@ -2765,6 +2825,83 @@ mod tests {
         // Rejection must leave the renderer usable.
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
+        Ok(())
+    }
+
+    /// The shared retained-shape scene, rendered by the wgpu backend (Metal on
+    /// macOS, Vulkan or GL on Linux). Skips when no adapter is available.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn retained_shapes_render_upload_ranges_and_match_metal() -> anyhow::Result<()> {
+        use gpui::retained_shapes_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let size = |(w, h): (i32, i32)| Size {
+            width: DevicePixels(w),
+            height: DevicePixels(h),
+        };
+        let shapes = gpui::RetainedShapes::new();
+        let (scene, probes) = t::scene(&shapes);
+        let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        let uploaded = renderer.core.resources.retained.uploaded_bytes;
+        assert_eq!(uploaded, 5 * 52);
+
+        // Same scene again: nothing uploads. A range write uploads one record.
+        renderer.render_scene_to_image(&scene, size(t::SIZE))?;
+        assert_eq!(renderer.core.resources.retained.uploaded_bytes, uploaded);
+        let mut first = t::instances()[0];
+        first.fill = 0x0000ffff;
+        shapes.write(0, &[first]);
+        let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
+        assert_eq!(
+            renderer.core.resources.retained.uploaded_bytes,
+            uploaded + 52
+        );
+        let blue = image.get_pixel(16, 16).0;
+        assert!(
+            blue[2] > 250 && blue[0] < 3,
+            "range write not drawn: {blue:?}"
+        );
+
+        // The dense scene, kept for the Metal comparison below.
+        let dense = gpui::RetainedShapes::new();
+        let (scene, target) = t::random_scene(&dense, 400, 7);
+        let image = renderer.render_scene_to_image(&scene, size(target))?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            let dir = std::path::Path::new(&dir);
+            image.save(dir.join("retained_random_wgpu.png"))?;
+            // Written by gpui_apple's `retained_shapes_render_and_upload_only_changes`.
+            let metal = dir.join("retained_random_metal.png");
+            if metal.exists() {
+                let metal = image::open(metal)?.to_rgba8();
+                let (mut worst, mut off) = (0u8, 0usize);
+                for (a, b) in image.pixels().zip(metal.pixels()) {
+                    let d =
+                        a.0.iter()
+                            .zip(b.0)
+                            .map(|(x, y)| x.abs_diff(y))
+                            .max()
+                            .unwrap_or(0);
+                    worst = worst.max(d);
+                    off += usize::from(d > 8);
+                }
+                let total = (image.width() * image.height()) as usize;
+                println!(
+                    "RETAINED_COMPARE wgpu vs metal: max channel diff {worst}, pixels over 8: {off} of {total}"
+                );
+                assert!(
+                    off * 1000 <= total,
+                    "{off} of {total} pixels differ by more than 8"
+                );
+            }
+        }
         Ok(())
     }
 
