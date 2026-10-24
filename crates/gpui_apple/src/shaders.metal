@@ -1301,6 +1301,16 @@ struct RetainedShape {
   uint kind;   // low byte: kind; bit 8: hidden; bits 16..23: layer
 };
 
+// A rounded-rectangle clip: device px map to its space by `m` (x' = m.x x +
+// m.z y + t.x, y' = m.y x + m.w y + t.y), where it is centered on `half_size`.
+// A negative half size is an empty clip.
+struct RetainedClip {
+  float4 m;
+  float2 t;
+  float2 half_size;
+  float4 radii; // top-left, top-right, bottom-right, bottom-left
+};
+
 struct RetainedShapesUniforms {
   float m00, m01, m10, m11, mtx, mty; // buffer space -> device px, row-major
   float2 viewport_size;
@@ -1309,7 +1319,9 @@ struct RetainedShapesUniforms {
   float lod_min_px;
   float2 greek_band;
   float l00, l01, l10, l11, ltx, lty; // layer 1, buffer space, row-major
-  float2 _pad;
+  uint clip_count;
+  float _pad;
+  RetainedClip clips[4];
 };
 
 constant uint RETAINED_RECT = 0u;
@@ -1499,6 +1511,30 @@ float retained_ellipse_sdf(float2 p, float2 radii) {
   return k1 > 0.0 ? k0 * (k0 - 1.0) / k1 : -min(r.x, r.y);
 }
 
+// How much of the device pixel at `pos` is inside every clip (antialiased
+// like a shape's edge: the distance is measured in device pixels along the
+// edge's normal, so a stretched clip stays sharp on both axes).
+float retained_clip_coverage(float2 pos, constant RetainedShapesUniforms *u) {
+  float coverage = 1.0;
+  for (uint i = 0; i < u->clip_count; i++) {
+    RetainedClip c = u->clips[i];
+    if (c.half_size.x < 0.0) {
+      return 0.0;
+    }
+    float2 p = float2(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
+    float d = retained_rect_sdf(p, c.half_size, c.radii);
+    // The distance's gradient in clip space, then in device pixels.
+    float2 side = p.x >= 0.0 ? c.radii.yz : c.radii.xw;
+    float radius = p.y >= 0.0 ? side.y : side.x;
+    float2 q = abs(p) - c.half_size + radius;
+    float2 g = (q.x > 0.0 && q.y > 0.0) ? normalize(q) : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
+    g *= float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    float per_px = length(float2(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
+    coverage *= clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0);
+  }
+  return coverage;
+}
+
 // Coverage of fill and stroke for a closed outline at signed distance `d_px`.
 float4 retained_fill_and_stroke(float d_px, float half_stroke, float px_per_unit,
                                 float4 fill, float4 stroke) {
@@ -1526,8 +1562,12 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   if (pos.x < mask.x || pos.y < mask.y || pos.x >= mask.x + mask.z || pos.y >= mask.y + mask.w) {
     discard_fragment();
   }
+  float clip = retained_clip_coverage(pos, u);
+  if (clip <= 0.0) {
+    discard_fragment();
+  }
   if (in.kind == RETAINED_SOLID) {
-    return float4(in.fill.rgb, in.fill.a * u->opacity);
+    return float4(in.fill.rgb, in.fill.a * u->opacity * clip);
   }
   float2 half_size = in.size * 0.5;
   float2 p = in.local - half_size;
@@ -1550,5 +1590,5 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   if (color.a <= 0.0) {
     discard_fragment();
   }
-  return float4(color.rgb, color.a * u->opacity);
+  return float4(color.rgb, color.a * u->opacity * clip);
 }

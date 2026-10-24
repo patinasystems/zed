@@ -8,10 +8,13 @@
 //! range of the buffer under a transformation, so panning and zooming upload
 //! nothing, and a [layer transformation](RetainedShapesPaint::layer_transformation)
 //! moves the instances flagged [`ShapeInstance::LAYER_1`] (a live drag) without
-//! touching the buffer.
+//! touching the buffer. A draw can be [clipped](RetainedShapesPaint::clips)
+//! to rounded rectangles in the buffer's space, rotated or not (a canvas
+//! frame that clips its content); unclipped draws pay one uniform check.
 
 use crate::{Bounds, ContentMask, DrawOrder, ScaledPixels, TransformationMatrix};
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::{
     ops::Range,
     sync::{
@@ -256,6 +259,32 @@ pub struct RetainedShapesPaint {
     /// device pixels, is at least the first value and below the second; the
     /// caller draws real glyphs above the band and nothing below it.
     pub text_bar_band_px: [f32; 2],
+    /// The draw shows only inside every one of these (their intersection),
+    /// with antialiased edges. At most [`MAX_RETAINED_CLIPS`].
+    pub clips: SmallVec<[RetainedClip; MAX_RETAINED_CLIPS]>,
+}
+
+/// Most [`RetainedClip`]s one draw takes.
+pub const MAX_RETAINED_CLIPS: usize = 4;
+
+/// A rounded rectangle that clips a retained-shape draw, in the buffer's
+/// space: a canvas frame that clips its content, even rotated or rounded.
+/// Drawing outside it is discarded; its edge is antialiased like a shape's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RetainedClip {
+    /// Maps the clip's own space, where it is the rectangle (0, 0)-(`width`,
+    /// `height`), into the buffer's space, as [`ShapeInstance::transform`] does.
+    pub transform: [f32; 6],
+    /// Local width.
+    pub width: f32,
+    /// Local height.
+    pub height: f32,
+    /// Corner radii, as [`ShapeInstance::corner_radii`] (each clamped to half
+    /// the shorter side).
+    pub corner_radii: [f32; 4],
+    /// Moves with the paint's layer transformation, as instances flagged
+    /// [`ShapeInstance::LAYER_1`] do.
+    pub layer_1: bool,
 }
 
 impl RetainedShapesPaint {
@@ -267,6 +296,7 @@ impl RetainedShapesPaint {
             layer_transformation: TransformationMatrix::unit(),
             lod_min_device_px: 1.5,
             text_bar_band_px: [4.0, 8.0],
+            clips: SmallVec::new(),
         }
     }
 
@@ -274,6 +304,68 @@ impl RetainedShapesPaint {
     pub fn layer(mut self, layer_transformation: TransformationMatrix) -> Self {
         self.layer_transformation = layer_transformation;
         self
+    }
+
+    /// Also clip to `clip`. Past [`MAX_RETAINED_CLIPS`] clips, later ones
+    /// are ignored.
+    pub fn clip(mut self, clip: RetainedClip) -> Self {
+        if self.clips.len() < MAX_RETAINED_CLIPS {
+            self.clips.push(clip);
+        }
+        self
+    }
+
+    /// `clip`'s space to `transformation`'s target, as `[a, b, c, d, tx, ty]`
+    /// in f64 (x' = a·x + c·y + tx).
+    fn clip_to_target(&self, clip: &RetainedClip) -> [f64; 6] {
+        let mut m = clip.transform.map(f64::from);
+        let mut then = |t: &TransformationMatrix| {
+            let [[a, c], [b, d]] = t.rotation_scale.map(|row| row.map(f64::from));
+            let [tx, ty] = t.translation.map(f64::from);
+            m = [
+                a * m[0] + c * m[1],
+                b * m[0] + d * m[1],
+                a * m[2] + c * m[3],
+                b * m[2] + d * m[3],
+                a * m[4] + c * m[5] + tx,
+                b * m[4] + d * m[5] + ty,
+            ];
+        };
+        if clip.layer_1 {
+            then(&self.layer_transformation);
+        }
+        then(&self.transformation);
+        m
+    }
+
+    /// Axis-aligned bounds, in `transformation`'s target, that hold the
+    /// intersection of the clips and their antialiased edges; `None` without clips.
+    pub fn clip_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        self.clips
+            .iter()
+            .take(MAX_RETAINED_CLIPS)
+            .map(|clip| {
+                let m = self.clip_to_target(clip);
+                let (w, h) = (f64::from(clip.width), f64::from(clip.height));
+                let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+                    .map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+                let (x0, y0, x1, y1) = corners
+                    .iter()
+                    .fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |b, c| {
+                        (b.0.min(c.0), b.1.min(c.1), b.2.max(c.0), b.3.max(c.1))
+                    });
+                Bounds::from_corners(
+                    crate::point(
+                        ScaledPixels(x0.floor() as f32 - 1.0),
+                        ScaledPixels(y0.floor() as f32 - 1.0),
+                    ),
+                    crate::point(
+                        ScaledPixels(x1.ceil() as f32 + 1.0),
+                        ScaledPixels(y1.ceil() as f32 + 1.0),
+                    ),
+                )
+            })
+            .reduce(|a, b| a.intersect(&b))
     }
 }
 
@@ -316,12 +408,59 @@ impl RetainedShapesDraw {
             lod_min_px: self.paint.lod_min_device_px,
             greek_band: self.paint.text_bar_band_px,
             layer1: m(&self.paint.layer_transformation),
-            _pad: [0.0; 2],
+            clip_count: self.paint.clips.len().min(MAX_RETAINED_CLIPS) as u32,
+            _pad: 0.0,
+            clips: std::array::from_fn(|i| {
+                self.paint
+                    .clips
+                    .get(i)
+                    .map_or_else(RetainedClipUniform::default, |clip| self.clip_uniform(clip))
+            }),
+        }
+    }
+
+    /// A clip's uniform: the map from device pixels to the clip's space
+    /// (the inverse of the clip's transform followed by the draw's).
+    fn clip_uniform(&self, clip: &RetainedClip) -> RetainedClipUniform {
+        // A clip with no area hides everything.
+        const EMPTY: RetainedClipUniform = RetainedClipUniform {
+            matrix: [0.0; 4],
+            translation: [0.0; 2],
+            half_size: [-1.0, -1.0],
+            corner_radii: [0.0; 4],
+        };
+        let (w, h) = (clip.width, clip.height);
+        if !(w > 0.0 && h > 0.0) {
+            return EMPTY;
+        }
+        let m = self.paint.clip_to_target(clip);
+        let det = m[0] * m[3] - m[2] * m[1];
+        let inverse = [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det];
+        let [a, b, c, d] = inverse.map(|v| v as f32);
+        let (tx, ty) = (
+            -(inverse[0] * m[4] + inverse[2] * m[5]),
+            -(inverse[1] * m[4] + inverse[3] * m[5]),
+        );
+        let uniform = RetainedClipUniform {
+            matrix: [a, b, c, d],
+            translation: [tx as f32, ty as f32],
+            half_size: [0.5 * w, 0.5 * h],
+            corner_radii: clip.corner_radii.map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+        };
+        let finite = uniform
+            .matrix
+            .iter()
+            .chain(&uniform.translation)
+            .all(|v| v.is_finite());
+        if det == 0.0 || !finite {
+            EMPTY
+        } else {
+            uniform
         }
     }
 }
 
-/// Per-draw uniforms shared by the Metal and WGSL shaders (96 bytes).
+/// Per-draw uniforms shared by the Metal and WGSL shaders (288 bytes).
 /// Transforms are row-major 2x2 then translation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -340,8 +479,29 @@ pub struct RetainedShapesUniforms {
     pub greek_band: [f32; 2],
     /// Layer-1 transform in buffer space.
     pub layer1: [f32; 6],
+    /// How many of `clips` apply.
+    pub clip_count: u32,
     #[doc(hidden)]
-    pub _pad: [f32; 2],
+    pub _pad: f32,
+    /// The draw's clips.
+    pub clips: [RetainedClipUniform; MAX_RETAINED_CLIPS],
+}
+
+/// One clip in [`RetainedShapesUniforms`] (48 bytes): device pixels map to
+/// its space by `matrix` (`[a, b, c, d]`, x' = a·x + c·y + tx) and
+/// `translation`, where it is a rounded rectangle centered on `half_size`.
+/// A negative `half_size` is an empty clip.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct RetainedClipUniform {
+    /// Device pixels to the clip's space, 2x2 part.
+    pub matrix: [f32; 4],
+    /// Device pixels to the clip's space, translation.
+    pub translation: [f32; 2],
+    /// Half the clip's size.
+    pub half_size: [f32; 2],
+    /// Corner radii, clamped.
+    pub corner_radii: [f32; 4],
 }
 
 /// A small scene that exercises retained shapes, for renderer tests: every
@@ -560,6 +720,112 @@ pub mod retained_shapes_test_scene {
         (scene, probes)
     }
 
+    /// Clips: a red square clipped to a rotated, rounded square (45°, side
+    /// 30, radius 6, centered on (20, 32)); a green square clipped to the
+    /// intersection of two rectangles, the second moved up 10 px by the
+    /// layer transformation; a blue square clipped to a clip stretched 200
+    /// times more across than down, whose edges stay one pixel sharp.
+    /// Probes inside and outside each.
+    pub fn clip_scene(shapes: &RetainedShapes) -> (Scene, Vec<Probe>) {
+        shapes.set_all(vec![
+            rect(0.0, 0.0, 64.0, 64.0, 0xff0000ff),
+            rect(0.0, 0.0, 64.0, 64.0, 0x00ff00ff),
+            rect(0.0, 0.0, 64.0, 64.0, 0x0000ffff),
+        ]);
+        let full = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        );
+        let (sin, cos) = std::f32::consts::FRAC_PI_4.sin_cos();
+        // The rotated square's own (0, 0) corner, so that its center lands on (20, 32).
+        let (cx, cy) = (
+            20.0 - (cos * 15.0 - sin * 15.0),
+            32.0 - (sin * 15.0 + cos * 15.0),
+        );
+        let diamond = RetainedClip {
+            transform: [cos, sin, -sin, cos, cx, cy],
+            width: 30.0,
+            height: 30.0,
+            corner_radii: [6.0; 4],
+            layer_1: false,
+        };
+        let right = RetainedClip {
+            transform: [1.0, 0.0, 0.0, 1.0, 44.0, 0.0],
+            width: 20.0,
+            height: 64.0,
+            ..Default::default()
+        };
+        let low = RetainedClip {
+            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 40.0],
+            width: 64.0,
+            height: 24.0,
+            layer_1: true,
+            ..Default::default()
+        };
+        let up = TransformationMatrix {
+            rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+            translation: [0.0, -10.0],
+        };
+        // Stretched 100x across and 0.5x down: 10 x 4 device pixels at (2, 54).
+        let stretched = RetainedClip {
+            transform: [100.0, 0.0, 0.0, 0.5, 2.0, 54.0],
+            width: 0.1,
+            height: 8.0,
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        for (order, paint) in [
+            (
+                0,
+                RetainedShapesPaint::new(0..1, TransformationMatrix::unit()).clip(diamond),
+            ),
+            (
+                1,
+                RetainedShapesPaint::new(1..2, TransformationMatrix::unit())
+                    .layer(up)
+                    .clip(right)
+                    .clip(low),
+            ),
+            (
+                2,
+                RetainedShapesPaint::new(2..3, TransformationMatrix::unit()).clip(stretched),
+            ),
+        ] {
+            let bounds = paint.clip_bounds().map_or(full, |b| full.intersect(&b));
+            scene.insert_primitive(RetainedShapesDraw {
+                order,
+                bounds,
+                content_mask: ContentMask { bounds: full },
+                shapes: shapes.clone(),
+                paint,
+                opacity: 1.0,
+            });
+        }
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        const BLACK: [u8; 4] = [0, 0, 0, 255];
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let probes = vec![
+            probe("inside the rotated clip", 20, 32, RED),
+            probe("inside, near its rounded tip", 35, 31, RED),
+            probe("past the rounded tip, inside the sharp one", 40, 31, BLACK),
+            probe("outside the rotated clip's side", 32, 20, BLACK),
+            probe("a corner of the target", 2, 2, BLACK),
+            probe("inside both clips, the second moved up", 54, 35, GREEN),
+            probe("below the moved clip", 54, 58, BLACK),
+            probe("above the moved clip", 54, 20, BLACK),
+            probe("left of the first clip", 40, 45, BLACK),
+            probe("inside the stretched clip", 6, 55, BLUE),
+            probe("its last column: the edge is sharp across", 11, 55, BLUE),
+            probe("past its right edge", 12, 55, BLACK),
+            probe("its last row: the edge is sharp down", 6, 57, BLUE),
+            probe("below it", 6, 58, BLACK),
+        ];
+        (scene, probes)
+    }
+
     /// A denser scene for comparing backends pixel by pixel: `n` random shapes
     /// of every kind (rotated, stroked, translucent, some below one pixel, some on
     /// layer 1) on a 256x256 target.
@@ -623,20 +889,50 @@ pub mod retained_shapes_test_scene {
             point(ScaledPixels(0.0), ScaledPixels(0.0)),
             size(ScaledPixels(256.0), ScaledPixels(256.0)),
         );
+        let layer = TransformationMatrix {
+            rotation_scale: [[0.9, 0.2], [-0.2, 0.9]],
+            translation: [12.0, -7.0],
+        };
+        // The second half draws inside a rotated rounded clip and a clip on layer 1.
+        let (sin, cos) = 0.4f32.sin_cos();
+        let tilted = RetainedClip {
+            transform: [cos, sin, -sin, cos, 70.0, 20.0],
+            width: 170.0,
+            height: 150.0,
+            corner_radii: [40.0, 0.0, 12.0, 70.0],
+            layer_1: false,
+        };
+        let moved = RetainedClip {
+            transform: [1.0, 0.0, 0.0, 1.0, 10.0, 30.0],
+            width: 200.0,
+            height: 200.0,
+            corner_radii: [24.0; 4],
+            layer_1: true,
+        };
+        let half = (n / 2) as u32;
         let mut scene = Scene::default();
-        scene.insert_primitive(RetainedShapesDraw {
-            order: 0,
-            bounds: full,
-            content_mask: ContentMask { bounds: full },
-            shapes: shapes.clone(),
-            paint: RetainedShapesPaint::new(0..n as u32, TransformationMatrix::unit()).layer(
-                TransformationMatrix {
-                    rotation_scale: [[0.9, 0.2], [-0.2, 0.9]],
-                    translation: [12.0, -7.0],
-                },
+        for (order, paint) in [
+            (
+                0,
+                RetainedShapesPaint::new(0..half, TransformationMatrix::unit()).layer(layer),
             ),
-            opacity: 0.9,
-        });
+            (
+                1,
+                RetainedShapesPaint::new(half..n as u32, TransformationMatrix::unit())
+                    .layer(layer)
+                    .clip(tilted)
+                    .clip(moved),
+            ),
+        ] {
+            scene.insert_primitive(RetainedShapesDraw {
+                order,
+                bounds: full,
+                content_mask: ContentMask { bounds: full },
+                shapes: shapes.clone(),
+                paint,
+                opacity: 0.9,
+            });
+        }
         scene.finish();
         (scene, (256, 256))
     }
@@ -672,8 +968,10 @@ mod tests {
         // 16 four-byte words: the Metal and WGSL `RetainedShape` records.
         assert_eq!(std::mem::size_of::<ShapeInstance>(), 16 * 4);
         // Six floats, float2, float4 (16-aligned at 32), two floats, float2,
-        // six floats, float2.
-        assert_eq!(std::mem::size_of::<RetainedShapesUniforms>(), 96);
+        // six floats, uint, float, then four 48-byte clips at 96.
+        assert_eq!(std::mem::size_of::<RetainedClipUniform>(), 48);
+        assert_eq!(std::mem::size_of::<RetainedShapesUniforms>(), 96 + 4 * 48);
+        assert_eq!(std::mem::offset_of!(RetainedShapesUniforms, clips), 96);
     }
 
     fn describe(u: RetainedUpload<'_>) -> String {
@@ -737,6 +1035,75 @@ mod tests {
             }
             _ => panic!("expected ranges"),
         });
+    }
+
+    #[test]
+    fn clip_uniforms_map_device_pixels_into_the_clip() {
+        let scale = TransformationMatrix::unit().scale(crate::size(2.0, 2.0));
+        let layer = TransformationMatrix {
+            rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
+            translation: [5.0, 0.0],
+        };
+        // A quarter turn.
+        let clip = RetainedClip {
+            transform: [0.0, 1.0, -1.0, 0.0, 100.0, 10.0],
+            width: 40.0,
+            height: 20.0,
+            corner_radii: [4.0, 100.0, 0.0, 0.0],
+            layer_1: true,
+        };
+        let paint = RetainedShapesPaint::new(0..1, scale)
+            .layer(layer)
+            .clip(clip);
+        let draw = RetainedShapesDraw {
+            order: 0,
+            bounds: Bounds::default(),
+            content_mask: ContentMask::default(),
+            shapes: RetainedShapes::new(),
+            paint: paint.clone(),
+            opacity: 1.0,
+        };
+        let u = draw.uniforms([400.0, 400.0]);
+        assert_eq!(u.clip_count, 1);
+        let c = u.clips[0];
+        // The clip's (10, 5) is buffer (100 - 5 + 5, 10 + 10) after the layer: device (200, 40).
+        let (x, y) = (200.0, 40.0);
+        let local = (
+            c.matrix[0] * x + c.matrix[2] * y + c.translation[0],
+            c.matrix[1] * x + c.matrix[3] * y + c.translation[1],
+        );
+        assert!(
+            (local.0 - 10.0).abs() < 1e-4 && (local.1 - 5.0).abs() < 1e-4,
+            "{local:?}"
+        );
+        assert_eq!(c.half_size, [20.0, 10.0]);
+        assert_eq!(
+            c.corner_radii,
+            [4.0, 10.0, 0.0, 0.0],
+            "clamped to half the shorter side"
+        );
+        // Bounds: the rotated 40 x 20 box at buffer (80..100, 10..50), moved 5 right, scaled by 2, plus a pixel.
+        let b = paint.clip_bounds().unwrap();
+        assert_eq!(
+            (b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0),
+            (169.0, 19.0, 42.0, 82.0)
+        );
+        // No clips, no bounds; a clip with no area hides everything.
+        assert!(
+            RetainedShapesPaint::new(0..1, scale)
+                .clip_bounds()
+                .is_none()
+        );
+        let flat = RetainedShapesDraw {
+            paint: RetainedShapesPaint::new(0..1, scale).clip(RetainedClip {
+                transform: [0.0; 6],
+                width: 1.0,
+                height: 1.0,
+                ..Default::default()
+            }),
+            ..draw
+        };
+        assert!(flat.uniforms([1.0, 1.0]).clips[0].half_size[0] < 0.0);
     }
 
     #[test]

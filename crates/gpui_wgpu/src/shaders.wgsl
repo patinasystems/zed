@@ -1380,6 +1380,16 @@ struct RetainedShape {
     kind: u32,
 }
 
+// A rounded-rectangle clip: device px map to its space by `m` (x' = m.x x +
+// m.z y + t.x, y' = m.y x + m.w y + t.y), where it is centered on `half_size`;
+// a negative half size is an empty clip.
+struct RetainedClip {
+    m: vec4<f32>,
+    t: vec2<f32>,
+    half_size: vec2<f32>,
+    radii: vec4<f32>, // top-left, top-right, bottom-right, bottom-left
+}
+
 struct RetainedShapesUniforms {
     m00: f32, m01: f32, m10: f32, m11: f32, mtx: f32, mty: f32,
     viewport_size: vec2<f32>,
@@ -1388,7 +1398,9 @@ struct RetainedShapesUniforms {
     lod_min_px: f32,
     greek_band: vec2<f32>,
     l00: f32, l01: f32, l10: f32, l11: f32, ltx: f32, lty: f32,
-    pad: vec2<f32>,
+    clip_count: u32,
+    pad: f32,
+    clips: array<RetainedClip, 4>,
 }
 
 // Bound per draw with a dynamic offset. Group 2 is the sprite texture for other
@@ -1582,6 +1594,30 @@ fn retained_ellipse_sdf(p: vec2<f32>, radii: vec2<f32>) -> f32 {
     return select(-min(r.x, r.y), k0 * (k0 - 1.0) / k1, k1 > 0.0);
 }
 
+// How much of the device pixel at `pos` is inside every clip (antialiased
+// like a shape's edge: the distance is measured in device pixels along the
+// edge's normal, so a stretched clip stays sharp on both axes).
+fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
+    var coverage = 1.0;
+    for (var i = 0u; i < retained_uniforms.clip_count; i++) {
+        let c = retained_uniforms.clips[i];
+        if c.half_size.x < 0.0 {
+            return 0.0;
+        }
+        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
+        let d = retained_rect_sdf(p, c.half_size, c.radii);
+        // The distance's gradient in clip space, then in device pixels.
+        let side = select(c.radii.xw, c.radii.yz, p.x >= 0.0);
+        let radius = select(side.x, side.y, p.y >= 0.0);
+        let q = abs(p) - c.half_size + radius;
+        var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
+        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
+        let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
+        coverage *= clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0);
+    }
+    return coverage;
+}
+
 // Coverage of fill and stroke for a closed outline at signed distance `d_px`.
 fn retained_fill_and_stroke(d_px: f32, half_stroke: f32, px_per_unit: f32, fill: vec4<f32>, stroke: vec4<f32>) -> vec4<f32> {
     let fill_cov = clamp(0.5 - d_px, 0.0, 1.0);
@@ -1608,8 +1644,12 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     if pos.x < mask.x || pos.y < mask.y || pos.x >= mask.x + mask.z || pos.y >= mask.y + mask.w {
         discard;
     }
+    let clip = retained_clip_coverage(pos);
+    if clip <= 0.0 {
+        discard;
+    }
     if input.kind == RETAINED_SOLID {
-        return blend_color(input.fill, retained_uniforms.opacity);
+        return blend_color(input.fill, retained_uniforms.opacity * clip);
     }
     let half_size = input.size * 0.5;
     let p = input.local - half_size;
@@ -1629,5 +1669,5 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     if color.a <= 0.0 {
         discard;
     }
-    return blend_color(color, retained_uniforms.opacity);
+    return blend_color(color, retained_uniforms.opacity * clip);
 }

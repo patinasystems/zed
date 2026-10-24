@@ -2882,6 +2882,12 @@ mod tests {
         let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
 
+        // Rounded, rotated and layer-moved clips.
+        let clipped = gpui::RetainedShapes::new();
+        let (scene, probes) = t::clip_scene(&clipped);
+        let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+
         // The dense scene, kept for the Metal comparison below.
         let dense = gpui::RetainedShapes::new();
         let (scene, target) = t::random_scene(&dense, 400, 7);
