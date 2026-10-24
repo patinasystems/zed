@@ -272,6 +272,19 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => {
                 sprite.transformation.transform_bounds(sprite.bounds)
             }
+            Primitive::Quad(quad) => quad.transformation.transform_bounds(quad.bounds),
+            Primitive::Underline(underline) => {
+                underline.transformation.transform_bounds(underline.bounds)
+            }
+            Primitive::Shadow(shadow) => {
+                // Drop shadows paint up to three blur radii outside their bounds.
+                let bounds = if shadow.inset != 0 {
+                    shadow.element_bounds
+                } else {
+                    shadow.bounds.dilate(shadow.blur_radius * 3.)
+                };
+                shadow.transformation.transform_bounds(bounds)
+            }
             primitive => *primitive.bounds(),
         }
     }
@@ -596,6 +609,9 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    /// Applied to the quad after layout, in device pixels (see [`Window::with_element_transformation`]).
+    pub transformation: TransformationMatrix,
+    pub pad: [u32; 2], // align to 16 bytes (WebGL reads quads as whole texels)
 }
 
 impl From<Quad> for Primitive {
@@ -615,6 +631,8 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    /// Applied to the underline after layout, in device pixels.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Underline> for Primitive {
@@ -638,6 +656,8 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    /// Applied to the shadow after layout, in device pixels.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Shadow> for Primitive {
@@ -773,6 +793,47 @@ impl TransformationMatrix {
             point(ScaledPixels(min_x), ScaledPixels(min_y)),
             point(ScaledPixels(max_x), ScaledPixels(max_y)),
         )
+    }
+
+    /// Whether this is the unit matrix.
+    pub fn is_unit(&self) -> bool {
+        *self == Self::unit()
+    }
+
+    /// The inverse transformation, or `None` if this one is singular (it
+    /// collapses the plane onto a line or a point).
+    pub fn inverse(&self) -> Option<Self> {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        let determinant = a * d - b * c;
+        if determinant == 0. || !determinant.is_finite() {
+            return None;
+        }
+        let rotation_scale = [
+            [d / determinant, -b / determinant],
+            [-c / determinant, a / determinant],
+        ];
+        let [tx, ty] = self.translation;
+        Some(Self {
+            rotation_scale,
+            translation: [
+                -(rotation_scale[0][0] * tx + rotation_scale[0][1] * ty),
+                -(rotation_scale[1][0] * tx + rotation_scale[1][1] * ty),
+            ],
+        })
+    }
+
+    /// The same transformation for coordinates scaled by `scale_factor`
+    /// (logical to device pixels): the translation scales, the rest does not.
+    pub fn scale_translation(mut self, scale_factor: f32) -> Self {
+        self.translation[0] *= scale_factor;
+        self.translation[1] *= scale_factor;
+        self
+    }
+
+    /// Apply transformation to a point in device pixels.
+    pub fn apply_scaled(&self, point: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        let applied = self.apply(Point::new(Pixels(point.x.0), Pixels(point.y.0)));
+        Point::new(ScaledPixels(applied.x.0), ScaledPixels(applied.y.0))
     }
 
     /// Apply transformation to a point, mainly useful for debugging
@@ -1007,6 +1068,23 @@ impl Path<Pixels> {
     }
 }
 
+impl Path<ScaledPixels> {
+    /// Applies `transformation` to every vertex; the bounds become the box that covers the
+    /// transformed path.
+    pub fn transform(&mut self, transformation: &TransformationMatrix) {
+        if transformation.is_unit() {
+            return;
+        }
+        let apply = |p: Point<ScaledPixels>| transformation.apply_scaled(p);
+        for vertex in &mut self.vertices {
+            vertex.xy_position = apply(vertex.xy_position);
+        }
+        self.start = apply(self.start);
+        self.current = apply(self.current);
+        self.bounds = transformation.transform_bounds(self.bounds);
+    }
+}
+
 impl<T> Path<T>
 where
     T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
@@ -1041,6 +1119,131 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+/// Quads, borders, shadows and underlines painted under element transformations, for
+/// renderer tests: every backend renders it and must hit the same probe colors. Each
+/// probe fails if its primitive is drawn untransformed.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod element_transformation_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, radians, size};
+
+    fn color(r: f32, g: f32, b: f32) -> Hsla {
+        Rgba { r, g, b, a: 1.0 }.into()
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    /// Rotates by `degrees` (clockwise on screen) and scales by `scale` about `(x, y)`.
+    pub fn about(x: f32, y: f32, degrees: f32, scale: f32) -> TransformationMatrix {
+        let pivot = point(ScaledPixels(x), ScaledPixels(y));
+        TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(radians(degrees.to_radians()))
+            .scale(size(scale, scale))
+            .translate(-pivot)
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask {
+            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
+        };
+        let mut scene = Scene::default();
+        // A red square turned 45 degrees: a diamond reaching 11.3 px from its center.
+        scene.insert_primitive(Quad {
+            bounds: bounds(8., 8., 16., 16.),
+            content_mask: full,
+            background: color(1., 0., 0.).into(),
+            transformation: about(16., 16., 45., 1.),
+            ..Default::default()
+        });
+        // A blue square with a 3 px green border, scaled 1.5x about its center: 36..60
+        // with a 4.5 px border.
+        scene.insert_primitive(Quad {
+            bounds: bounds(40., 8., 16., 16.),
+            content_mask: full,
+            background: color(0., 0., 1.).into(),
+            border_color: color(0., 1., 0.),
+            border_widths: Edges::all(ScaledPixels(3.)),
+            transformation: about(48., 16., 0., 1.5),
+            ..Default::default()
+        });
+        // A white underline turned upright: x 15..17, y 33..49.
+        scene.insert_primitive(Underline {
+            order: 0,
+            pad: 0,
+            bounds: bounds(8., 40., 16., 2.),
+            content_mask: full,
+            color: color(1., 1., 1.),
+            thickness: ScaledPixels(2.),
+            wavy: false.into(),
+            transformation: about(16., 41., 90., 1.),
+        });
+        // A sharp yellow drop shadow turned 45 degrees: a diamond reaching 8.5 px.
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: bounds(40., 40., 12., 12.),
+            corner_radii: Corners::default(),
+            content_mask: full,
+            color: color(1., 1., 0.),
+            element_bounds: bounds(40., 40., 12., 12.),
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+            transformation: about(46., 46., 45., 1.),
+        });
+        // A magenta 4x8 quad stretched 4x wide and squeezed to half height: x 22..38,
+        // y 54..58. Its edges must stay sharp along both axes.
+        scene.insert_primitive(Quad {
+            bounds: bounds(28., 52., 4., 8.),
+            content_mask: full,
+            background: color(1., 0., 1.).into(),
+            transformation: TransformationMatrix::unit()
+                .translate(point(ScaledPixels(30.), ScaledPixels(56.)))
+                .scale(size(4., 0.5))
+                .translate(point(ScaledPixels(-30.), ScaledPixels(-56.))),
+            ..Default::default()
+        });
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let magenta = [255, 0, 255, 255];
+        let (black, red, green, blue, white, yellow) = (
+            [0, 0, 0, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+            [255, 255, 0, 255],
+        );
+        let probes = vec![
+            probe("rotated quad center", 16, 16, red),
+            probe("rotated quad tip above its box", 16, 6, red),
+            probe("rotated quad leaves its corner", 9, 9, black),
+            probe("scaled quad fill", 48, 16, blue),
+            probe("scaled quad border", 37, 16, green),
+            probe("scaled quad border past its box", 38, 22, green),
+            probe("outside the scaled quad", 34, 16, black),
+            probe("upright underline", 16, 35, white),
+            probe("upright underline leaves its row", 10, 41, black),
+            probe("rotated shadow tip", 46, 39, yellow),
+            probe("rotated shadow leaves its corner", 40, 40, black),
+            probe("stretched quad past its box", 24, 56, magenta),
+            probe("stretched quad's edge does not blur right", 38, 56, black),
+            probe("stretched quad's edge does not blur left", 21, 56, black),
+            probe("squeezed quad leaves its rows", 30, 52, black),
+        ];
+        (scene, probes)
     }
 }
 

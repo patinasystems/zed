@@ -849,6 +849,42 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// How window positions map into `bounds` when the hitbox was inserted under an
+    /// element transformation ([`Window::with_element_transformation`]).
+    pub transformation: HitboxTransformation,
+}
+
+/// How a hitbox maps window positions into its bounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum HitboxTransformation {
+    /// Window positions are the hitbox's coordinates.
+    #[default]
+    None,
+    /// Window logical pixels to the hitbox's coordinates.
+    Inverse(TransformationMatrix),
+    /// The element transformation collapses the hitbox: nothing hits it.
+    Singular,
+}
+
+impl HitboxTransformation {
+    fn for_element(transformation: TransformationMatrix) -> Self {
+        if transformation.is_unit() {
+            Self::None
+        } else {
+            transformation
+                .inverse()
+                .map_or(Self::Singular, Self::Inverse)
+        }
+    }
+
+    /// `position` in the hitbox's coordinates, or `None` if nothing can hit it.
+    pub fn local(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
+        match self {
+            Self::None => Some(position),
+            Self::Inverse(inverse) => Some(inverse.apply(position)),
+            Self::Singular => None,
+        }
+    }
 }
 
 impl Hitbox {
@@ -891,6 +927,31 @@ impl Hitbox {
     /// this sets `HitboxBehavior::BlockMouse` (`InteractiveElement::occlude`).
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
+    }
+
+    /// `position`, in window coordinates, in the hitbox's own coordinates (those of its
+    /// `bounds`). They differ when the hitbox was inserted under
+    /// [`Window::with_element_transformation`]. `None` if that transformation collapses it.
+    pub fn local_position(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
+        self.transformation.local(position)
+    }
+
+    /// `position`, in the hitbox's own coordinates, in window coordinates: the inverse of
+    /// [`Hitbox::local_position`].
+    pub fn window_position(&self, position: Point<Pixels>) -> Point<Pixels> {
+        match self.transformation {
+            HitboxTransformation::Inverse(inverse) => inverse
+                .inverse()
+                .map_or(position, |transformation| transformation.apply(position)),
+            HitboxTransformation::None | HitboxTransformation::Singular => position,
+        }
+    }
+
+    /// Whether `bounds` contain `position`, given in window coordinates (such as
+    /// [`Window::mouse_position`]), regardless of what is in front of the hitbox.
+    pub fn contains_window_position(&self, position: Point<Pixels>) -> bool {
+        self.local_position(position)
+            .is_some_and(|local| self.bounds.contains(&local))
     }
 }
 
@@ -1039,6 +1100,8 @@ pub(crate) struct DeferredDraw {
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
+    /// The element transformation in effect where the draw was deferred.
+    element_transformation: TransformationMatrix,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -1175,8 +1238,13 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            // Content masks are in window coordinates; transformed bounds are local.
+            let hit = hitbox.content_mask.bounds.contains(&position)
+                && hitbox
+                    .transformation
+                    .local(position)
+                    .is_some_and(|local| hitbox.bounds.contains(&local));
+            if hit {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1249,6 +1317,9 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// Composed element transformations in window logical pixels; see
+    /// [`Window::with_element_transformation`].
+    pub(crate) element_transformation_stack: Vec<TransformationMatrix>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2156,6 +2227,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            element_transformation_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -3245,8 +3317,15 @@ impl Window {
             self.next_frame.scene.insert_primitive(underline);
             return;
         }
+        // Exclusions are spans of the underline's own (untransformed) x. Content masks are
+        // in window coordinates, so a transformed underline is split by its bounds instead.
+        let transformed = !underline.transformation.is_unit();
 
-        let bounds = underline.bounds.intersect(&underline.content_mask.bounds);
+        let bounds = if transformed {
+            underline.bounds
+        } else {
+            underline.bounds.intersect(&underline.content_mask.bounds)
+        };
         if bounds.is_empty() {
             return;
         }
@@ -3266,14 +3345,18 @@ impl Window {
         exclusions.sort_unstable_by_key(|span| span.start);
 
         let mut paint_span = |start, end| {
-            self.next_frame.scene.insert_primitive(Underline {
-                content_mask: ContentMask {
-                    bounds: Bounds::from_corners(
-                        point(start, bounds.top()),
-                        point(end, bounds.bottom()),
-                    ),
-                },
-                ..underline
+            let span =
+                Bounds::from_corners(point(start, bounds.top()), point(end, bounds.bottom()));
+            self.next_frame.scene.insert_primitive(if transformed {
+                Underline {
+                    bounds: span,
+                    ..underline
+                }
+            } else {
+                Underline {
+                    content_mask: ContentMask { bounds: span },
+                    ..underline
+                }
             });
         };
         let mut start = bounds.left();
@@ -3300,6 +3383,7 @@ impl Window {
                 .opacity(self.element_opacity()),
             thickness: self.snap_stroke(style.thickness),
             wavy: style.wavy.into(),
+            transformation: self.device_element_transformation(),
         }
     }
 
@@ -3914,7 +3998,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    element_transformation,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3926,6 +4018,7 @@ impl Window {
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
+                        deferred_draw.element_transformation,
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -3936,7 +4029,10 @@ impl Window {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                                window.with_element_transformation(
+                                    element_transformation,
+                                    |window| element.prepaint(window, cx),
+                                );
                             });
                         });
                     });
@@ -3978,10 +4074,17 @@ impl Window {
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
+                    // The mask was captured in window coordinates: apply it before the
+                    // transformation, which would map it again.
                     window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
+                        window.with_element_transformation(
+                            deferred_draw.element_transformation,
+                            |window| {
+                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                    element.paint(window, cx);
+                                });
+                            },
+                        )
                     })
                 })
             } else {
@@ -4057,6 +4160,7 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
+                    element_transformation: deferred_draw.element_transformation,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -4185,7 +4289,12 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
-        if let Some(mask) = mask {
+        if let Some(mut mask) = mask {
+            // Masks stay in window coordinates: a mask inside a transformed element covers
+            // its transformed bounds (exact for translation and scale).
+            if let Some(transformation) = self.element_transformation_stack.last() {
+                mask.bounds = transform_pixel_bounds(transformation, mask.bounds);
+            }
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
@@ -4194,6 +4303,54 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// Paints, hit-tests and delivers mouse events to everything `f` draws through
+    /// `transformation`, composed with any enclosing element transformation. Use it around both
+    /// the prepaint and the paint of an element subtree, as CSS `transform` does:
+    ///
+    /// - `transformation` maps window logical pixels (where layout placed the subtree) to window
+    ///   logical pixels. To rotate by `angle` about `pivot`, compose
+    ///   `translate(pivot) · rotate(angle) · translate(-pivot)`. Layout is unaffected.
+    /// - Quads, borders, shadows, underlines, paths, glyphs, images, SVGs and retained shapes are
+    ///   transformed when painted. Glyphs keep rasterizing at the transformation's scale
+    ///   ([`Window::paint_glyph_with_transformation`]). Surfaces are not transformed.
+    /// - Hitboxes inserted inside test window positions mapped back through the inverse, and
+    ///   mouse listeners registered inside receive events with positions in the subtree's own
+    ///   coordinates, so `bounds.contains(&event.position)` keeps working.
+    /// - Content masks set inside clip to their transformed bounding box, which is exact for
+    ///   translation and scale and covers a rotated mask.
+    ///
+    /// This method should only be called during the prepaint or paint phase of element drawing.
+    pub fn with_element_transformation<R>(
+        &mut self,
+        transformation: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if transformation.is_unit() {
+            return f(self);
+        }
+        let composed = self.element_transformation().compose(transformation);
+        self.element_transformation_stack.push(composed);
+        let result = f(self);
+        self.element_transformation_stack.pop();
+        result
+    }
+
+    /// The composed element transformation, in window logical pixels; the unit matrix outside
+    /// [`Window::with_element_transformation`].
+    pub fn element_transformation(&self) -> TransformationMatrix {
+        self.element_transformation_stack
+            .last()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The element transformation for device-pixel primitives.
+    fn device_element_transformation(&self) -> TransformationMatrix {
+        self.element_transformation()
+            .scale_translation(self.scale_factor())
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
@@ -4539,6 +4696,7 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
+            element_transformation: self.element_transformation(),
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
@@ -4553,6 +4711,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
+        let bounds = match self.element_transformation_stack.last() {
+            Some(transformation) => transform_pixel_bounds(transformation, bounds),
+            None => bounds,
+        };
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
@@ -4587,6 +4749,7 @@ impl Window {
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
+        let transformation = self.device_element_transformation();
         for shadow in shadows {
             if shadow.inset {
                 continue;
@@ -4603,6 +4766,7 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
+                transformation,
             });
         }
     }
@@ -4623,6 +4787,7 @@ impl Window {
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
+        let transformation = self.device_element_transformation();
         for shadow in shadows {
             if !shadow.inset {
                 continue;
@@ -4648,6 +4813,7 @@ impl Window {
                 element_corner_radii,
                 inset: 1,
                 pad: 0,
+                transformation,
             });
         }
     }
@@ -4715,9 +4881,13 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            transformation: self.device_element_transformation(),
+            pad: [0; 2],
         };
 
-        if !quad.background.is_transparent() {
+        // The strips below are clipped with window-space masks, so a transformed quad
+        // is drawn whole.
+        if !quad.background.is_transparent() || !quad.transformation.is_unit() {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4780,9 +4950,12 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        let mut path = path.scale(scale_factor);
+        let transformation = self.device_element_transformation();
+        if !transformation.is_unit() {
+            path.transform(&transformation);
+        }
+        self.next_frame.scene.insert_primitive(path);
     }
 
     /// Paint shapes from a retained buffer: `paint.range` under
@@ -4806,10 +4979,13 @@ impl Window {
             return;
         }
         let scale_factor = self.scale_factor();
-        paint.transformation = TransformationMatrix::unit()
-            .scale(size(scale_factor, scale_factor))
-            .compose(paint.transformation);
-        let mut bounds = bounds.scale(scale_factor);
+        let element = self.device_element_transformation();
+        paint.transformation = element.compose(
+            TransformationMatrix::unit()
+                .scale(size(scale_factor, scale_factor))
+                .compose(paint.transformation),
+        );
+        let mut bounds = element.transform_bounds(bounds.scale(scale_factor));
         // Nothing shows outside the clips: the draw covers only their bounds.
         if let Some(clip) = paint.clip_bounds() {
             bounds = bounds.intersect(&clip);
@@ -4866,6 +5042,7 @@ impl Window {
             thickness: self.snap_stroke(style.thickness),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: false.into(),
+            transformation: self.device_element_transformation(),
         });
     }
 
@@ -4930,6 +5107,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
+        let transformation = self.device_element_transformation().compose(transformation);
         let Some((raster_scale_factor, transformation)) =
             glyph_raster_transformation(transformation, font_size, self.scale_factor())
         else {
@@ -5061,6 +5239,7 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
+        let transformation = self.device_element_transformation().compose(transformation);
         let Some((raster_scale_factor, transformation)) =
             glyph_raster_transformation(transformation, font_size, self.scale_factor())
         else {
@@ -5170,7 +5349,7 @@ impl Window {
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            transformation: self.device_element_transformation().compose(transformation),
         });
 
         Ok(())
@@ -5307,7 +5486,7 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
-            transformation,
+            transformation: self.device_element_transformation().compose(transformation),
         });
         Ok(())
     }
@@ -5467,6 +5646,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            transformation: HitboxTransformation::for_element(self.element_transformation()),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -5621,10 +5801,23 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        // Under an element transformation, listeners see positions in the element's own
+        // (untransformed) coordinates, the space its bounds and hitboxes are in.
+        let transformation = HitboxTransformation::for_element(self.element_transformation());
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
+                let Some(event) = event.downcast_ref::<Event>() else {
+                    return;
+                };
+                match transformation {
+                    HitboxTransformation::None => listener(event, phase, window, cx),
+                    HitboxTransformation::Inverse(inverse) => {
+                        let event = event.map_position(&|position| inverse.apply(position));
+                        listener(&event, phase, window, cx)
+                    }
+                    // A collapsed element is under no position; it still hears the event
+                    // (capture-phase listeners watch for events outside an element).
+                    HitboxTransformation::Singular => listener(event, phase, window, cx),
                 }
             },
         )));
@@ -8115,6 +8308,458 @@ mod tests {
         WindowOptions, canvas, div, hsla, point, px, size,
     };
 
+    /// A canvas whose hitbox, quad and mouse listener sit under one element
+    /// transformation: a quarter turn about (50, 50).
+    struct TransformedProbe {
+        downs: Rc<RefCell<Vec<Point<Pixels>>>>,
+        hovered: Rc<Cell<bool>>,
+    }
+
+    fn quarter_turn() -> super::TransformationMatrix {
+        let pivot = point(ScaledPixels(50.), ScaledPixels(50.));
+        super::TransformationMatrix::unit()
+            .translate(pivot)
+            .rotate(crate::radians(std::f32::consts::FRAC_PI_2))
+            .translate(-pivot)
+    }
+
+    impl Render for TransformedProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (downs, hovered) = (self.downs.clone(), self.hovered.clone());
+            // The box x 40..60, y 20..40 turns to x 60..80, y 40..60.
+            let local = Bounds::new(point(px(40.), px(20.)), size(px(20.), px(20.)));
+            canvas(
+                move |_, window, _| {
+                    window.with_element_transformation(quarter_turn(), |window| {
+                        window.insert_hitbox(local, super::HitboxBehavior::Normal)
+                    })
+                },
+                move |_, hitbox, window, _| {
+                    window.with_element_transformation(quarter_turn(), |window| {
+                        hovered.set(hitbox.is_hovered(window));
+                        window.paint_quad(crate::fill(local, hsla(0., 1., 0.5, 1.)));
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, _| {
+                            if phase == DispatchPhase::Bubble {
+                                downs.borrow_mut().push(event.position);
+                            }
+                        });
+                    })
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn test_element_transformation_paints_and_hit_tests(cx: &mut TestAppContext) {
+        let downs = Rc::new(RefCell::new(Vec::new()));
+        let hovered = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let (downs, hovered) = (downs.clone(), hovered.clone());
+            move |_, _| TransformedProbe { downs, hovered }
+        });
+        let hits = |cx: &mut TestAppContext, at: Point<Pixels>| {
+            window
+                .update(cx, |_, window, _| {
+                    !window.rendered_frame.hit_test(at).ids.is_empty()
+                })
+                .unwrap()
+        };
+        cx.run_until_parked();
+        assert!(hits(cx, point(px(70.), px(50.))), "inside the turned box");
+        assert!(hits(cx, point(px(62.), px(58.))));
+        assert!(
+            !hits(cx, point(px(50.), px(30.))),
+            "where the box was laid out"
+        );
+        assert!(!hits(cx, point(px(58.), px(50.))));
+
+        // The quad carries the transformation, in device pixels.
+        window
+            .update(cx, |_, window, _| {
+                let quad = &window.rendered_frame.scene.quads[0];
+                let expected = quarter_turn().scale_translation(window.scale_factor());
+                for (a, e) in quad
+                    .transformation
+                    .rotation_scale
+                    .iter()
+                    .flatten()
+                    .chain(&quad.transformation.translation)
+                    .zip(
+                        expected
+                            .rotation_scale
+                            .iter()
+                            .flatten()
+                            .chain(&expected.translation),
+                    )
+                {
+                    assert!(
+                        (a - e).abs() < 1e-4,
+                        "{:?} vs {expected:?}",
+                        quad.transformation
+                    );
+                }
+            })
+            .unwrap();
+
+        // Listeners get the press in the element's own coordinates.
+        let press = |cx: &mut TestAppContext, at: Point<Pixels>| {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: at,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            position: at,
+                            button: MouseButton::Left,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        press(cx, point(px(70.), px(50.)));
+        let local = downs.borrow()[0];
+        assert!(
+            (local.x - px(50.)).abs() < px(0.01) && (local.y - px(30.)).abs() < px(0.01),
+            "{local:?}"
+        );
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        cx.run_until_parked();
+        assert!(hovered.get(), "is_hovered follows the transformed hitbox");
+    }
+
+    /// Prepaints and paints a child under an element transformation, as an
+    /// application wrapping a subtree for CSS `transform` would.
+    struct TransformedChild(crate::AnyElement, super::TransformationMatrix);
+
+    impl IntoElement for TransformedChild {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl crate::Element for TransformedChild {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) -> (crate::LayoutId, ()) {
+            (self.0.request_layout(window, cx), ())
+        }
+        fn prepaint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            window.with_element_transformation(self.1, |window| self.0.prepaint(window, cx));
+        }
+        fn paint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            window.with_element_transformation(self.1, |window| self.0.paint(window, cx));
+        }
+    }
+
+    /// A 100x100 box at the origin, drawn moved 200 px right and doubled: x 200..400.
+    struct TransformedInteractive {
+        outside: Rc<Cell<usize>>,
+        scroll: crate::ScrollHandle,
+    }
+
+    impl Render for TransformedInteractive {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let outside = self.outside.clone();
+            let transformation = super::TransformationMatrix::unit()
+                .translate(point(ScaledPixels(200.), ScaledPixels(0.)))
+                .scale(size(2., 2.));
+            div().size_full().child(TransformedChild(
+                div()
+                    .id("scroller")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .on_mouse_down_out(move |_, _, _| outside.set(outside.get() + 1))
+                    .child(div().w(px(100.)).h(px(1000.)))
+                    .into_any_element(),
+                transformation,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_input_under_element_transformation(cx: &mut TestAppContext) {
+        let outside = Rc::new(Cell::new(0));
+        let scroll = crate::ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let (outside, scroll) = (outside.clone(), scroll.clone());
+            move |_, _| TransformedInteractive { outside, scroll }
+        });
+        cx.run_until_parked();
+        // Inside the drawn box (and outside its layout bounds): not "outside".
+        cx.simulate_click(point(px(300.), px(150.)), crate::Modifiers::default());
+        assert_eq!(
+            outside.get(),
+            0,
+            "a press on the drawn box is not outside it"
+        );
+        // Inside the layout bounds but not the drawn box: outside.
+        cx.simulate_click(point(px(50.), px(50.)), crate::Modifiers::default());
+        assert_eq!(outside.get(), 1);
+
+        // A 40 px trackpad scroll over the doubled box scrolls 20 local px, so the
+        // content moves 40 screen px with the fingers.
+        cx.simulate_event(crate::ScrollEvent {
+            position: point(px(300.), px(100.)),
+            delta: crate::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(scroll.offset().y, px(-20.));
+    }
+
+    /// Under translate(200, 0) · scale(2): a draggable 100x100 box (drawn over x 200..400)
+    /// and a deferred 20x20 hitbox at its origin (drawn over x 200..240, y 0..40).
+    struct TransformedDragAndDeferred {
+        offsets: Rc<RefCell<Vec<Point<Pixels>>>>,
+        deferred: Rc<Cell<bool>>,
+        scale: f32,
+    }
+
+    impl Render for TransformedDragAndDeferred {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (offsets, deferred) = (self.offsets.clone(), self.deferred.clone());
+            let transformation = super::TransformationMatrix::unit()
+                .translate(point(ScaledPixels(200.), ScaledPixels(0.)))
+                .scale(size(self.scale, self.scale));
+            let probe = canvas(
+                |bounds, window, _| window.insert_hitbox(bounds, super::HitboxBehavior::Normal),
+                move |_, hitbox, window, _| deferred.set(hitbox.is_hovered(window)),
+            )
+            .w(px(20.))
+            .h(px(20.));
+            div().size_full().child(TransformedChild(
+                div()
+                    .id("draggable")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_drag(7u32, move |_, offset, _, cx| {
+                        offsets.borrow_mut().push(offset);
+                        cx.new(|_| crate::Empty)
+                    })
+                    .child(crate::deferred(probe))
+                    .into_any_element(),
+                transformation,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_drags_and_deferred_draws_under_element_transformation(cx: &mut TestAppContext) {
+        let offsets = Rc::new(RefCell::new(Vec::new()));
+        let deferred = Rc::new(Cell::new(false));
+        let (_, cx) = cx.add_window_view({
+            let (offsets, deferred) = (offsets.clone(), deferred.clone());
+            move |_, _| TransformedDragAndDeferred {
+                offsets,
+                deferred,
+                scale: 2.,
+            }
+        });
+        cx.run_until_parked();
+        // The deferred child keeps its parent's transformation.
+        cx.simulate_mouse_move(point(px(230.), px(30.)), None, crate::Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            deferred.get(),
+            "the deferred child is hit where it is drawn"
+        );
+        cx.simulate_mouse_move(point(px(10.), px(10.)), None, crate::Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(!deferred.get(), "nor where it was laid out");
+
+        // The drag preview's cursor offset is in window coordinates: the drag starts at
+        // the move, 140 px right of and below the drawn box's corner.
+        let modifiers = crate::Modifiers::default();
+        cx.simulate_mouse_down(point(px(300.), px(100.)), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(px(340.), px(140.)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(*offsets.borrow(), vec![point(px(140.), px(140.))]);
+    }
+
+    #[gpui::test]
+    fn test_drag_threshold_is_in_window_pixels_under_scale(cx: &mut TestAppContext) {
+        let offsets = Rc::new(RefCell::new(Vec::new()));
+        // A quarter scale: the box is drawn over x 200..225, y 0..25.
+        let (_, cx) = cx.add_window_view({
+            let offsets = offsets.clone();
+            move |_, _| TransformedDragAndDeferred {
+                offsets,
+                deferred: Rc::default(),
+                scale: 0.25,
+            }
+        });
+        cx.run_until_parked();
+        let modifiers = crate::Modifiers::default();
+        cx.simulate_mouse_down(point(px(210.), px(10.)), MouseButton::Left, modifiers);
+        // 1.5 window px is under the 2 px threshold, though it is 6 local px.
+        cx.simulate_mouse_move(point(px(211.5), px(10.)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert!(offsets.borrow().is_empty(), "{:?}", offsets.borrow());
+        cx.simulate_mouse_move(point(px(213.), px(10.)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(offsets.borrow().len(), 1);
+    }
+
+    /// Clickable text moved 200 px right by an element transformation.
+    struct TransformedLink;
+
+    impl Render for TransformedLink {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let transformation = super::TransformationMatrix::unit()
+                .translate(point(ScaledPixels(200.), ScaledPixels(0.)));
+            let link =
+                crate::InteractiveText::new("link", crate::StyledText::new("link link link"))
+                    .on_click(vec![0..14], |_, _, _| {});
+            div()
+                .size_full()
+                .child(TransformedChild(link.into_any_element(), transformation))
+        }
+    }
+
+    #[gpui::test]
+    fn test_interactive_text_cursor_under_element_transformation(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TransformedLink);
+        cx.run_until_parked();
+        let cursor_at = |cx: &mut crate::VisualTestContext, at: Point<Pixels>| {
+            cx.simulate_mouse_move(at, None, crate::Modifiers::default());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.update(|window, _| window.rendered_frame.cursor_style(window))
+        };
+        assert_eq!(
+            cursor_at(cx, point(px(210.), px(5.))),
+            Some(crate::CursorStyle::PointingHand),
+            "over the drawn link"
+        );
+        assert_ne!(
+            cursor_at(cx, point(px(10.), px(5.))),
+            Some(crate::CursorStyle::PointingHand)
+        );
+    }
+
+    #[gpui::test]
+    fn test_transformed_underline_keeps_its_exclusions(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| crate::Empty);
+        window
+            .update(cx, |_, window, _| {
+                window.invalidator.set_phase(super::DrawPhase::Paint);
+                let shift = super::TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(100.), ScaledPixels(0.)));
+                let style = UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                };
+                let scale_factor = window.scale_factor();
+                let device = |x: f32| ScaledPixels(x * scale_factor);
+                window.with_element_transformation(shift, |window| {
+                    // Underline x 0..40 with x 10..20 excluded: two spans, still shifted.
+                    window.paint_underline_with_exclusions(
+                        point(px(0.), px(10.)),
+                        px(40.),
+                        &style,
+                        &[device(10.)..device(20.)],
+                    );
+                });
+                let spans: Vec<_> = window
+                    .next_frame
+                    .scene
+                    .underlines
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.bounds.left(),
+                            u.bounds.right(),
+                            u.transformation.is_unit(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    spans,
+                    vec![
+                        (device(0.), device(10.), false),
+                        (device(20.), device(40.), false)
+                    ]
+                );
+                window.invalidator.set_phase(super::DrawPhase::None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_element_transformations_compose_and_map_masks(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| crate::Empty);
+        window
+            .update(cx, |_, window, _| {
+                window.invalidator.set_phase(super::DrawPhase::Paint);
+                let scale = super::TransformationMatrix::unit().scale(size(2., 2.));
+                let shift = super::TransformationMatrix::unit()
+                    .translate(point(ScaledPixels(10.), ScaledPixels(0.)));
+                window.with_element_transformation(scale, |window| {
+                    window.with_element_transformation(shift, |window| {
+                        // The inner transformation applies first.
+                        let origin = window.element_transformation().apply(point(px(0.), px(0.)));
+                        assert_eq!(origin, point(px(20.), px(0.)));
+                    });
+                    let mask = ContentMask {
+                        bounds: Bounds::new(point(px(5.), px(5.)), size(px(10.), px(10.))),
+                    };
+                    window.with_content_mask(Some(mask), |window| {
+                        assert_eq!(
+                            window.content_mask().bounds,
+                            Bounds::new(point(px(10.), px(10.)), size(px(20.), px(20.)))
+                        );
+                    });
+                });
+                assert!(window.element_transformation().is_unit());
+                window.invalidator.set_phase(super::DrawPhase::None);
+            })
+            .unwrap();
+    }
+
     #[test]
     fn test_glyph_raster_transformation() {
         use super::{TransformationMatrix, glyph_raster_transformation};
@@ -10224,5 +10869,21 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// The window-space box covering `bounds` after `transformation` (logical pixels).
+fn transform_pixel_bounds(
+    transformation: &TransformationMatrix,
+    bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let scaled = Bounds {
+        origin: bounds.origin.map(|c| ScaledPixels(c.0)),
+        size: bounds.size.map(|c| ScaledPixels(c.0)),
+    };
+    let transformed = transformation.transform_bounds(scaled);
+    Bounds {
+        origin: transformed.origin.map(|c| Pixels(c.0)),
+        size: transformed.size.map(|c| Pixels(c.0)),
     }
 }

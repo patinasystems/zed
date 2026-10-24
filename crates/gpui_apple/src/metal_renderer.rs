@@ -2048,6 +2048,25 @@ mod tests {
     }
 
     #[test]
+    fn element_transformations_render() {
+        use gpui::element_transformation_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("transformed_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    #[test]
     fn retained_shapes_render_and_upload_only_changes() {
         use gpui::retained_shapes_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();

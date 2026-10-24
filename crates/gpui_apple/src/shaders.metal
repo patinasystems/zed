@@ -20,6 +20,12 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
+bool is_transformed(TransformationMatrix transformation);
+float2 transformation_scale(TransformationMatrix transformation);
+Bounds_ScaledPixels dilate_bounds(Bounds_ScaledPixels bounds, float2 amount);
+Bounds_ScaledPixels scale_bounds(Bounds_ScaledPixels bounds, float2 scale);
+Corners_ScaledPixels scale_corners(Corners_ScaledPixels corners, float scale);
+float2 bounds_position(float2 unit_vertex, Bounds_ScaledPixels bounds);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
@@ -47,6 +53,8 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla co
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  // The position in the quad's own (untransformed) frame.
+  float2 local_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -57,6 +65,7 @@ struct QuadVertexOutput {
 struct QuadFragmentInput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  float2 local_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -73,10 +82,22 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     [[buffer(QuadInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
-  float4 device_position =
-      to_device_position(unit_vertex, quad.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
-                                                 quad.content_mask.bounds);
+  Bounds_ScaledPixels geometry = quad.bounds;
+  float4 device_position;
+  float4 clip_distance;
+  if (is_transformed(quad.transformation)) {
+    // One device pixel of margin around the quad for its antialiased edges.
+    geometry = dilate_bounds(geometry, 1. / transformation_scale(quad.transformation));
+    device_position = to_device_position_transformed(unit_vertex, geometry,
+                                                     quad.transformation, viewport_size);
+    clip_distance = distance_from_clip_rect_transformed(
+        unit_vertex, geometry, quad.content_mask.bounds, quad.transformation);
+  } else {
+    device_position = to_device_position(unit_vertex, geometry, viewport_size);
+    clip_distance = distance_from_clip_rect(unit_vertex, geometry,
+                                            quad.content_mask.bounds);
+  }
+  float2 local_position = bounds_position(unit_vertex, geometry);
   float4 border_color = hsla_to_rgba(quad.border_color);
 
   GradientColor gradient = prepare_fill_color(
@@ -90,6 +111,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   return QuadVertexOutput{
       quad_id,
       device_position,
+      local_position,
       border_color,
       gradient.solid,
       gradient.color0,
@@ -101,7 +123,22 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]]) {
   Quad quad = quads[input.quad_id];
-  float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
+  float2 position = input.position.xy;
+  bool transformed = is_transformed(quad.transformation);
+  if (transformed) {
+    // Shade in the quad's own frame, scaled to device pixels so that edges
+    // antialias over about one pixel.
+    // Corners stay circular: they take the smaller axis scale.
+    float2 scale = transformation_scale(quad.transformation);
+    position = input.local_position * scale;
+    quad.bounds = scale_bounds(quad.bounds, scale);
+    quad.corner_radii = scale_corners(quad.corner_radii, min(scale.x, scale.y));
+    quad.border_widths.top *= scale.y;
+    quad.border_widths.right *= scale.x;
+    quad.border_widths.bottom *= scale.y;
+    quad.border_widths.left *= scale.x;
+  }
+  float4 background_color = fill_color(quad.background, position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -109,18 +146,19 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     quad.corner_radii.top_right == 0.0 &&
     quad.corner_radii.bottom_right == 0.0;
 
-  // Fast path when the quad is not rounded and doesn't have any border
+  // Fast path when the quad is not rounded and doesn't have any border.
+  // Transformed quads antialias their edges below.
   if (quad.border_widths.top == 0.0 &&
       quad.border_widths.left == 0.0 &&
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
-      unrounded) {
+      unrounded && !transformed) {
     return background_color;
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
   float2 half_size = size / 2.0;
-  float2 point = input.position.xy - float2(quad.bounds.origin.x, quad.bounds.origin.y);
+  float2 point = position - float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float2 center_to_point = point - half_size;
 
   // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -448,6 +486,7 @@ float quarter_ellipse_sdf(float2 point, float2 radii) {
 
 struct ShadowVertexOutput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -455,6 +494,7 @@ struct ShadowVertexOutput {
 
 struct ShadowFragmentInput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
 };
@@ -481,14 +521,25 @@ vertex ShadowVertexOutput shadow_vertex(
     bounds.size.height += 2. * margin;
   }
 
-  float4 device_position =
-      to_device_position(unit_vertex, bounds, viewport_size);
-  float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+  float4 device_position;
+  float4 clip_distance;
+  if (is_transformed(shadow.transformation)) {
+    bounds = dilate_bounds(bounds, 1. / transformation_scale(shadow.transformation));
+    device_position = to_device_position_transformed(unit_vertex, bounds,
+                                                     shadow.transformation, viewport_size);
+    clip_distance = distance_from_clip_rect_transformed(
+        unit_vertex, bounds, shadow.content_mask.bounds, shadow.transformation);
+  } else {
+    device_position = to_device_position(unit_vertex, bounds, viewport_size);
+    clip_distance =
+        distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+  }
+  float2 local_position = bounds_position(unit_vertex, bounds);
   float4 color = hsla_to_rgba(shadow.color);
 
   return ShadowVertexOutput{
       device_position,
+      local_position,
       color,
       shadow_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -498,12 +549,24 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
                                 [[buffer(ShadowInputIndex_Shadows)]]) {
   Shadow shadow = shadows[input.shadow_id];
+  float2 position = input.position.xy;
+  if (is_transformed(shadow.transformation)) {
+    // Shade in the shadow's own frame, scaled to device pixels.
+    float2 scale = transformation_scale(shadow.transformation);
+    float uniform_scale = min(scale.x, scale.y);
+    position = input.local_position * scale;
+    shadow.bounds = scale_bounds(shadow.bounds, scale);
+    shadow.corner_radii = scale_corners(shadow.corner_radii, uniform_scale);
+    shadow.blur_radius *= uniform_scale;
+    shadow.element_bounds = scale_bounds(shadow.element_bounds, scale);
+    shadow.element_corner_radii = scale_corners(shadow.element_corner_radii, uniform_scale);
+  }
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
   float2 half_size = size / 2.;
   float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
+  float2 point = position - center;
   float corner_radius;
   if (point.x < 0.) {
     if (point.y < 0.) {
@@ -521,7 +584,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(position, shadow.bounds, shadow.corner_radii);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -546,7 +609,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+    float element_distance = quad_sdf(position, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
   }
@@ -556,6 +619,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
 struct UnderlineVertexOutput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -563,6 +627,7 @@ struct UnderlineVertexOutput {
 
 struct UnderlineFragmentInput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
 };
@@ -575,13 +640,25 @@ vertex UnderlineVertexOutput underline_vertex(
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
-  float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                 underline.content_mask.bounds);
+  Bounds_ScaledPixels geometry = underline.bounds;
+  float4 device_position;
+  float4 clip_distance;
+  if (is_transformed(underline.transformation)) {
+    geometry = dilate_bounds(geometry, 1. / transformation_scale(underline.transformation));
+    device_position = to_device_position_transformed(unit_vertex, geometry,
+                                                     underline.transformation, viewport_size);
+    clip_distance = distance_from_clip_rect_transformed(
+        unit_vertex, geometry, underline.content_mask.bounds, underline.transformation);
+  } else {
+    device_position = to_device_position(unit_vertex, geometry, viewport_size);
+    clip_distance = distance_from_clip_rect(unit_vertex, geometry,
+                                            underline.content_mask.bounds);
+  }
+  float2 local_position = bounds_position(unit_vertex, geometry);
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
       device_position,
+      local_position,
       color,
       underline_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -594,12 +671,20 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  float2 position = input.position.xy;
+  bool transformed = is_transformed(underline.transformation);
+  if (transformed) {
+    float2 scale = transformation_scale(underline.transformation);
+    position = input.local_position * scale;
+    underline.bounds = scale_bounds(underline.bounds, scale);
+    underline.thickness *= scale.y;
+  }
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+    float2 st = ((position - origin) / underline.bounds.size.height) -
                 float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
@@ -613,6 +698,12 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
     return input.color * float4(1., 1., 1., alpha);
+  } else if (transformed) {
+    // Antialias the edges of the transformed rectangle.
+    float2 half_size = float2(underline.bounds.size.width, underline.bounds.size.height) / 2.;
+    float2 center = float2(underline.bounds.origin.x, underline.bounds.origin.y) + half_size;
+    float2 distance = fabs(position - center) - half_size;
+    return input.color * float4(1., 1., 1., saturate(0.5 - max(distance.x, distance.y)));
   } else {
     return input.color;
   }
@@ -1146,6 +1237,52 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
                 clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,
                 transformed_position.y - clip_bounds.origin.y,
                 clip_bounds.origin.y + clip_bounds.size.height - transformed_position.y);
+}
+
+bool is_transformed(TransformationMatrix transformation) {
+  return transformation.rotation_scale[0][0] != 1. ||
+         transformation.rotation_scale[0][1] != 0. ||
+         transformation.rotation_scale[1][0] != 0. ||
+         transformation.rotation_scale[1][1] != 1. ||
+         transformation.translation[0] != 0. ||
+         transformation.translation[1] != 0.;
+}
+
+// Device pixels per unit along each axis of the transformed frame: the lengths
+// of the transformed unit vectors (exact for rotation and any axis scale).
+float2 transformation_scale(TransformationMatrix transformation) {
+  float2 x_axis = float2(transformation.rotation_scale[0][0], transformation.rotation_scale[1][0]);
+  float2 y_axis = float2(transformation.rotation_scale[0][1], transformation.rotation_scale[1][1]);
+  return max(float2(length(x_axis), length(y_axis)), float2(1e-6));
+}
+
+Bounds_ScaledPixels dilate_bounds(Bounds_ScaledPixels bounds, float2 amount) {
+  bounds.origin.x -= amount.x;
+  bounds.origin.y -= amount.y;
+  bounds.size.width += 2. * amount.x;
+  bounds.size.height += 2. * amount.y;
+  return bounds;
+}
+
+Bounds_ScaledPixels scale_bounds(Bounds_ScaledPixels bounds, float2 scale) {
+  bounds.origin.x *= scale.x;
+  bounds.origin.y *= scale.y;
+  bounds.size.width *= scale.x;
+  bounds.size.height *= scale.y;
+  return bounds;
+}
+
+Corners_ScaledPixels scale_corners(Corners_ScaledPixels corners, float scale) {
+  corners.top_left *= scale;
+  corners.top_right *= scale;
+  corners.bottom_right *= scale;
+  corners.bottom_left *= scale;
+  return corners;
+}
+
+float2 bounds_position(float2 unit_vertex, Bounds_ScaledPixels bounds) {
+  return unit_vertex * float2(bounds.size.width, bounds.size.height) +
+         float2(bounds.origin.x, bounds.origin.y);
 }
 
 float4 over(float4 below, float4 above) {
