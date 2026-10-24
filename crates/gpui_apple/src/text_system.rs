@@ -160,7 +160,16 @@ impl PlatformTextSystem for AppleTextSystem {
 
             let candidate_properties = candidates
                 .iter()
-                .map(|font_id| lock.fonts[font_id.0].properties())
+                .map(|font_id| {
+                    let font = &lock.fonts[font_id.0];
+                    let mut properties = font.properties();
+                    // font-kit maps Core Text's weight trait onto CSS weights with a curve
+                    // that puts Medium at 530, so CSS matching sends 500 to Regular.
+                    if let Some(weight) = core_text_css_weight(font) {
+                        properties.weight = FontkitWeight(weight);
+                    }
+                    properties
+                })
                 .collect::<SmallVec<[_; 4]>>();
 
             let ix = font_kit::matching::find_best_match(
@@ -729,6 +738,42 @@ fn size_from_vector2f(vec: Vector2F) -> Size<f32> {
     size(vec.x(), vec.y())
 }
 
+/// The CSS weight of a font from its Core Text weight trait, on Apple's scale
+/// (`NSFontWeight*`: ultralight -0.8 is 100, regular 0 is 400, medium 0.23 is 500,
+/// semibold 0.3 is 600, bold 0.4 is 700, black 0.62 is 900), interpolated between
+/// those points. `None` if the trait is missing.
+fn core_text_css_weight(font: &FontKitFont) -> Option<f32> {
+    let traits = font.native_font().all_traits();
+    let trait_value = unsafe { traits.get(kCTFontWeightTrait) }
+        .downcast::<CFNumber>()?
+        .to_f64()? as f32;
+    Some(css_weight_from_core_text_trait(trait_value))
+}
+
+fn css_weight_from_core_text_trait(value: f32) -> f32 {
+    const SCALE: [(f32, f32); 9] = [
+        (-0.8, 100.),
+        (-0.6, 200.),
+        (-0.4, 300.),
+        (0., 400.),
+        (0.23, 500.),
+        (0.3, 600.),
+        (0.4, 700.),
+        (0.56, 800.),
+        (0.62, 900.),
+    ];
+    if value <= SCALE[0].0 {
+        return SCALE[0].1;
+    }
+    for pair in SCALE.windows(2) {
+        let ((t0, w0), (t1, w1)) = (pair[0], pair[1]);
+        if value <= t1 {
+            return w0 + (value - t0) / (t1 - t0) * (w1 - w0);
+        }
+    }
+    SCALE[SCALE.len() - 1].1
+}
+
 fn fontkit_weight(value: FontWeight) -> FontkitWeight {
     FontkitWeight(value.0)
 }
@@ -812,6 +857,36 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_css_weights_select_the_matching_system_face() {
+        use gpui::{Font, FontWeight};
+        let fonts = AppleTextSystem::new();
+        for (weight, face) in [
+            (100., "Ultralight"),
+            (200., "Thin"),
+            (300., "Light"),
+            (400., "Regular"),
+            (500., "Medium"),
+            (600., "Semibold"),
+            (700., "Bold"),
+            (900., "Black"),
+        ] {
+            let font = Font {
+                weight: FontWeight(weight),
+                ..font(".SystemUIFont")
+            };
+            let id = fonts.font_id(&font).unwrap();
+            let name = fonts.0.read().fonts[id.0].full_name();
+            assert!(name.ends_with(face), "weight {weight}: {name}");
+        }
+        assert_eq!(super::css_weight_from_core_text_trait(0.23), 500.);
+        assert_eq!(super::css_weight_from_core_text_trait(-1.), 100.);
+        assert_eq!(
+            super::css_weight_from_core_text_trait(0.1),
+            400. + 0.1 / 0.23 * 100.
+        );
     }
 
     #[test]
