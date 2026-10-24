@@ -1730,3 +1730,98 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   }
   return float4(color.rgb, color.a * u->opacity * clip);
 }
+
+
+// --- backdrop filters --- //
+
+struct BackdropFullscreenOutput {
+  float4 position [[position]];
+  float2 uv;
+};
+
+// One triangle that covers the target; `uv` runs 0..1 across it.
+vertex BackdropFullscreenOutput backdrop_fullscreen_vertex(uint vertex_id [[vertex_id]]) {
+  float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
+  return BackdropFullscreenOutput{float4(uv * float2(2., -2.) + float2(-1., 1.), 0., 1.), uv};
+}
+
+fragment float4 backdrop_copy_fragment(BackdropFullscreenOutput input [[stage_in]],
+                                       texture2d<float> source [[texture(0)]]) {
+  constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  return source.sample(linear_sampler, input.uv);
+}
+
+struct BackdropBlurParams {
+  float2 direction;  // one texel along the blur axis, in uv
+  float sigma;       // in texels
+  int radius;        // taps on each side
+};
+
+// One axis of a gaussian blur.
+fragment float4 backdrop_blur_fragment(BackdropFullscreenOutput input [[stage_in]],
+                                       texture2d<float> source [[texture(0)]],
+                                       constant BackdropBlurParams &params [[buffer(0)]]) {
+  constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float4 sum = float4(0.);
+  float total = 0.;
+  for (int i = -params.radius; i <= params.radius; i++) {
+    float weight = exp(-0.5 * float(i * i) / (params.sigma * params.sigma));
+    sum += source.sample(linear_sampler, input.uv + params.direction * float(i)) * weight;
+    total += weight;
+  }
+  return sum / total;
+}
+
+struct BackdropCompositeOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropCompositeInput {
+  float4 position [[position]];
+};
+
+vertex BackdropCompositeOutput backdrop_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    constant BackdropFilter *filter [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position = to_device_position(unit_vertex, filter->bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, filter->bounds, filter->content_mask.bounds);
+  return BackdropCompositeOutput{
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// The filtered backdrop inside the filter's rounded bounds. `region` is where the
+// filtered texture sits in the target: origin and size, in device pixels.
+fragment float4 backdrop_composite_fragment(BackdropCompositeInput input [[stage_in]],
+                                            constant BackdropFilter *filter [[buffer(1)]],
+                                            constant float4 &region [[buffer(3)]],
+                                            texture2d<float> filtered [[texture(0)]]) {
+  constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float2 uv = (input.position.xy - region.xy) / region.zw;
+  float4 color = filtered.sample(linear_sampler, uv);
+  // Filter straight colors, then weight them by the backdrop's alpha again, so
+  // transparent texels stay empty.
+  float3 rgb = color.a > 0. ? color.rgb / color.a : float3(0.);
+  // CSS saturate(), brightness(), contrast() (Filter Effects 1), in that order.
+  float s = filter->saturate;
+  float3x3 saturate_matrix = float3x3(
+      float3(0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s),
+      float3(0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s),
+      float3(0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s));
+  rgb = saturate(saturate_matrix * rgb);
+  rgb = saturate(rgb * filter->brightness);
+  rgb = saturate((rgb - 0.5) * filter->contrast + 0.5);
+  float distance = quad_sdf(input.position.xy, filter->bounds, filter->corner_radii);
+  float coverage = saturate(0.5 - distance) * filter->opacity;
+  // Blended as color * 1 + target * (1 - coverage), keeping the target's alpha:
+  // transparent backdrops stay transparent.
+  return float4(rgb * color.a * coverage, coverage);
+}

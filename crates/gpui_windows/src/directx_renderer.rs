@@ -387,6 +387,8 @@ impl DirectXRenderer {
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 // Spike: not implemented on DirectX.
                 PrimitiveBatch::RetainedShapes(_) => Ok(()),
+                // Not implemented by the DirectX renderer: the backdrop draws unfiltered.
+                PrimitiveBatch::BackdropFilters(_) => Ok(()),
             }
             .with_context(|| {
                 format!(
