@@ -41,7 +41,8 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    /// Each open layer's draw order and bounds.
+    layer_stack: Vec<(DrawOrder, Bounds<ScaledPixels>)>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -51,6 +52,7 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub retained_shapes: Vec<RetainedShapesDraw>,
+    pub backdrop_filters: Vec<BackdropFilter>,
 }
 
 #[expect(missing_docs)]
@@ -68,6 +70,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.retained_shapes.clear();
+        self.backdrop_filters.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -76,7 +79,7 @@ impl Scene {
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        self.layer_stack.push((order, bounds));
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -88,19 +91,38 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
+        let mut clipped_bounds = primitive
             .transformed_bounds()
             .intersect(&primitive.content_mask().bounds);
+        // A backdrop filter draws inside its mask but reads three blur radii beyond it.
+        if let Primitive::BackdropFilter(filter) = &primitive {
+            if filter
+                .bounds
+                .intersect(&filter.content_mask.bounds)
+                .is_empty()
+            {
+                return;
+            }
+            clipped_bounds = filter
+                .sample_bounds()
+                .intersect(&filter.content_mask.bounds.dilate(filter.blur_radius * 3.));
+        }
 
         if clipped_bounds.is_empty() {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = match (&primitive, self.layer_stack.last_mut()) {
+            // Inside a layer a filter needs its own order, after what the layer drew so
+            // far; the rest of the layer then draws after the filter.
+            (Primitive::BackdropFilter(_), Some(layer)) => {
+                let order = self.primitive_bounds.insert(clipped_bounds);
+                layer.0 = self.primitive_bounds.insert(layer.1);
+                order
+            }
+            (_, Some(layer)) => layer.0,
+            (_, None) => self.primitive_bounds.insert(clipped_bounds),
+        };
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -139,6 +161,10 @@ impl Scene {
                 draw.order = order;
                 self.retained_shapes.push(draw.clone());
             }
+            Primitive::BackdropFilter(filter) => {
+                filter.order = order;
+                self.backdrop_filters.push(*filter);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -167,6 +193,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.retained_shapes.sort_by_key(|draw| draw.order);
+        self.backdrop_filters.sort_by_key(|filter| filter.order);
     }
 
     #[cfg_attr(
@@ -196,6 +223,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             retained_start: 0,
             retained_iter: self.retained_shapes.iter().peekable(),
+            backdrop_filters_start: 0,
+            backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
         }
     }
 }
@@ -209,6 +238,9 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    // First: at an equal order, a backdrop filter reads what is behind the element
+    // before the element draws.
+    BackdropFilter,
     Shadow,
     #[default]
     Quad,
@@ -239,6 +271,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     RetainedShapes(RetainedShapesDraw),
+    BackdropFilter(BackdropFilter),
 }
 
 #[expect(missing_docs)]
@@ -254,6 +287,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::RetainedShapes(draw) => &draw.bounds,
+            Primitive::BackdropFilter(filter) => &filter.bounds,
         }
     }
 
@@ -273,6 +307,9 @@ impl Primitive {
                 sprite.transformation.transform_bounds(sprite.bounds)
             }
             Primitive::Quad(quad) => quad.transformation.transform_bounds(quad.bounds),
+            // It reads up to three blur radii beyond its bounds: order it after anything
+            // drawn there.
+            Primitive::BackdropFilter(filter) => filter.sample_bounds(),
             Primitive::Underline(underline) => {
                 underline.transformation.transform_bounds(underline.bounds)
             }
@@ -300,6 +337,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::RetainedShapes(draw) => &draw.content_mask,
+            Primitive::BackdropFilter(filter) => &filter.content_mask,
         }
     }
 }
@@ -330,6 +368,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     retained_start: usize,
     retained_iter: Peekable<slice::Iter<'a, RetainedShapesDraw>>,
+    backdrop_filters_start: usize,
+    backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -366,6 +406,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.retained_iter.peek().map(|s| s.order),
                 PrimitiveKind::RetainedShapes,
+            ),
+            (
+                self.backdrop_filters_iter.peek().map(|f| f.order),
+                PrimitiveKind::BackdropFilter,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -526,6 +570,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.retained_start = end;
                 Some(PrimitiveBatch::RetainedShapes(start..end))
             }
+            PrimitiveKind::BackdropFilter => {
+                let start = self.backdrop_filters_start;
+                let mut end = start + 1;
+                self.backdrop_filters_iter.next();
+                while self
+                    .backdrop_filters_iter
+                    .next_if(|filter| (filter.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.backdrop_filters_start = end;
+                Some(PrimitiveBatch::BackdropFilters(start..end))
+            }
         }
     }
 }
@@ -560,6 +618,8 @@ pub enum PrimitiveBatch {
     Surfaces(Range<usize>),
     /// Draws of retained shape buffers, each its own draw call.
     RetainedShapes(Range<usize>),
+    /// Backdrop filters, each read from and drawn back to the target in turn.
+    BackdropFilters(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -570,6 +630,7 @@ impl PrimitiveBatch {
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
+            Self::BackdropFilters(range) => format!("backdrop filters ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
                 format!(
                     "monochrome sprites ({}) on atlas {}",
@@ -663,6 +724,60 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// Filters what is already drawn behind `bounds` (CSS `backdrop-filter`): a gaussian
+/// blur, then saturation, brightness and contrast, drawn back inside `bounds` with
+/// `corner_radii`. Renderers read the target, so everything behind must be drawn
+/// first; the scene orders it after anything within three blur radii.
+#[derive(Debug, Copy, Clone, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BackdropFilter {
+    pub order: DrawOrder,
+    /// The element's opacity: 0 leaves the backdrop as it is.
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian standard deviation, in device pixels.
+    pub blur_radius: ScaledPixels,
+    /// 1 leaves colors as they are; 0 is grayscale.
+    pub saturate: f32,
+    /// A multiplier.
+    pub brightness: f32,
+    /// 1 leaves colors as they are; 0 is mid gray.
+    pub contrast: f32,
+}
+
+impl Default for BackdropFilter {
+    /// A filter that changes nothing (no blur, neutral color controls, fully opaque).
+    fn default() -> Self {
+        Self {
+            order: 0,
+            opacity: 1.,
+            bounds: Bounds::default(),
+            content_mask: ContentMask::default(),
+            corner_radii: Corners::default(),
+            blur_radius: ScaledPixels(0.),
+            saturate: 1.,
+            brightness: 1.,
+            contrast: 1.,
+        }
+    }
+}
+
+impl BackdropFilter {
+    /// What the filter reads: its bounds and three blur radii around them.
+    pub fn sample_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds.dilate(self.blur_radius * 3.)
+    }
+}
+
+impl From<BackdropFilter> for Primitive {
+    fn from(filter: BackdropFilter) -> Self {
+        Primitive::BackdropFilter(filter)
     }
 }
 
@@ -1247,6 +1362,118 @@ pub mod element_transformation_test_scene {
     }
 }
 
+/// Backdrop filters over a striped and a red backdrop, for renderer tests: every
+/// backend renders it and must hit the same probe colors.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod backdrop_filter_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    fn color(r: f32, g: f32, b: f32) -> Hsla {
+        Rgba { r, g, b, a: 1.0 }.into()
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask {
+            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
+        };
+        let mut scene = Scene::default();
+        // White one-pixel columns on black, over the top 40 rows.
+        for x in (1..SIZE.0).step_by(2) {
+            scene.insert_primitive(Quad {
+                bounds: bounds(x as f32, 0., 1., 40.),
+                content_mask: full,
+                background: color(1., 1., 1.).into(),
+                ..Default::default()
+            });
+        }
+        // A red band below.
+        scene.insert_primitive(Quad {
+            bounds: bounds(0., 44., SIZE.0 as f32, 20.),
+            content_mask: full,
+            background: color(1., 0., 0.).into(),
+            ..Default::default()
+        });
+        // Blur the stripes inside a rounded square: they average to gray.
+        scene.insert_primitive(BackdropFilter {
+            bounds: bounds(8., 4., 32., 32.),
+            content_mask: full,
+            corner_radii: Corners::all(ScaledPixels(10.)),
+            blur_radius: ScaledPixels(3.),
+            opacity: 1.,
+            saturate: 1.,
+            brightness: 1.,
+            contrast: 1.,
+            ..Default::default()
+        });
+        // Desaturate part of the red band, darken another part, and half-fade a third
+        // desaturation (element opacity 0.5).
+        scene.insert_primitive(BackdropFilter {
+            bounds: bounds(4., 48., 16., 12.),
+            content_mask: full,
+            opacity: 1.,
+            saturate: 0.,
+            brightness: 1.,
+            contrast: 1.,
+            ..Default::default()
+        });
+        scene.insert_primitive(BackdropFilter {
+            bounds: bounds(40., 48., 16., 12.),
+            content_mask: full,
+            opacity: 1.,
+            saturate: 1.,
+            brightness: 0.5,
+            contrast: 1.,
+            ..Default::default()
+        });
+        scene.insert_primitive(BackdropFilter {
+            bounds: bounds(24., 48., 12., 12.),
+            content_mask: full,
+            opacity: 0.5,
+            saturate: 0.,
+            brightness: 1.,
+            contrast: 1.,
+            ..Default::default()
+        });
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let gray = 128;
+        let luma = (0.213f32 * 255.).round() as u8;
+        let probes = vec![
+            probe("blurred stripes average", 24, 20, [gray, gray, gray, 255]),
+            probe(
+                "blurred stripes average (odd column)",
+                25,
+                20,
+                [gray, gray, gray, 255],
+            ),
+            probe("stripes outside stay black", 46, 20, [0, 0, 0, 255]),
+            probe("stripes outside stay white", 47, 20, [255, 255, 255, 255]),
+            probe("rounded corner leaves the backdrop", 8, 4, [0, 0, 0, 255]),
+            probe("desaturated red", 12, 54, [luma, luma, luma, 255]),
+            probe("red outside the filters", 22, 54, [255, 0, 0, 255]),
+            probe(
+                "half-faded desaturation",
+                30,
+                54,
+                [((255 + luma as u16) / 2) as u8, luma / 2, luma / 2, 255],
+            ),
+            probe("darkened red", 48, 54, [128, 0, 0, 255]),
+        ];
+        (scene, probes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,6 +1590,75 @@ mod tests {
             scene.polychrome_sprites[0].bounds,
             scaled_bounds(-190., 10., 20., 20.)
         );
+    }
+
+    #[test]
+    fn backdrop_filters_inside_a_layer_keep_paint_order() {
+        let mut scene = Scene::default();
+        let layer = scaled_bounds(0., 0., 40., 40.);
+        scene.push_layer(layer);
+        scene.insert_primitive(quad(scaled_bounds(0., 0., 40., 40.)));
+        scene.insert_primitive(BackdropFilter {
+            bounds: scaled_bounds(5., 5., 20., 20.),
+            content_mask: ContentMask { bounds: layer },
+            ..Default::default()
+        });
+        scene.insert_primitive(quad(scaled_bounds(5., 5., 20., 20.)));
+        scene.pop_layer();
+        scene.finish();
+        let filter = scene.backdrop_filters[0].order;
+        assert!(scene.quads[0].order < filter, "{:?}", scene.quads);
+        assert!(filter < scene.quads[1].order, "{:?}", scene.quads);
+        assert_eq!(BackdropFilter::default().opacity, 1.);
+        assert_eq!(BackdropFilter::default().brightness, 1.);
+    }
+
+    #[test]
+    fn clipped_backdrop_filters_order_after_what_their_blur_reads() {
+        let mut scene = Scene::default();
+        // Outside the filter's mask, but within its blur reach.
+        scene.insert_primitive(quad(scaled_bounds(0., 0., 10., 10.)));
+        scene.insert_primitive(BackdropFilter {
+            bounds: scaled_bounds(12., 0., 20., 20.),
+            content_mask: ContentMask {
+                bounds: scaled_bounds(12., 0., 20., 20.),
+            },
+            blur_radius: ScaledPixels(2.),
+            ..Default::default()
+        });
+        scene.finish();
+        assert!(scene.quads[0].order < scene.backdrop_filters[0].order);
+    }
+
+    #[test]
+    fn backdrop_filters_order_after_what_they_read_and_before_what_covers_them() {
+        let mut scene = Scene::default();
+        // A quad near, but outside, the filter's bounds: inside its blur reach.
+        scene.insert_primitive(quad(scaled_bounds(0., 0., 10., 10.)));
+        let filter_bounds = scaled_bounds(14., 0., 20., 20.);
+        scene.insert_primitive(BackdropFilter {
+            bounds: filter_bounds,
+            content_mask: ContentMask {
+                bounds: scaled_bounds(-100., -100., 1000., 1000.),
+            },
+            blur_radius: ScaledPixels(2.),
+            ..Default::default()
+        });
+        // The element's own background over it.
+        scene.insert_primitive(quad(filter_bounds));
+        scene.finish();
+        let filter = scene.backdrop_filters[0].order;
+        assert!(scene.quads[0].order < filter);
+        assert!(filter < scene.quads[1].order);
+        let kinds: Vec<_> = scene
+            .batches()
+            .map(|batch| match batch {
+                PrimitiveBatch::Quads(_) => "quads",
+                PrimitiveBatch::BackdropFilters(_) => "backdrop",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["quads", "backdrop", "quads"]);
     }
 
     fn quad(bounds: Bounds<ScaledPixels>) -> Quad {

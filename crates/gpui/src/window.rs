@@ -6,8 +6,8 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
@@ -4936,6 +4936,40 @@ impl Window {
                 });
             }
         }
+    }
+
+    /// Filters what is already painted behind `bounds` (CSS `backdrop-filter`): a gaussian
+    /// blur of standard deviation `backdrop.blur_radius`, then saturation, brightness and
+    /// contrast, drawn back inside `bounds` with `corner_radii` and the current content mask.
+    /// Paint it before the element's own background. Under an element transformation it
+    /// filters the transformed bounding box.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        backdrop: Backdrop,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let bounds = match self.element_transformation_stack.last() {
+            Some(transformation) => transform_pixel_bounds(transformation, bounds),
+            None => bounds,
+        };
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            opacity: self.element_opacity(),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii
+                .clamp_radii_for_quad_size(bounds.size)
+                .scale(scale_factor),
+            blur_radius: backdrop.blur_radius.scale(scale_factor),
+            saturate: backdrop.saturate,
+            brightness: backdrop.brightness,
+            contrast: backdrop.contrast,
+        });
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -10900,6 +10934,30 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// What [`Window::paint_backdrop_filter`] does to the backdrop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Backdrop {
+    /// The blur's standard deviation (CSS `blur()`); zero for none.
+    pub blur_radius: Pixels,
+    /// CSS `saturate()`: 1 leaves colors as they are, 0 is grayscale.
+    pub saturate: f32,
+    /// CSS `brightness()`: a multiplier.
+    pub brightness: f32,
+    /// CSS `contrast()`: 1 leaves colors as they are, 0 is mid gray.
+    pub contrast: f32,
+}
+
+impl Default for Backdrop {
+    fn default() -> Self {
+        Self {
+            blur_radius: Pixels::ZERO,
+            saturate: 1.,
+            brightness: 1.,
+            contrast: 1.,
+        }
     }
 }
 
