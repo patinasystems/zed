@@ -33,7 +33,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
     let text = "A界😀👨‍👩‍👧‍👦か\u{3099}";
     let runs = [FontRun {
         len: text.len(),
-        font_id,
+        font_id, font_size: None, letter_spacing: None,
     }];
     let layout = text_system.layout_line(text, px(24.), &runs);
     assert!(
@@ -67,7 +67,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
             px(24.),
             &[FontRun {
                 len: text.len(),
-                font_id,
+                font_id, font_size: None, letter_spacing: None,
             }],
         );
         let glyphs = layout
@@ -100,7 +100,7 @@ pub fn test_missing_glyph_notifications() -> Result<(), JsValue> {
         px(24.),
         &[FontRun {
             len: bundled.len(),
-            font_id,
+            font_id, font_size: None, letter_spacing: None,
         }],
     );
     for run in &layout.runs {

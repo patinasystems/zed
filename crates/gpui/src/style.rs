@@ -570,6 +570,8 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            font_size: None,
+            letter_spacing: None,
         }
     }
 }
@@ -578,6 +580,12 @@ impl TextStyle {
 /// for a single font, uniformly sized and spaced text.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct HighlightStyle {
+    /// The font size of the highlighted text, when it differs from the surrounding text.
+    pub font_size: Option<Pixels>,
+
+    /// Extra advance after each character of the highlighted text.
+    pub letter_spacing: Option<Pixels>,
+
     /// The color of the text
     pub color: Option<Hsla>,
 
@@ -605,6 +613,8 @@ impl Eq for HighlightStyle {}
 impl Hash for HighlightStyle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.color.hash(state);
+        self.font_size.hash(state);
+        self.letter_spacing.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
         self.background_color.hash(state);
@@ -906,6 +916,8 @@ impl From<&TextStyle> for HighlightStyle {
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            font_size: None,
+            letter_spacing: None,
         }
     }
 }
@@ -933,6 +945,8 @@ impl HighlightStyle {
                     }
                 })
                 .or(self.color),
+            font_size: other.font_size.or(self.font_size),
+            letter_spacing: other.letter_spacing.or(self.letter_spacing),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
@@ -1362,6 +1376,8 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            font_size: None,
+            letter_spacing: None,
         };
         let expected_style = style_b;
 
@@ -1394,6 +1410,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_size: None,
+            letter_spacing: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1412,6 +1430,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_size: None,
+            letter_spacing: None,
         };
 
         let style_c = style_c.highlight(style_d);

@@ -36,6 +36,9 @@ pub struct LineLayout {
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
+    /// The font size of this run's glyphs, when it differs from the line's
+    /// ([`LineLayout::run_font_size`]).
+    pub font_size: Option<Pixels>,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
 }
@@ -57,6 +60,11 @@ pub struct ShapedGlyph {
 }
 
 impl LineLayout {
+    /// The font size `run`'s glyphs are shaped and painted at.
+    pub fn run_font_size(&self, run: &ShapedRun) -> Pixels {
+        run.font_size.unwrap_or(self.font_size)
+    }
+
     /// The index for the character at the given x coordinate
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
@@ -149,6 +157,7 @@ impl LineLayout {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: run.glyphs[..split_pos].to_vec(),
+                    font_size: run.font_size,
                 });
             }
 
@@ -165,6 +174,7 @@ impl LineLayout {
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: right_glyphs,
+                    font_size: run.font_size,
                 });
             }
         }
@@ -675,6 +685,7 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            apply_letter_spacing_to_layout(&mut layout, runs);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -717,6 +728,43 @@ impl LineLayoutCache {
 // loop must not advance the cell counter for these zero-advance glyphs,
 // otherwise they get displaced into the next cell. We detect them by checking
 // whether shaped x has advanced by at least half a cell beyond the last base.
+/// Adds each run's `letter_spacing` after every character cluster of the run
+/// (CSS `letter-spacing`, trailing space included): later glyphs shift right and
+/// the line widens. Glyphs sharing a cluster (a ligature, combining marks) move
+/// together, so wrapping, hit testing and painting follow the spaced positions.
+fn apply_letter_spacing_to_layout(layout: &mut LineLayout, runs: &[FontRun]) {
+    if runs.iter().all(|run| run.letter_spacing.is_none()) {
+        return;
+    }
+    let spacing_at = |index: usize| {
+        let mut end = 0;
+        for run in runs {
+            end += run.len;
+            if index < end {
+                return run.letter_spacing.unwrap_or_default();
+            }
+        }
+        Pixels::ZERO
+    };
+    let mut shift = Pixels::ZERO;
+    let mut cluster: Option<usize> = None;
+    for run in layout.runs.iter_mut() {
+        for glyph in run.glyphs.iter_mut() {
+            if let Some(previous) = cluster
+                && previous != glyph.index
+            {
+                shift += spacing_at(previous);
+            }
+            cluster = Some(glyph.index);
+            glyph.position.x += shift;
+        }
+    }
+    if let Some(last) = cluster {
+        shift += spacing_at(last);
+    }
+    layout.width += shift;
+}
+
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
     // NEG_INFINITY ensures the first glyph is always classified as a base.
@@ -748,6 +796,23 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    /// The run's font size, when it differs from the line's. Runs of different sizes
+    /// shape, wrap and share a baseline as one line.
+    pub font_size: Option<Pixels>,
+    /// Extra advance after each character of the run (CSS `letter-spacing`).
+    pub letter_spacing: Option<Pixels>,
+}
+
+impl FontRun {
+    /// A run of `len` bytes in `font_id`, at the line's font size, with no letter spacing.
+    pub fn new(len: usize, font_id: FontId) -> Self {
+        Self {
+            len,
+            font_id,
+            font_size: None,
+            letter_spacing: None,
+        }
+    }
 }
 
 trait AsCacheKeyRef {
@@ -845,6 +910,7 @@ mod tests {
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 glyphs,
+                font_size: None,
             }],
             len: 0,
         }
@@ -856,6 +922,38 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_letter_spacing_follows_each_cluster_and_its_run() {
+        // "ab" + "c" + a combining mark sharing c's cluster, then "d".
+        let mut layout = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(8., 1),
+            glyph_at(16., 2),
+            glyph_at(16., 2),
+            glyph_at(24., 5),
+        ]);
+        let runs = [
+            FontRun {
+                letter_spacing: Some(px(2.)),
+                ..FontRun::new(2, FontId(0))
+            },
+            FontRun::new(3, FontId(0)),
+            FontRun {
+                letter_spacing: Some(px(10.)),
+                ..FontRun::new(1, FontId(0))
+            },
+        ];
+        apply_letter_spacing_to_layout(&mut layout, &runs);
+        // a and b each add 2 after themselves; c (no spacing) adds none; d adds 10.
+        assert_eq!(glyph_x_positions(&layout), vec![0., 10., 20., 20., 28.]);
+        assert_eq!(layout.width, px(100. + 2. + 2. + 10.));
+
+        let mut unchanged = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1)]);
+        apply_letter_spacing_to_layout(&mut unchanged, &[FontRun::new(2, FontId(0))]);
+        assert_eq!(glyph_x_positions(&unchanged), vec![0., 8.]);
+        assert_eq!(unchanged.width, px(100.));
     }
 
     #[test]

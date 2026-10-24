@@ -424,6 +424,8 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size: None,
+                    letter_spacing: None,
                 }],
             )
             .width
@@ -483,6 +485,12 @@ impl TextSystem {
     /// in single spaced text.
     pub fn descent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
+    }
+
+    /// Get the recommended gap between lines (the font's line gap) for the given font and
+    /// font size: CSS `line-height: normal` is ascent + descent + line gap.
+    pub fn line_gap(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.line_gap(font_size))
     }
 
     /// Get the recommended baseline offset for the given font and line height.
@@ -764,6 +772,8 @@ impl WindowTextSystem {
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && font_run.font_size == run.font_size
+                    && font_run.letter_spacing == run.letter_spacing
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -771,6 +781,8 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        font_size: run.font_size,
+                        letter_spacing: run.letter_spacing,
                     });
                 }
 
@@ -878,6 +890,8 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && font_run.font_size == run.font_size
+                && font_run.letter_spacing == run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -885,6 +899,8 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run.font_size,
+                    letter_spacing: run.letter_spacing,
                 });
             }
         }
@@ -912,6 +928,8 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size: None,
+                    letter_spacing: None,
                 }],
                 None,
             )
@@ -1081,6 +1099,11 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// The font size of this run, when it differs from the text's. Runs of different
+    /// sizes shape, wrap and share a baseline as one line.
+    pub font_size: Option<Pixels>,
+    /// Extra advance after each character of this run (CSS `letter-spacing`).
+    pub letter_spacing: Option<Pixels>,
 }
 
 #[cfg(all(target_os = "macos", test))]

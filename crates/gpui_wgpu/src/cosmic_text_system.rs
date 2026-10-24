@@ -677,7 +677,7 @@ impl CosmicTextSystemState {
             if let Some(same_run) = layout
                 .runs
                 .last_mut()
-                .filter(|last| last.font_id == run.font_id)
+                .filter(|last| last.font_id == run.font_id && last.font_size == run.font_size)
             {
                 same_run.glyphs.append(&mut run.glyphs);
             } else {
@@ -706,11 +706,25 @@ impl CosmicTextSystemState {
                 continue;
             };
 
-            let primary_attrs = properties.attributes(run.font_id, &properties.primary_family_name);
+            // A run with its own size shapes at that size.
+            fn sized(attrs: Attrs<'_>, font_size: Option<Pixels>) -> Attrs<'_> {
+                match font_size {
+                    Some(size) => {
+                        attrs.metrics(cosmic_text::Metrics::new(size.into(), size.into()))
+                    }
+                    None => attrs,
+                }
+            }
+            let primary_attrs = sized(
+                properties.attributes(run.font_id, &properties.primary_family_name),
+                run.font_size,
+            );
             let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = properties
                 .fallback_chain
                 .iter()
-                .map(|(font_id, family_name)| properties.attributes(*font_id, family_name))
+                .map(|(font_id, family_name)| {
+                    sized(properties.attributes(*font_id, family_name), run.font_size)
+                })
                 .collect();
 
             let spans = if properties.fallback_chain.is_empty() {
@@ -821,15 +835,17 @@ impl CosmicTextSystemState {
                 is_emoji,
             };
 
-            if let Some(last_run) = runs
-                .last_mut()
-                .filter(|last_run| last_run.font_id == font_id)
-            {
+            let glyph_font_size =
+                (glyph.font_size != f32::from(font_size)).then(|| gpui::px(glyph.font_size));
+            if let Some(last_run) = runs.last_mut().filter(|last_run| {
+                last_run.font_id == font_id && last_run.font_size == glyph_font_size
+            }) {
                 last_run.glyphs.push(shaped_glyph);
             } else {
                 runs.push(ShapedRun {
                     font_id,
                     glyphs: vec![shaped_glyph],
+                    font_size: glyph_font_size,
                 });
             }
         }
@@ -956,7 +972,7 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
         if start < end {
             clipped.push(FontRun {
                 len: end - start,
-                font_id: run.font_id,
+                ..*run
             });
         }
     }
@@ -1336,6 +1352,61 @@ mod tests {
     }
 
     #[test]
+    fn runs_shape_at_their_own_font_size() -> Result<()> {
+        use gpui::{FontRun, PlatformTextSystem as _, px};
+        let text_system = text_system()?;
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let uniform = text_system.layout_line("abab", px(16.), &[FontRun::new(4, font_id)]);
+        let mixed = text_system.layout_line(
+            "abab",
+            px(16.),
+            &[
+                FontRun::new(2, font_id),
+                FontRun {
+                    font_size: Some(px(32.)),
+                    ..FontRun::new(2, font_id)
+                },
+            ],
+        );
+        let sizes: Vec<_> = mixed.runs.iter().map(|run| run.font_size).collect();
+        assert_eq!(sizes, vec![None, Some(px(32.))]);
+        let half = uniform.runs[0].glyphs[2].position.x;
+        assert!(
+            (mixed.width - half * 3.).abs() < px(0.5),
+            "{:?} vs {:?}",
+            mixed.width,
+            half * 3.
+        );
+        assert!(mixed.ascent > uniform.ascent * 1.9);
+
+        // Lines with paragraph separators shape segment by segment; sizes survive.
+        let separated = text_system.layout_line(
+            "ab\rab",
+            px(16.),
+            &[
+                FontRun::new(3, font_id),
+                FontRun {
+                    font_size: Some(px(32.)),
+                    ..FontRun::new(2, font_id)
+                },
+            ],
+        );
+        assert!(
+            separated
+                .runs
+                .iter()
+                .any(|run| run.font_size == Some(px(32.))),
+            "{:?}",
+            separated
+                .runs
+                .iter()
+                .map(|run| run.font_size)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn font_properties_describe_the_selected_face() -> Result<()> {
         let text_system = text_system()?;
         let regular = gpui::font("IBM Plex Sans");
@@ -1365,6 +1436,8 @@ mod tests {
         let runs = [FontRun {
             len: text.len(),
             font_id,
+            font_size: None,
+            letter_spacing: None,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
     }
@@ -1437,6 +1510,8 @@ mod tests {
         let runs = [FontRun {
             len: text.len(),
             font_id,
+            font_size: None,
+            letter_spacing: None,
         }];
 
         let missing_glyphs = text_system
@@ -1566,10 +1641,14 @@ mod tests {
             FontRun {
                 len: "ab\u{001c}\u{05d0}".len(),
                 font_id,
+                font_size: None,
+                letter_spacing: None,
             },
             FontRun {
                 len: "\u{05d1}".len(),
                 font_id,
+                font_size: None,
+                letter_spacing: None,
             },
         ];
         let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
@@ -1667,10 +1746,14 @@ mod tests {
             FontRun {
                 len: 3,
                 font_id: fid(1),
+                font_size: None,
+                letter_spacing: None,
             },
             FontRun {
                 len: 4,
                 font_id: fid(2),
+                font_size: None,
+                letter_spacing: None,
             },
         ];
 
@@ -1680,11 +1763,15 @@ mod tests {
             &[
                 FontRun {
                     len: 1,
-                    font_id: fid(1)
+                    font_id: fid(1),
+                    font_size: None,
+                    letter_spacing: None,
                 },
                 FontRun {
                     len: 2,
-                    font_id: fid(2)
+                    font_id: fid(2),
+                    font_size: None,
+                    letter_spacing: None,
                 },
             ]
         );
@@ -1692,7 +1779,9 @@ mod tests {
             clip_font_runs(&runs, 3..7).as_slice(),
             &[FontRun {
                 len: 4,
-                font_id: fid(2)
+                font_id: fid(2),
+                font_size: None,
+                letter_spacing: None,
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());

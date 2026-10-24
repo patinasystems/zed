@@ -8729,6 +8729,37 @@ mod tests {
             .unwrap();
     }
 
+    struct MixedSizeText(Rc<Cell<Pixels>>);
+
+    impl Render for MixedSizeText {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let height = self.0.clone();
+            div()
+                .text_size(px(16.))
+                .line_height(crate::relative(1.5))
+                .on_children_prepainted(move |bounds, _, _| height.set(bounds[0].size.height))
+                .child(crate::StyledText::new("big small").with_highlights([(
+                    0..3,
+                    crate::HighlightStyle {
+                        font_size: Some(px(32.)),
+                        ..Default::default()
+                    },
+                )]))
+        }
+    }
+
+    #[gpui::test]
+    fn test_relative_line_height_follows_the_largest_run(cx: &mut TestAppContext) {
+        let height = Rc::new(Cell::new(px(0.)));
+        let (_, cx) = cx.add_window_view({
+            let height = height.clone();
+            move |_, _| MixedSizeText(height)
+        });
+        cx.run_until_parked();
+        // 1.5 times the 32 px run, not the 16 px text.
+        assert_eq!(height.get(), px(48.));
+    }
+
     #[gpui::test]
     fn test_element_transformations_compose_and_map_masks(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| crate::Empty);
