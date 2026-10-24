@@ -1947,7 +1947,7 @@ mod tests {
                     ],
                     width: 24.0 + unit() * 30.0,
                     height: 20.0 + unit() * 30.0,
-                    corner_radius: if i % 7 == 0 { 6.0 } else { 0.0 },
+                    corner_radii: if i % 7 == 0 { [6.0; 4] } else { [0.0; 4] },
                     stroke_width: 2.0,
                     fill: if unit() < 0.25 { 0x569cff5a } else { 0 },
                     stroke: 0xa78bfaff,
@@ -2082,6 +2082,14 @@ mod tests {
         // Arrow parts and text bars.
         let kinds = gpui::RetainedShapes::new();
         let (scene, probes) = t::kinds_scene(&kinds);
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+
+        // Four corner radii.
+        let corners = gpui::RetainedShapes::new();
+        let (scene, probes) = t::corners_scene(&corners);
         let image =
             gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
                 .expect("render");

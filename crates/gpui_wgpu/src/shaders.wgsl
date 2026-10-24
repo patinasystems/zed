@@ -1373,7 +1373,7 @@ struct RetainedShape {
     a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32,
     width: f32,
     height: f32,
-    corner_radius: f32,
+    corner_radii: vec4<f32>, // top-left, top-right, bottom-right, bottom-left
     stroke_width: f32,
     fill: u32,
     stroke: u32,
@@ -1406,7 +1406,7 @@ struct RetainedShapeVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) @interpolate(flat) size: vec2<f32>,
-    @location(2) @interpolate(flat) corner_radius: f32,
+    @location(2) @interpolate(flat) corner_radii: vec4<f32>,
     @location(3) @interpolate(flat) half_stroke: f32,
     @location(4) @interpolate(flat) px_per_unit: f32,
     @location(5) @interpolate(flat) fill: vec4<f32>,
@@ -1489,7 +1489,8 @@ fn vs_retained_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_in
     out.position = vec4<f32>(device_px / u.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     out.local = local;
     out.size = vec2<f32>(s.width, s.height);
-    out.corner_radius = select(min(s.corner_radius, 0.5 * min(s.width, s.height)), 0.5 * s.height, kind == RETAINED_TEXT_BAR);
+    // Each corner clamped to half the shorter side; a text bar is a pill.
+    out.corner_radii = select(clamp(s.corner_radii, vec4<f32>(0.0), vec4<f32>(0.5 * min(s.width, s.height))), vec4<f32>(0.5 * s.height), kind == RETAINED_TEXT_BAR);
     out.half_stroke = half_stroke;
     out.px_per_unit = 0.5 * (sx + sy);
     out.fill = fill;
@@ -1564,7 +1565,11 @@ fn retained_triangle_sdf(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f3
     return -sqrt(d.x) * sign(d.y);
 }
 
-fn retained_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+// `p` from the center, y down; `radii` top-left, top-right, bottom-right,
+// bottom-left, each at most half the shorter side.
+fn retained_rect_sdf(p: vec2<f32>, half_size: vec2<f32>, radii: vec4<f32>) -> f32 {
+    let side = select(radii.xw, radii.yz, p.x >= 0.0);
+    let radius = select(side.x, side.y, p.y >= 0.0);
     let q = abs(p) - half_size + radius;
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
 }
@@ -1618,7 +1623,7 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     } else if input.kind == RETAINED_TRIANGLE {
         d = retained_triangle_sdf(input.local, vec2<f32>(0.0), vec2<f32>(input.size.x, 0.5 * input.size.y), vec2<f32>(0.0, input.size.y));
     } else {
-        d = retained_rect_sdf(p, half_size, input.corner_radius);
+        d = retained_rect_sdf(p, half_size, input.corner_radii);
     }
     let color = retained_fill_and_stroke(d * input.px_per_unit, input.half_stroke, input.px_per_unit, input.fill, input.stroke);
     if color.a <= 0.0 {

@@ -24,7 +24,7 @@ use std::{
 ///
 /// `transform` maps shape-local points (0..`width`, 0..`height`) into the
 /// buffer's space: `x' = a·x + c·y + tx`, `y' = b·x + d·y + ty`. The layout is
-/// shared with the shaders (13 four-byte words).
+/// shared with the shaders (16 four-byte words).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct ShapeInstance {
@@ -34,8 +34,10 @@ pub struct ShapeInstance {
     pub width: f32,
     /// Local height.
     pub height: f32,
-    /// Corner radius in local units (rectangles only).
-    pub corner_radius: f32,
+    /// Corner radii in local units, rectangles only: top-left, top-right,
+    /// bottom-right, bottom-left (local y grows down). Each is clamped to
+    /// half the shorter side when drawn.
+    pub corner_radii: [f32; 4],
     /// Stroke width in local units, centered on the outline. 0 draws no stroke.
     pub stroke_width: f32,
     /// Fill color, `0xRRGGBBAA` (straight alpha). Alpha 0 draws no fill.
@@ -48,7 +50,7 @@ pub struct ShapeInstance {
 }
 
 impl ShapeInstance {
-    /// A rectangle, rounded by `corner_radius`.
+    /// A rectangle, each corner rounded by its entry of `corner_radii`.
     pub const RECT: u32 = 0;
     /// An ellipse inscribed in the local rectangle.
     pub const ELLIPSE: u32 = 1;
@@ -521,6 +523,43 @@ pub mod retained_shapes_test_scene {
         (scene, probes)
     }
 
+    /// A 56 x 56 rectangle with four different corner radii (0, 8, 24, and
+    /// 40, which is clamped to half the side, 28), with probes inside and
+    /// outside each corner.
+    pub fn corners_scene(shapes: &RetainedShapes) -> (Scene, Vec<Probe>) {
+        shapes.set_all(vec![ShapeInstance {
+            corner_radii: [0.0, 8.0, 24.0, 40.0],
+            ..rect(4.0, 4.0, 56.0, 56.0, 0xffffffff)
+        }]);
+        let full = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(RetainedShapesDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask { bounds: full },
+            shapes: shapes.clone(),
+            paint: RetainedShapesPaint::new(0..1, TransformationMatrix::unit()),
+            opacity: 1.0,
+        });
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        const WHITE: [u8; 4] = [255, 255, 255, 255];
+        const BLACK: [u8; 4] = [0, 0, 0, 255];
+        let probes = vec![
+            probe("top-left (0) is square", 5, 5, WHITE),
+            probe("top-right (8) cuts its tip", 58, 5, BLACK),
+            probe("top-right (8) keeps its arc", 55, 8, WHITE),
+            probe("bottom-right (24) cuts its tip", 56, 56, BLACK),
+            probe("bottom-right (24) keeps its arc", 50, 50, WHITE),
+            probe("bottom-left (40) cuts its tip", 8, 54, BLACK),
+            probe("bottom-left is clamped to 28", 14, 48, WHITE),
+        ];
+        (scene, probes)
+    }
+
     /// A denser scene for comparing backends pixel by pixel: `n` random shapes
     /// of every kind (rotated, stroked, translucent, some below one pixel, some on
     /// layer 1) on a 256x256 target.
@@ -551,7 +590,11 @@ pub mod retained_shapes_test_scene {
                     transform: [cos, sin, -sin, cos, x, y],
                     width: w,
                     height: h,
-                    corner_radius: if i % 3 == 0 { radius } else { 0.0 },
+                    corner_radii: match i % 6 {
+                        0 => [radius; 4],
+                        3 => [radius, 0.0, radius * 2.0, radius * 0.5],
+                        _ => [0.0; 4],
+                    },
                     stroke_width: if i % 4 == 0 { 0.0 } else { stroke_width },
                     fill: if i % 2 == 0 {
                         fill_rgb | if i % 6 == 0 { 120 } else { 255 }
@@ -626,8 +669,8 @@ mod tests {
 
     #[test]
     fn layouts_match_the_shaders() {
-        // 13 four-byte words: the Metal and WGSL `RetainedShape` records.
-        assert_eq!(std::mem::size_of::<ShapeInstance>(), 13 * 4);
+        // 16 four-byte words: the Metal and WGSL `RetainedShape` records.
+        assert_eq!(std::mem::size_of::<ShapeInstance>(), 16 * 4);
         // Six floats, float2, float4 (16-aligned at 32), two floats, float2,
         // six floats, float2.
         assert_eq!(std::mem::size_of::<RetainedShapesUniforms>(), 96);

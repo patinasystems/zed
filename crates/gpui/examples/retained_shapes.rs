@@ -69,7 +69,7 @@ fn make(n: usize) -> (Vec<ShapeInstance>, f32, f32) {
             transform: [c, s, -s, c, col * PITCH, row * PITCH],
             width: w,
             height: h,
-            corner_radius: if i % 7 == 0 { 6.0 } else { 0.0 },
+            corner_radii: if i % 7 == 0 { [6.0; 4] } else { [0.0; 4] },
             stroke_width: 2.0,
             fill: if filled { (color << 8) | 90 } else { 0 },
             stroke: (color << 8) | 0xff,
