@@ -2851,7 +2851,7 @@ mod tests {
         let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
         let uploaded = renderer.core.resources.retained.uploaded_bytes;
-        assert_eq!(uploaded, 5 * 52);
+        assert_eq!(uploaded, 5 * 64);
 
         // Same scene again: nothing uploads. A range write uploads one record.
         renderer.render_scene_to_image(&scene, size(t::SIZE))?;
@@ -2862,7 +2862,7 @@ mod tests {
         let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
         assert_eq!(
             renderer.core.resources.retained.uploaded_bytes,
-            uploaded + 52
+            uploaded + 64
         );
         let blue = image.get_pixel(16, 16).0;
         assert!(
@@ -2873,6 +2873,12 @@ mod tests {
         // Arrow parts and text bars.
         let kinds = gpui::RetainedShapes::new();
         let (scene, probes) = t::kinds_scene(&kinds);
+        let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+
+        // Four corner radii.
+        let corners = gpui::RetainedShapes::new();
+        let (scene, probes) = t::corners_scene(&corners);
         let image = renderer.render_scene_to_image(&scene, size(t::SIZE))?;
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
 

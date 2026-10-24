@@ -1294,7 +1294,7 @@ float4 fill_color(Background background,
 struct RetainedShape {
   float a, b, c, d, tx, ty; // local -> buffer space: x' = a x + c y + tx
   float width, height;
-  float corner_radius;
+  float4 corner_radii; // top-left, top-right, bottom-right, bottom-left
   float stroke_width;
   uint fill;   // 0xRRGGBBAA
   uint stroke; // 0xRRGGBBAA
@@ -1324,7 +1324,7 @@ struct RetainedShapeVarying {
   float4 position [[position]];
   float2 local;             // shape-local point
   float2 size [[flat]];     // local width, height
-  float corner_radius [[flat]];
+  float4 corner_radii [[flat]]; // top-left, top-right, bottom-right, bottom-left
   float half_stroke [[flat]];   // local units
   float px_per_unit [[flat]];
   float4 fill [[flat]];
@@ -1410,8 +1410,10 @@ vertex RetainedShapeVarying retained_shape_vertex(
   out.position = float4(device_px / u->viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
   out.local = local;
   out.size = float2(s.width, s.height);
-  out.corner_radius = kind == RETAINED_TEXT_BAR ? 0.5 * s.height
-                                               : min(s.corner_radius, 0.5 * min(s.width, s.height));
+  // Each corner clamped to half the shorter side; a text bar is a pill.
+  out.corner_radii = kind == RETAINED_TEXT_BAR
+                         ? float4(0.5 * s.height)
+                         : clamp(s.corner_radii, float4(0.0), float4(0.5 * min(s.width, s.height)));
   out.half_stroke = half_stroke;
   out.px_per_unit = 0.5 * (sx + sy);
   out.fill = fill;
@@ -1480,7 +1482,11 @@ float retained_triangle_sdf(float2 p, float2 p0, float2 p1, float2 p2) {
   return -sqrt(d.x) * sign(d.y);
 }
 
-float retained_rect_sdf(float2 p, float2 half_size, float radius) {
+// `p` from the center, y down; `radii` top-left, top-right, bottom-right,
+// bottom-left, each at most half the shorter side.
+float retained_rect_sdf(float2 p, float2 half_size, float4 radii) {
+  float2 side = p.x >= 0.0 ? radii.yz : radii.xw;
+  float radius = p.y >= 0.0 ? side.y : side.x;
   float2 q = abs(p) - half_size + radius;
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
 }
@@ -1537,7 +1543,7 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
     d = retained_triangle_sdf(in.local, float2(0.0), float2(in.size.x, 0.5 * in.size.y),
                               float2(0.0, in.size.y));
   } else {
-    d = retained_rect_sdf(p, half_size, in.corner_radius);
+    d = retained_rect_sdf(p, half_size, in.corner_radii);
   }
   float4 color = retained_fill_and_stroke(d * in.px_per_unit, in.half_stroke, in.px_per_unit,
                                           in.fill, in.stroke);

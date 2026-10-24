@@ -279,7 +279,8 @@ fn write_range(queue: &wgpu::Queue, data: &InstanceData, bytes: &[u8], range: Ra
             height,
             ..
         } => {
-            // Records are 52 bytes and texels 16: widen to whole texels.
+            // Records are 64 bytes and texels 16; a range of records still widens
+            // to whole texels in case the record size changes.
             let texel = INSTANCE_TEXTURE_TEXEL_SIZE;
             let first = start / texel * texel;
             let last = end.next_multiple_of(texel).min(bytes.len() as u64);
