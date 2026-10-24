@@ -463,12 +463,13 @@ impl StyledText {
                 runs.push(default_style.clone().to_run(range.start - ix));
             }
             debug_assert!(text.is_char_boundary(range.end));
-            runs.push(
-                default_style
-                    .clone()
-                    .highlight(highlight)
-                    .to_run(range.len()),
-            );
+            let mut run = default_style
+                .clone()
+                .highlight(highlight)
+                .to_run(range.len());
+            run.font_size = highlight.font_size;
+            run.letter_spacing = highlight.letter_spacing;
+            runs.push(run);
             ix = range.end;
         }
         if ix < text.len() {
@@ -640,17 +641,22 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
-
         let runs = if let Some(runs) = runs {
             runs
         } else {
             vec![text_style.to_run(text.len())]
         };
+        // A line height relative to the font size follows the largest run, as each
+        // CSS inline box contributes its own; an absolute one stays as set.
+        let largest_run = runs
+            .iter()
+            .filter_map(|run| run.font_size)
+            .fold(font_size, Pixels::max);
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(largest_run.into(), window.rem_size()),
+        );
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 

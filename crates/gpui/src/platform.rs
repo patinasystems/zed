@@ -1649,6 +1649,7 @@ impl PlatformTextSystem for NoopTextSystem {
             runs.push(ShapedRun {
                 font_id: FontId(0),
                 glyphs,
+                font_size: None,
             });
         } else {
             position = px(0.);

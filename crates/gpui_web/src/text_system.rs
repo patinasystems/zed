@@ -217,7 +217,7 @@ impl WebTextSystem {
                     candidate.font_id,
                     text,
                     candidate.color,
-                    layout.font_size,
+                    candidate.font_size.unwrap_or(layout.font_size),
                 )?;
                 Ok(Replacement {
                     glyph_range: glyphs.range,
@@ -405,6 +405,8 @@ impl PlatformTextSystem for WebTextSystem {
                         .map(|run| FontRun {
                             len: run.len,
                             font_id: self.native_font_id(run.font_id),
+                            font_size: run.font_size,
+                            letter_spacing: run.letter_spacing,
                         })
                         .collect(),
                 )

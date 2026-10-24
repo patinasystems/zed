@@ -1619,7 +1619,11 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             }
             glyph_idx += cluster_glyph_count;
         }
-        context.runs.push(ShapedRun { font_id, glyphs });
+        context.runs.push(ShapedRun {
+            font_id,
+            glyphs,
+            font_size: None,
+        });
         Ok(())
     }
 

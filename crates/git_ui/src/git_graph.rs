@@ -1547,6 +1547,8 @@ impl GitGraph {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    font_size: None,
+                    letter_spacing: None,
                 }],
                 None,
             )
