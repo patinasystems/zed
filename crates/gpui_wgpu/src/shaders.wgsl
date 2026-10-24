@@ -1381,16 +1381,13 @@ struct RetainedShape {
 }
 
 // A rounded-rectangle clip: device px map to its space by `m` (x' = m.x x +
-// m.z y + t.x, y' = m.y x + m.w y + t.y), where it is centered on `half_size`.
+// m.z y + t.x, y' = m.y x + m.w y + t.y), where it is centered on `half_size`;
+// a negative half size is an empty clip.
 struct RetainedClip {
     m: vec4<f32>,
     t: vec2<f32>,
     half_size: vec2<f32>,
     radii: vec4<f32>, // top-left, top-right, bottom-right, bottom-left
-    px_per_unit: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
 }
 
 struct RetainedShapesUniforms {
@@ -1598,14 +1595,25 @@ fn retained_ellipse_sdf(p: vec2<f32>, radii: vec2<f32>) -> f32 {
 }
 
 // How much of the device pixel at `pos` is inside every clip (antialiased
-// like a shape's edge).
+// like a shape's edge: the distance is measured in device pixels along the
+// edge's normal, so a stretched clip stays sharp on both axes).
 fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
     var coverage = 1.0;
     for (var i = 0u; i < retained_uniforms.clip_count; i++) {
         let c = retained_uniforms.clips[i];
-        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t;
-        let d = retained_rect_sdf(p - c.half_size, c.half_size, c.radii) * c.px_per_unit;
-        coverage *= clamp(0.5 - d, 0.0, 1.0);
+        if c.half_size.x < 0.0 {
+            return 0.0;
+        }
+        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
+        let d = retained_rect_sdf(p, c.half_size, c.radii);
+        // The distance's gradient in clip space, then in device pixels.
+        let side = select(c.radii.xw, c.radii.yz, p.x >= 0.0);
+        let radius = select(side.x, side.y, p.y >= 0.0);
+        let q = abs(p) - c.half_size + radius;
+        var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
+        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
+        let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
+        coverage *= clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0);
     }
     return coverage;
 }
