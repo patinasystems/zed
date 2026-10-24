@@ -2,7 +2,7 @@ use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
-    StyleRefinement, TextStyle, WeakEntity,
+    StyleRefinement, TextStyle, TransformationMatrix, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -331,6 +331,9 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    // Hitboxes and mouse listeners capture it, so a cached view reuses them only under the
+    // same one.
+    element_transformation: TransformationMatrix,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -542,11 +545,13 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let element_transformation = window.element_transformation();
 
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.element_transformation == element_transformation
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -582,6 +587,7 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
+                            element_transformation,
                         },
                     },
                 )

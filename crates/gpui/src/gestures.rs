@@ -395,7 +395,15 @@ impl InputEvent for TouchDragEvent {
     }
 }
 impl GestureEvent for TouchDragEvent {}
-impl MouseEvent for TouchDragEvent {}
+impl MouseEvent for TouchDragEvent {
+    fn map_position(&self, map: &dyn Fn(Point<Pixels>) -> Point<Pixels>) -> Self {
+        Self {
+            start_position: map(self.start_position),
+            position: map(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 /// A back-navigation gesture, such as the iOS swipe from the leading screen
 /// edge.
@@ -438,7 +446,14 @@ impl InputEvent for BackGestureEvent {
     }
 }
 impl GestureEvent for BackGestureEvent {}
-impl MouseEvent for BackGestureEvent {}
+impl MouseEvent for BackGestureEvent {
+    fn map_position(&self, map: &dyn Fn(Point<Pixels>) -> Point<Pixels>) -> Self {
+        Self {
+            start_position: map(self.start_position),
+            ..self.clone()
+        }
+    }
+}
 
 /// A phased long-press gesture recognized from a touch.
 #[derive(Clone, Debug)]
@@ -468,7 +483,15 @@ impl InputEvent for LongPressEvent {
     }
 }
 impl GestureEvent for LongPressEvent {}
-impl MouseEvent for LongPressEvent {}
+impl MouseEvent for LongPressEvent {
+    fn map_position(&self, map: &dyn Fn(Point<Pixels>) -> Point<Pixels>) -> Self {
+        Self {
+            start_position: map(self.start_position),
+            position: map(self.position),
+            ..self.clone()
+        }
+    }
+}
 
 /// Platform gesture recognition services.
 ///

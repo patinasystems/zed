@@ -138,7 +138,7 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 fn load_quad(instance_id: u32) -> Quad {
     // Keep this fixed-layout decoder explicit. Some WebGL shader compilers fail
     // to optimize the cursor's branches and dynamic vector indexing for quads.
-    let first_texel_index = instance_id * 10u;
+    let first_texel_index = instance_id * 12u;
     let width = textureDimensions(t_instances).x;
     let texel0 = fetch_instance_texel(first_texel_index, width);
     let texel1 = fetch_instance_texel(first_texel_index + 1u, width);
@@ -150,6 +150,8 @@ fn load_quad(instance_id: u32) -> Quad {
     let texel7 = fetch_instance_texel(first_texel_index + 7u, width);
     let texel8 = fetch_instance_texel(first_texel_index + 8u, width);
     let texel9 = fetch_instance_texel(first_texel_index + 9u, width);
+    let texel10 = fetch_instance_texel(first_texel_index + 10u, width);
+    let texel11 = fetch_instance_texel(first_texel_index + 11u, width);
 
     let values0 = bitcast<vec4<f32>>(texel0);
     let values1 = bitcast<vec4<f32>>(texel1);
@@ -161,6 +163,8 @@ fn load_quad(instance_id: u32) -> Quad {
     let values7 = bitcast<vec4<f32>>(texel7);
     let values8 = bitcast<vec4<f32>>(texel8);
     let values9 = bitcast<vec4<f32>>(texel9);
+    let values10 = bitcast<vec4<f32>>(texel10);
+    let values11 = bitcast<vec4<f32>>(texel11);
 
     return Quad(
         texel0.x,
@@ -187,11 +191,13 @@ fn load_quad(instance_id: u32) -> Quad {
         Hsla(values7.x, values7.y, values7.z, values7.w),
         Corners(values8.x, values8.y, values8.z, values8.w),
         Edges(values9.x, values9.y, values9.z, values9.w),
+        TransformationMatrix(mat2x2<f32>(values10.xy, values10.zw), values11.xy),
+        texel11.zw,
     );
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 34u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
@@ -203,6 +209,7 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_corners(&cursor),
         read_word(&cursor),
         read_word(&cursor),
+        read_transformation(&cursor),
     );
 }
 
@@ -222,7 +229,7 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 16u);
+    var cursor = instance_cursor(instance_id * 22u);
     return Underline(
         read_word(&cursor),
         read_word(&cursor),
@@ -231,6 +238,7 @@ fn load_underline(instance_id: u32) -> Underline {
         read_hsla(&cursor),
         read_f32(&cursor),
         read_word(&cursor),
+        read_transformation(&cursor),
     );
 }
 

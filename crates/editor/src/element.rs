@@ -11534,6 +11534,7 @@ mod tests {
                 bounds,
                 content_mask: gpui::ContentMask { bounds },
                 behavior: HitboxBehavior::Normal,
+                transformation: gpui::HitboxTransformation::None,
             };
             let minimap_scroll_top = MinimapLayout::calculate_minimap_top_offset(
                 self.document_lines,
@@ -11710,6 +11711,7 @@ mod tests {
                 bounds: zero_bounds,
             },
             behavior: HitboxBehavior::Normal,
+            transformation: gpui::HitboxTransformation::None,
         }
     }
 

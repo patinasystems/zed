@@ -1171,7 +1171,9 @@ impl Element for InteractiveText {
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
                 if let Some(click_listener) = self.click_listener.take() {
-                    let mouse_position = window.mouse_position();
+                    let mouse_position = hitbox
+                        .local_position(window.mouse_position())
+                        .unwrap_or_else(|| window.mouse_position());
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
                         && self
                             .clickable_ranges
@@ -1248,9 +1250,13 @@ impl Element for InteractiveText {
                     let build_tooltip = Rc::new({
                         let tooltip_is_hoverable = false;
                         let text_layout = text_layout.clone();
+                        let hitbox = hitbox.clone();
                         move |window: &mut Window, cx: &mut App| {
+                            let position = hitbox
+                                .local_position(window.mouse_position())
+                                .unwrap_or_else(|| window.mouse_position());
                             text_layout
-                                .index_for_position(window.mouse_position())
+                                .index_for_position(position)
                                 .ok()
                                 .and_then(|position| tooltip_builder(position, window, cx))
                                 .map(|view| (view, tooltip_is_hoverable))
@@ -1259,30 +1265,32 @@ impl Element for InteractiveText {
 
                     // Use bounds instead of testing hitbox since this is called during prepaint.
                     let check_is_hovered_during_prepaint = Rc::new({
-                        let source_bounds = hitbox.bounds;
+                        let source = hitbox.clone();
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
-                            text_layout
-                                .index_for_position(window.mouse_position())
-                                .is_ok()
-                                && source_bounds.contains(&window.mouse_position())
+                            source
+                                .local_position(window.mouse_position())
+                                .is_some_and(|position| {
+                                    text_layout.index_for_position(position).is_ok()
+                                        && source.bounds.contains(&position)
+                                })
                                 && pending_mouse_down.get().is_none()
                         }
                     });
 
-                    let check_is_hovered = Rc::new({
-                        let hitbox = hitbox.clone();
-                        let text_layout = text_layout.clone();
-                        let pending_mouse_down = interactive_state.mouse_down_index.clone();
-                        move |window: &Window| {
-                            text_layout
-                                .index_for_position(window.mouse_position())
-                                .is_ok()
-                                && hitbox.is_hovered(window)
-                                && pending_mouse_down.get().is_none()
-                        }
-                    });
+                    let check_is_hovered =
+                        Rc::new({
+                            let hitbox = hitbox.clone();
+                            let text_layout = text_layout.clone();
+                            let pending_mouse_down = interactive_state.mouse_down_index.clone();
+                            move |window: &Window| {
+                                hitbox.local_position(window.mouse_position()).is_some_and(
+                                    |position| text_layout.index_for_position(position).is_ok(),
+                                ) && hitbox.is_hovered(window)
+                                    && pending_mouse_down.get().is_none()
+                            }
+                        });
 
                     register_tooltip_mouse_handlers(
                         &active_tooltip,

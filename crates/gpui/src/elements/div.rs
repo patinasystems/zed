@@ -268,7 +268,7 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Capture
                     && !window.has_active_prompt()
-                    && !hitbox.contains(&window.mouse_position())
+                    && !hitbox.contains_window_position(window.mouse_position())
                 {
                     (listener)(event, window, cx)
                 }
@@ -3038,12 +3038,18 @@ impl Interactivity {
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
-                            && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
+                            // In window pixels, whatever the element's transformation.
+                            && (hitbox.window_position(event.position)
+                                - hitbox.window_position(mouse_down.position))
+                            .magnitude()
+                                > DRAG_THRESHOLD
                             && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
-                            let cursor_offset = event.position - hitbox.origin;
+                            // The preview follows the pointer in window coordinates.
+                            let cursor_offset = hitbox.window_position(event.position)
+                                - hitbox.window_position(hitbox.origin);
                             let drag = (listener.render)(
                                 listener.value.as_ref(),
                                 cursor_offset,
@@ -3264,11 +3270,11 @@ impl Interactivity {
                 // Use bounds instead of testing hitbox since this is called during prepaint.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
+                    let source = hitbox.clone();
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
                             && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && source.contains_window_position(window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
