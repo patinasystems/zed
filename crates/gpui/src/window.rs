@@ -4788,7 +4788,8 @@ impl Window {
     /// Paint shapes from a retained buffer: `paint.range` under
     /// `paint.transformation` (buffer space to window pixels). `bounds` is the
     /// window area the shapes may cover; it orders the draw against other
-    /// primitives and clips it, together with the current content mask.
+    /// primitives and clips it, together with the current content mask and
+    /// `paint.clips` (rounded rectangles in buffer space, any rotation).
     /// Nothing is uploaded unless the buffer changed since the renderer last
     /// drew it, so moving the transformation (pan, zoom) or the layer
     /// transformation (a drag) costs one uniform.
@@ -4808,9 +4809,14 @@ impl Window {
         paint.transformation = TransformationMatrix::unit()
             .scale(size(scale_factor, scale_factor))
             .compose(paint.transformation);
+        let mut bounds = bounds.scale(scale_factor);
+        // Nothing shows outside the clips: the draw covers only their bounds.
+        if let Some(clip) = paint.clip_bounds() {
+            bounds = bounds.intersect(&clip);
+        }
         let draw = RetainedShapesDraw {
             order: 0,
-            bounds: bounds.scale(scale_factor),
+            bounds,
             content_mask: self.content_mask().scale(scale_factor),
             shapes: shapes.clone(),
             paint,
