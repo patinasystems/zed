@@ -1613,7 +1613,8 @@ fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
         var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
         g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
         let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
-        coverage *= clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0);
+        // The intersection: the least covered clip (a product would darken shared edges).
+        coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
     }
     return coverage;
 }

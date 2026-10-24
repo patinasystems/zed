@@ -773,6 +773,19 @@ pub mod retained_shapes_test_scene {
             height: 8.0,
             ..Default::default()
         };
+        // Two clips whose top edges both lie at y = 61.5 (the middle of row 61).
+        let shared = RetainedClip {
+            transform: [1.0, 0.0, 0.0, 1.0, 24.0, 61.5],
+            width: 12.0,
+            height: 10.0,
+            ..Default::default()
+        };
+        let shared_too = RetainedClip {
+            transform: [1.0, 0.0, 0.0, 1.0, 20.0, 61.5],
+            width: 20.0,
+            height: 10.0,
+            ..Default::default()
+        };
         let mut scene = Scene::default();
         for (order, paint) in [
             (
@@ -789,6 +802,12 @@ pub mod retained_shapes_test_scene {
             (
                 2,
                 RetainedShapesPaint::new(2..3, TransformationMatrix::unit()).clip(stretched),
+            ),
+            (
+                3,
+                RetainedShapesPaint::new(2..3, TransformationMatrix::unit())
+                    .clip(shared)
+                    .clip(shared_too),
             ),
         ] {
             let bounds = paint.clip_bounds().map_or(full, |b| full.intersect(&b));
@@ -822,6 +841,8 @@ pub mod retained_shapes_test_scene {
             probe("past its right edge", 12, 55, BLACK),
             probe("its last row: the edge is sharp down", 6, 57, BLUE),
             probe("below it", 6, 58, BLACK),
+            // Two clips sharing an edge halfway through a pixel: half covered, not a quarter.
+            probe("a shared half-covered edge", 30, 61, [0, 0, 128, 255]),
         ];
         (scene, probes)
     }

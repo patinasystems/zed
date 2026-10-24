@@ -1530,7 +1530,8 @@ float retained_clip_coverage(float2 pos, constant RetainedShapesUniforms *u) {
     float2 g = (q.x > 0.0 && q.y > 0.0) ? normalize(q) : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
     g *= float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
     float per_px = length(float2(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
-    coverage *= clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0);
+    // The intersection: the least covered clip (a product would darken shared edges).
+    coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
   }
   return coverage;
 }
