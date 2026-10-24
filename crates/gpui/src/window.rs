@@ -4385,7 +4385,14 @@ impl Window {
         result
     }
 
-    pub(crate) fn with_element_opacity<R>(
+    /// Multiplies the opacity of everything `f` paints by `opacity` (nested calls
+    /// compose), as a `div` does for its `opacity` style. Elements that paint parts of
+    /// themselves outside their child element (a backdrop filter, a custom shadow) use
+    /// it to fade with the rest of the element.
+    ///
+    /// This method should only be called during the prepaint or paint phase of element
+    /// drawing.
+    pub fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
         f: impl FnOnce(&mut Self) -> R,
@@ -4478,7 +4485,7 @@ impl Window {
     /// Obtain the current element opacity. This method should only be called during the
     /// prepaint phase of element drawing.
     #[inline]
-    pub(crate) fn element_opacity(&self) -> f32 {
+    pub fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
     }
@@ -8792,6 +8799,29 @@ mod tests {
         cx.run_until_parked();
         // 1.5 times the 32 px run, not the 16 px text.
         assert_eq!(height.get(), px(48.));
+    }
+
+    #[gpui::test]
+    fn test_element_opacity_composes_and_fades_paint(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| crate::Empty);
+        window
+            .update(cx, |_, window, _| {
+                window.invalidator.set_phase(super::DrawPhase::Paint);
+                window.with_element_opacity(Some(0.5), |window| {
+                    window.with_element_opacity(Some(0.5), |window| {
+                        assert_eq!(window.element_opacity(), 0.25);
+                        window.paint_quad(crate::fill(
+                            Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.))),
+                            hsla(0., 1., 0.5, 1.),
+                        ));
+                    });
+                });
+                assert_eq!(window.element_opacity(), 1.);
+                let quad = &window.next_frame.scene.quads[0];
+                assert_eq!(quad.background.solid.a, 0.25);
+                window.invalidator.set_phase(super::DrawPhase::None);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
