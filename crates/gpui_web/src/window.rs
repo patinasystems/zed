@@ -104,8 +104,10 @@ pub struct WebWindow {
 }
 
 impl WebWindow {
+    /// Creates the window's canvas inside `container`, or the document body.
     pub(crate) fn prepare_canvas(
         browser_window: &web_sys::Window,
+        container: Option<&web_sys::Element>,
     ) -> anyhow::Result<web_sys::HtmlCanvasElement> {
         let document = browser_window
             .document()
@@ -133,11 +135,16 @@ impl WebWindow {
             })?;
         }
 
-        let body = document
-            .body()
-            .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?;
-        body.append_child(&canvas)
-            .map_err(|error| anyhow::anyhow!("Failed to append canvas to body: {error:?}"))?;
+        let parent: web_sys::Element = match container {
+            Some(container) => container.clone(),
+            None => document
+                .body()
+                .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?
+                .into(),
+        };
+        parent
+            .append_child(&canvas)
+            .map_err(|error| anyhow::anyhow!("Failed to append canvas: {error:?}"))?;
         Ok(canvas)
     }
 
