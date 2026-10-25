@@ -8635,6 +8635,71 @@ mod tests {
         assert!(filters(cx).0.is_empty(), "hidden by its hover style");
     }
 
+    /// Overlapping children of a composited div whose hover style changes its
+    /// opacity, over its own backdrop filter.
+    struct HoverGroup;
+
+    impl Render for HoverGroup {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().p(px(50.)).child(
+                div()
+                    .id("group")
+                    .size(px(40.))
+                    .opacity(0.5)
+                    .backdrop_filter(super::Backdrop {
+                        saturate: 0.,
+                        ..Default::default()
+                    })
+                    .compositing(crate::Compositing {
+                        blend_mode: crate::BlendMode::Multiply,
+                        ..Default::default()
+                    })
+                    .hover(|style| style.opacity(0.25))
+                    .child(div().size(px(20.)).bg(hsla(0., 1., 0.5, 1.)))
+                    .child(div().size(px(20.)).mt(px(-10.)).bg(hsla(0.6, 1., 0.5, 1.))),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_style_compositing_follows_the_painted_style(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| HoverGroup);
+        cx.run_until_parked();
+        // Draws a frame, then reads its group's opacity.
+        let painted = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let scene = &window.rendered_frame.scene;
+                assert_eq!(scene.groups.len(), 1);
+                let group = &scene.groups[0];
+                assert_eq!(group.effects.blend_mode, crate::BlendMode::Multiply);
+                assert_eq!(group.scene.quads.len(), 2);
+                // The backdrop filter starts the group's image, faded with it.
+                assert!(scene.backdrop_filters.is_empty());
+                assert!(group.scene.backdrop_filters.is_empty());
+                let backdrop = group.effects.backdrop.expect("the div's backdrop filter");
+                assert_eq!((backdrop.saturate, backdrop.opacity), (0., 1.));
+                (group.effects.opacity, backdrop.opacity)
+            })
+            .unwrap()
+        };
+        assert_eq!(painted(cx), (0.5, 1.));
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(60.), px(60.)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(painted(cx), (0.25, 1.), "the hover style's opacity");
+    }
+
     /// A canvas whose hitbox, quad and mouse listener sit under one element
     /// transformation: a quarter turn about (50, 50).
     struct TransformedProbe {

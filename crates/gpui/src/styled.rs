@@ -755,6 +755,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Paints this element and its children as one compositing group, faded by its
+    /// opacity as a whole, then filtered and blended ([`crate::Style::compositing`]),
+    /// as CSS composites a stacking context.
+    fn compositing(mut self, compositing: crate::Compositing) -> Self {
+        self.style().compositing = Some(compositing);
+        self
+    }
+
     /// Paints this element's box with a shader ([`crate::Window::paint_shader`]),
     /// over its background color.
     fn shader(mut self, fill: crate::ShaderFill) -> Self {
