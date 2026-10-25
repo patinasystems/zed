@@ -8349,6 +8349,61 @@ mod tests {
         WindowOptions, canvas, div, hsla, point, px, size,
     };
 
+    /// A div with a backdrop filter that a hover style hides.
+    struct HoverGlass;
+
+    impl Render for HoverGlass {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Away from the origin, where the test pointer starts.
+            div().size_full().p(px(50.)).child(
+                div()
+                    .id("glass")
+                    .size(px(40.))
+                    .rounded(px(8.))
+                    .opacity(0.5)
+                    .backdrop_filter(super::Backdrop {
+                        saturate: 0.,
+                        ..Default::default()
+                    })
+                    .hover(|style| style.invisible()),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_style_backdrop_filter_follows_the_painted_style(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| HoverGlass);
+        cx.run_until_parked();
+        // Draws a frame, then reads its backdrop filters.
+        let filters = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                (window.rendered_frame.scene.backdrop_filters.clone(), window.scale_factor())
+            })
+            .unwrap()
+        };
+        let (painted, scale) = filters(cx);
+        assert_eq!(painted.len(), 1);
+        assert_eq!(painted[0].corner_radii.top_left, ScaledPixels(8. * scale));
+        assert_eq!(painted[0].opacity, 0.5, "faded with the element");
+        assert_eq!(painted[0].saturate, 0.);
+        // Hovered, the element is hidden, and so is its filter.
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(70.), px(70.)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(filters(cx).0.is_empty(), "hidden by its hover style");
+    }
+
     /// A canvas whose hitbox, quad and mouse listener sit under one element
     /// transformation: a quarter turn about (50, 50).
     struct TransformedProbe {
@@ -10968,7 +11023,15 @@ mod inspector_tests {
 }
 
 /// What [`Window::paint_backdrop_filter`] does to the backdrop.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 pub struct Backdrop {
     /// The blur's standard deviation (CSS `blur()`); zero for none.
     pub blur_radius: Pixels,
