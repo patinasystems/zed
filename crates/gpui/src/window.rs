@@ -8451,6 +8451,7 @@ mod tests {
                     .id("shaded")
                     .size(px(40.))
                     .opacity(0.5)
+                    .bg(hsla(0., 1., 0.5, 1.))
                     .shader(crate::ShaderFill {
                         shader: crate::Shader::new(
                             "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }",
@@ -8474,6 +8475,10 @@ mod tests {
                 let scene = &window.rendered_frame.scene;
                 let filter = scene.backdrop_filters.first().copied();
                 let uniforms = filter.map(|f| f.shader.uniforms(scene).to_vec());
+                // Over the background color.
+                if let Some(filter) = filter {
+                    assert!(scene.quads.iter().all(|quad| quad.order < filter.order));
+                }
                 (filter, uniforms, window.scale_factor())
             })
             .unwrap()

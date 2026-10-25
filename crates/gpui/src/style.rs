@@ -298,7 +298,7 @@ pub struct Style {
     pub backdrop_filter: Option<crate::Backdrop>,
 
     /// A shader that paints the element's border box (within its corner radii)
-    /// after the backdrop filter and before the background color. A div paints
+    /// over its background color, as CSS paints a background image. A div paints
     /// it from its final style, so it follows the div's state styles, opacity
     /// and visibility.
     pub shader: Option<crate::ShaderFill>,
@@ -736,16 +736,6 @@ impl Style {
             window.paint_backdrop_filter(bounds, corner_radii, backdrop);
         }
 
-        if let Some(fill) = &self.shader {
-            window.paint_shader(
-                bounds,
-                corner_radii,
-                &fill.shader,
-                &fill.uniforms,
-                fill.input,
-            );
-        }
-
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -771,6 +761,17 @@ impl Style {
                 border_color,
                 self.border_style,
             ));
+        }
+
+        // Over the background color, as CSS paints a background image.
+        if let Some(fill) = &self.shader {
+            window.paint_shader(
+                bounds,
+                corner_radii,
+                &fill.shader,
+                &fill.uniforms,
+                fill.input,
+            );
         }
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
