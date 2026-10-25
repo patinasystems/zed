@@ -355,6 +355,15 @@ impl DirectXRenderer {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
+        // Compositing groups are not drawn offscreen here: paint their content with
+        // each group's opacity per primitive, without filters or blend modes.
+        let flattened;
+        let scene = if scene.groups.is_empty() {
+            scene
+        } else {
+            flattened = scene.without_groups();
+            &flattened
+        };
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -389,6 +398,8 @@ impl DirectXRenderer {
                 PrimitiveBatch::RetainedShapes(_) => Ok(()),
                 // Not implemented by the DirectX renderer: the backdrop draws unfiltered.
                 PrimitiveBatch::BackdropFilters(_) => Ok(()),
+                // Flattened above.
+                PrimitiveBatch::Groups(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

@@ -911,7 +911,6 @@ fragment float4 path_rasterization_fragment(
 
 struct PathSpriteVertexOutput {
   float4 position [[position]];
-  float2 texture_coords;
 };
 
 vertex PathSpriteVertexOutput path_sprite_vertex(
@@ -927,22 +926,16 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
   // rasterizing the path.
   float4 device_position =
       to_device_position(unit_vertex, sprite.bounds, viewport_size);
-
-  float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
-
-  return PathSpriteVertexOutput{
-    device_position,
-    texture_coords
-  };
+  return PathSpriteVertexOutput{device_position};
 }
 
 fragment float4 path_sprite_fragment(
   PathSpriteVertexOutput input [[stage_in]],
   texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
 ) {
-  constexpr sampler intermediate_texture_sampler(mag_filter::linear, min_filter::linear);
-  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+  // The intermediate texture holds the paths at the target's pixels (it may be larger
+  // than the target, a group's image).
+  return intermediate_texture.read(uint2(input.position.xy));
 }
 
 struct SurfaceVertexOutput {
@@ -1797,15 +1790,14 @@ vertex BackdropCompositeOutput backdrop_composite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-// The filtered backdrop inside the filter's rounded bounds. `region` is where the
-// filtered texture sits in the target: origin and size, in device pixels.
-fragment float4 backdrop_composite_fragment(BackdropCompositeInput input [[stage_in]],
-                                            constant BackdropFilter *filter [[buffer(1)]],
-                                            constant float4 &region [[buffer(3)]],
-                                            texture2d<float> filtered [[texture(0)]]) {
+// The filtered backdrop (straight color and alpha) at `position`, and in `coverage`
+// its coverage of the filter's rounded bounds, faded by its opacity. `region` is
+// where the filtered texture sits in the target: origin and size, device pixels.
+float4 backdrop_filtered(float2 position, constant BackdropFilter *filter, float4 region,
+                         texture2d<float> filtered, thread float &coverage) {
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
                                    address::clamp_to_edge);
-  float2 uv = (input.position.xy - region.xy) / region.zw;
+  float2 uv = (position - region.xy) / region.zw;
   float4 color = filtered.sample(linear_sampler, uv);
   // Filter straight colors, then weight them by the backdrop's alpha again, so
   // transparent texels stay empty.
@@ -1819,9 +1811,234 @@ fragment float4 backdrop_composite_fragment(BackdropCompositeInput input [[stage
   rgb = saturate(saturate_matrix * rgb);
   rgb = saturate(rgb * filter->brightness);
   rgb = saturate((rgb - 0.5) * filter->contrast + 0.5);
-  float distance = quad_sdf(input.position.xy, filter->bounds, filter->corner_radii);
-  float coverage = saturate(0.5 - distance) * filter->opacity;
-  // Blended as color * 1 + target * (1 - coverage), keeping the target's alpha:
-  // transparent backdrops stay transparent.
-  return float4(rgb * color.a * coverage, coverage);
+  float distance = quad_sdf(position, filter->bounds, filter->corner_radii);
+  coverage = saturate(0.5 - distance) * filter->opacity;
+  return float4(rgb, color.a);
+}
+
+// The filtered backdrop inside the filter's rounded bounds, blended as
+// color * 1 + target * (1 - coverage), keeping the target's alpha: transparent
+// backdrops stay transparent.
+fragment float4 backdrop_composite_fragment(BackdropCompositeInput input [[stage_in]],
+                                            constant BackdropFilter *filter [[buffer(1)]],
+                                            constant float4 &region [[buffer(3)]],
+                                            texture2d<float> filtered [[texture(0)]]) {
+  float coverage;
+  float4 color = backdrop_filtered(input.position.xy, filter, region, filtered, coverage);
+  return float4(color.rgb * color.a * coverage, coverage);
+}
+
+// The filtered backdrop that starts a group's image: premultiplied, drawn over the
+// (transparent) image with its alpha.
+fragment float4 backdrop_group_fragment(BackdropCompositeInput input [[stage_in]],
+                                        constant BackdropFilter *filter [[buffer(1)]],
+                                        constant float4 &region [[buffer(3)]],
+                                        texture2d<float> filtered [[texture(0)]]) {
+  float coverage;
+  float4 color = backdrop_filtered(input.position.xy, filter, region, filtered, coverage);
+  return float4(color.rgb, 1.) * color.a * coverage;
+}
+
+// --- compositing groups --- //
+
+// A group's image (premultiplied, as targets hold colors) is color filtered, faded
+// and blended onto the target. `GroupCompositeUniforms` in gpui.
+struct GroupCompositeParams {
+  float4 bounds;           // what to draw: origin and size, device pixels
+  float4 content_mask;
+  float4 source_region;    // where the group's image sits in the target
+  float4 backdrop_region;  // where the copy of what is behind it sits
+  uint4 filter_kinds[2];   // `ColorFilter::gpu` codes, four to a vector
+  float4 filter_amounts[2];
+  float2 viewport_size;
+  float opacity;
+  uint blend_mode;  // `BlendMode`
+  uint filter_count;
+  uint pad0;
+  uint pad1;
+  uint pad2;
+};
+
+struct GroupCompositeOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct GroupCompositeInput {
+  float4 position [[position]];
+};
+
+vertex GroupCompositeOutput group_composite_vertex(
+    uint unit_vertex_id [[vertex_id]], constant float2 *unit_vertices [[buffer(0)]],
+    constant GroupCompositeParams &params [[buffer(1)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 position = unit_vertex * params.bounds.zw + params.bounds.xy;
+  float2 ndc = position / params.viewport_size * float2(2., -2.) + float2(-1., 1.);
+  float2 tl = position - params.content_mask.xy;
+  float2 br = params.content_mask.xy + params.content_mask.zw - position;
+  return GroupCompositeOutput{float4(ndc, 0., 1.), {tl.x, br.x, tl.y, br.y}};
+}
+
+float3 group_matrix(float3 rgb, float3 r, float3 g, float3 b) {
+  return saturate(float3(dot(r, rgb), dot(g, rgb), dot(b, rgb)));
+}
+
+// One CSS color filter function (Filter Effects 1) on a straight color.
+float3 group_color_filter(float3 rgb, uint kind, float amount) {
+  switch (kind) {
+  case 1:  // brightness
+    return saturate(rgb * amount);
+  case 2:  // contrast
+    return saturate((rgb - 0.5) * amount + 0.5);
+  case 3: {  // grayscale
+    float s = 1. - amount;
+    return group_matrix(rgb, float3(0.2126 + 0.7874 * s, 0.7152 - 0.7152 * s, 0.0722 - 0.0722 * s),
+                        float3(0.2126 - 0.2126 * s, 0.7152 + 0.2848 * s, 0.0722 - 0.0722 * s),
+                        float3(0.2126 - 0.2126 * s, 0.7152 - 0.7152 * s, 0.0722 + 0.9278 * s));
+  }
+  case 4: {  // hue-rotate, in radians
+    float c = cos(amount);
+    float s = sin(amount);
+    return group_matrix(
+        rgb,
+        float3(0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715,
+               0.072 - c * 0.072 + s * 0.928),
+        float3(0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140,
+               0.072 - c * 0.072 - s * 0.283),
+        float3(0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715,
+               0.072 + c * 0.928 + s * 0.072));
+  }
+  case 5:  // invert
+    return saturate(mix(rgb, 1. - rgb, amount));
+  case 6: {  // saturate
+    float s = amount;
+    return group_matrix(rgb, float3(0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s),
+                        float3(0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s),
+                        float3(0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s));
+  }
+  case 7: {  // sepia
+    float s = 1. - amount;
+    return group_matrix(rgb, float3(0.393 + 0.607 * s, 0.769 - 0.769 * s, 0.189 - 0.189 * s),
+                        float3(0.349 - 0.349 * s, 0.686 + 0.314 * s, 0.168 - 0.168 * s),
+                        float3(0.272 - 0.272 * s, 0.534 - 0.534 * s, 0.131 + 0.869 * s));
+  }
+  default:
+    return rgb;
+  }
+}
+
+float3 group_screen(float3 b, float3 s) { return b + s - b * s; }
+
+float3 group_hard_light(float3 b, float3 s) {
+  return select(group_screen(b, 2. * s - 1.), b * 2. * s, s <= float3(0.5));
+}
+
+float group_lum(float3 c) { return dot(c, float3(0.3, 0.59, 0.11)); }
+
+float3 group_set_lum(float3 c, float l) {
+  float3 d = c + (l - group_lum(c));
+  float lum = group_lum(d);
+  float n = min(d.r, min(d.g, d.b));
+  float x = max(d.r, max(d.g, d.b));
+  float3 out = d;
+  if (n < 0.) {
+    out = lum + (out - lum) * lum / (lum - n);
+  }
+  if (x > 1.) {
+    out = lum + (out - lum) * (1. - lum) / (x - lum);
+  }
+  return out;
+}
+
+float group_sat(float3 c) { return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)); }
+
+float3 group_set_sat(float3 c, float s) {
+  float n = min(c.r, min(c.g, c.b));
+  float x = max(c.r, max(c.g, c.b));
+  if (x > n) {
+    return (c - n) * s / (x - n);
+  }
+  return float3(0.);
+}
+
+// The blend function B(backdrop, source) of a `BlendMode` (Compositing and Blending
+// 1), on straight colors.
+float3 group_blend(float3 b, float3 s, uint mode) {
+  switch (mode) {
+  case 1:
+    return b * s;
+  case 2:
+    return group_screen(b, s);
+  case 3:
+    return group_hard_light(s, b);
+  case 4:
+    return min(b, s);
+  case 5:
+    return max(b, s);
+  case 6: {
+    float3 dodge = min(float3(1.), b / max(1. - s, float3(1e-6)));
+    return select(select(dodge, float3(1.), s >= float3(1.)), float3(0.), b <= float3(0.));
+  }
+  case 7: {
+    float3 burn = 1. - min(float3(1.), (1. - b) / max(s, float3(1e-6)));
+    return select(select(burn, float3(0.), s <= float3(0.)), float3(1.), b >= float3(1.));
+  }
+  case 8:
+    return group_hard_light(b, s);
+  case 9: {
+    float3 d = select(sqrt(b), ((16. * b - 12.) * b + 4.) * b, b <= float3(0.25));
+    return select(b + (2. * s - 1.) * (d - b), b - (1. - 2. * s) * b * (1. - b), s <= float3(0.5));
+  }
+  case 10:
+    return abs(b - s);
+  case 11:
+    return b + s - 2. * b * s;
+  case 12:
+    return group_set_lum(group_set_sat(s, group_sat(b)), group_lum(b));
+  case 13:
+    return group_set_lum(group_set_sat(b, group_sat(s)), group_lum(b));
+  case 14:
+    return group_set_lum(s, group_lum(b));
+  case 15:
+    return group_set_lum(b, group_lum(s));
+  default:
+    return s;
+  }
+}
+
+// Normal and most modes are drawn over the target (premultiplied source over),
+// plus-lighter adds, and plus-darker replaces the target with the whole result.
+fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
+                                         constant GroupCompositeParams &params [[buffer(1)]],
+                                         texture2d<float> source [[texture(0)]],
+                                         texture2d<float> backdrop [[texture(1)]]) {
+  constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float2 position = input.position.xy;
+  float4 color =
+      source.sample(linear_sampler, (position - params.source_region.xy) / params.source_region.zw);
+  if (params.filter_count > 0) {
+    float3 rgb = color.rgb / max(color.a, 1e-6);
+    for (uint i = 0; i < params.filter_count; i++) {
+      rgb = group_color_filter(rgb, params.filter_kinds[i / 4][i % 4],
+                               params.filter_amounts[i / 4][i % 4]);
+    }
+    color = float4(rgb * color.a, color.a);
+  }
+  color *= params.opacity;
+  uint mode = params.blend_mode;
+  if (mode == 0 || mode == 16) {
+    return color;
+  }
+  float4 behind = backdrop.sample(linear_sampler, (position - params.backdrop_region.xy) /
+                                                      params.backdrop_region.zw);
+  if (mode == 17) {
+    float alpha = min(1., color.a + behind.a);
+    float3 rgb = max(float3(0.), alpha - (behind.a - behind.rgb) - (color.a - color.rgb));
+    return float4(rgb, alpha);
+  }
+  float3 s = color.rgb / max(color.a, 1e-6);
+  float3 b = behind.rgb / max(behind.a, 1e-6);
+  float3 mixed = (1. - behind.a) * s + behind.a * saturate(group_blend(b, s, mode));
+  return float4(mixed * color.a, color.a);
 }
