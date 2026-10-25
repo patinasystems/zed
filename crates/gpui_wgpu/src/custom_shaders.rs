@@ -285,6 +285,8 @@ impl CustomShaders {
             ],
         });
         let mut pass = crate::wgpu_renderer::begin_load_pass(encoder, target, "custom_shader");
+        // The target may be larger than its viewport (a group's image).
+        pass.set_viewport(0., 0., viewport_size[0], viewport_size[1], 0., 1.);
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..4, 0..1);

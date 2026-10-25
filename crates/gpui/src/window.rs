@@ -6,24 +6,25 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, RetainedShapes,
-    RetainedShapesDraw, RetainedShapesPaint, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
-    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BlendMode,
+    BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, GroupEffects, Hsla, InputHandler, InputPreference, IsZero,
+    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
+    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, RetainedShapes, RetainedShapesDraw, RetainedShapesPaint,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4410,6 +4411,63 @@ impl Window {
         result
     }
 
+    /// Paints what `f` paints as one group, as CSS composites a stacking context:
+    /// into an offscreen image, which is filtered by `group.filter`, faded by
+    /// `group.opacity` and the element opacity, and blended with `group.blend_mode`
+    /// onto what is behind it, within the current content mask.
+    ///
+    /// - Inside, the element opacity starts again at 1: the group fades as a whole, so
+    ///   overlapping children do not show through each other.
+    /// - Backdrop filters inside a group with opacity below 1, a filter or a blend mode
+    ///   read only what the group drew before them: it is their Backdrop Root (Filter
+    ///   Effects 2). `group.backdrop` is the element's own backdrop filter, which reads
+    ///   what is behind the group and starts its image.
+    /// - A group with opacity 1 and no filter or blend mode isolates the blending
+    ///   groups inside it (CSS `isolation: isolate`) and is otherwise free. It is not a
+    ///   Backdrop Root, unless it holds a blending group (then it is drawn offscreen).
+    /// - Groups that need no image are painted directly: one that is empty or fully
+    ///   transparent paints nothing, and one without a filter or blend mode whose
+    ///   content does not overlap itself fades each primitive (see
+    ///   [`Scene::push_group`]).
+    /// - The image is in window pixels: the blur is not scaled by an element
+    ///   transformation around the group.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_compositing_group<R>(
+        &mut self,
+        group: &CompositingGroup,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let backdrop = group.backdrop.as_ref().map(|backdrop| {
+            // Faded with the rest of the group's image.
+            self.backdrop_filter(
+                backdrop.bounds,
+                backdrop.corner_radii,
+                backdrop.backdrop,
+                1.,
+            )
+        });
+        let effects = GroupEffects {
+            backdrop,
+            opacity: (group.opacity * self.element_opacity).clamp(0., 1.),
+            blur_radius: group
+                .filter
+                .blur_radius
+                .max(Pixels::ZERO)
+                .scale(self.scale_factor()),
+            color_filters: group.filter.color_filters.iter().copied().collect(),
+            blend_mode: group.blend_mode,
+            content_mask: self.snapped_content_mask(),
+        };
+        self.next_frame.scene.push_group(effects);
+        let previous_opacity = std::mem::replace(&mut self.element_opacity, 1.);
+        let result = f(self);
+        self.element_opacity = previous_opacity;
+        self.next_frame.scene.pop_group();
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4959,14 +5017,25 @@ impl Window {
         backdrop: Backdrop,
     ) {
         self.invalidator.debug_assert_paint();
+        let filter = self.backdrop_filter(bounds, corner_radii, backdrop, self.element_opacity());
+        self.next_frame.scene.insert_primitive(filter);
+    }
+
+    fn backdrop_filter(
+        &self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        backdrop: Backdrop,
+        opacity: f32,
+    ) -> BackdropFilter {
         let scale_factor = self.scale_factor();
         let bounds = match self.element_transformation_stack.last() {
             Some(transformation) => transform_pixel_bounds(transformation, bounds),
             None => bounds,
         };
-        self.next_frame.scene.insert_primitive(BackdropFilter {
+        BackdropFilter {
             order: 0,
-            opacity: self.element_opacity(),
+            opacity,
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii
@@ -4977,7 +5046,7 @@ impl Window {
             brightness: backdrop.brightness,
             contrast: backdrop.contrast,
             shader: crate::ShaderDraw::NONE,
-        });
+        }
     }
 
     /// Paints `shader` over `bounds`, clipped to `corner_radii` and the content
@@ -9042,6 +9111,46 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_compositing_groups_take_the_element_opacity(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| crate::Empty);
+        window
+            .update(cx, |_, window, _| {
+                window.invalidator.set_phase(super::DrawPhase::Paint);
+                let square = |x: f32| Bounds::new(point(px(x), px(0.)), size(px(10.), px(10.)));
+                let group = super::CompositingGroup {
+                    opacity: 0.5,
+                    filter: super::Filter {
+                        blur_radius: px(2.),
+                        color_filters: vec![crate::ColorFilter::Grayscale(1.)],
+                    },
+                    blend_mode: crate::BlendMode::Multiply,
+                    backdrop: None,
+                };
+                window.with_element_opacity(Some(0.5), |window| {
+                    window.with_compositing_group(&group, |window| {
+                        // The group fades its image: what it paints starts opaque.
+                        assert_eq!(window.element_opacity(), 1.);
+                        window.paint_quad(crate::fill(square(0.), hsla(0., 1., 0.5, 1.)));
+                        window.paint_quad(crate::fill(square(5.), hsla(0.5, 1., 0.5, 1.)));
+                    });
+                    assert_eq!(window.element_opacity(), 0.5);
+                });
+                let scale = window.scale_factor();
+                let scene = &mut window.next_frame.scene;
+                scene.finish();
+                assert!(scene.quads.is_empty());
+                let composited = &scene.groups[0];
+                assert_eq!(composited.effects.opacity, 0.25);
+                assert_eq!(composited.effects.blend_mode, crate::BlendMode::Multiply);
+                assert_eq!(composited.effects.blur_radius, ScaledPixels(2. * scale));
+                assert_eq!(composited.scene.quads.len(), 2);
+                assert_eq!(composited.scene.quads[0].background.solid.a, 1.);
+                window.invalidator.set_phase(super::DrawPhase::None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn test_element_transformations_compose_and_map_masks(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| crate::Empty);
         window
@@ -11181,6 +11290,64 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// How [`Window::with_compositing_group`] composites what it paints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositingGroup {
+    /// Multiplies the group's image (CSS `opacity`); 0 hides it.
+    pub opacity: f32,
+    /// Filters the image (CSS `filter`).
+    pub filter: Filter,
+    /// How the image blends onto what is behind it (CSS `mix-blend-mode`).
+    pub blend_mode: BlendMode,
+    /// The element's own backdrop filter (CSS `backdrop-filter`): what is behind the
+    /// group, filtered, starts its image, so the group's filter, opacity and blend
+    /// mode apply to it with the rest (Filter Effects 2).
+    pub backdrop: Option<GroupBackdrop>,
+}
+
+impl Default for CompositingGroup {
+    /// An isolated group: opaque, without a filter or blend mode.
+    fn default() -> Self {
+        Self {
+            opacity: 1.,
+            filter: Filter::default(),
+            blend_mode: BlendMode::Normal,
+            backdrop: None,
+        }
+    }
+}
+
+/// A backdrop filter that starts a group's image ([`CompositingGroup::backdrop`]),
+/// as [`Window::paint_backdrop_filter`] takes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupBackdrop {
+    /// The element's bounds.
+    pub bounds: Bounds<Pixels>,
+    /// Its corner radii.
+    pub corner_radii: Corners<Pixels>,
+    /// The filter.
+    pub backdrop: Backdrop,
+}
+
+/// A CSS `filter` on a group's image: a gaussian blur, then color filters in order.
+#[derive(
+    Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct Filter {
+    /// The blur's standard deviation (CSS `blur()`); zero for none.
+    pub blur_radius: Pixels,
+    /// Applied in order after the blur; only the first [`crate::MAX_COLOR_FILTERS`]
+    /// apply.
+    pub color_filters: Vec<ColorFilter>,
+}
+
+impl Filter {
+    /// Whether it changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.blur_radius <= Pixels::ZERO && self.color_filters.is_empty()
     }
 }
 

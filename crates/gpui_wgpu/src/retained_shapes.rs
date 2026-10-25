@@ -50,24 +50,21 @@ fn as_bytes<T>(values: &[T]) -> &[u8] {
 impl WgpuRendererCore {
     /// Upload what changed in the buffers this scene draws, and write every
     /// draw's uniforms. Returns the uniform slot stride.
-    pub(super) fn prepare_retained_shapes(
-        &mut self,
-        scene: &Scene,
-        viewport: [f32; 2],
-    ) -> Result<u64> {
+    pub(super) fn prepare_retained_shapes(&mut self, scenes: &[(&Scene, [f32; 2])]) -> Result<u64> {
         let uses_texture = self.uses_webgl_instance_data;
         let max_storage = self.max_instance_data_size;
         let resources = &mut self.resources;
         let state = &mut resources.retained;
         state.frame += 1;
         let frame = state.frame;
-        if scene.retained_shapes.is_empty() {
+        let draws = || scenes.iter().flat_map(|(scene, _)| &scene.retained_shapes);
+        if draws().next().is_none() {
             return Ok(0);
         }
         let device = &resources.device;
         let queue = &resources.queue;
         let max_texture_dimension = device.limits().max_texture_dimension_2d;
-        for draw in &scene.retained_shapes {
+        for draw in draws() {
             let id = draw.shapes.id();
             if state
                 .entries
@@ -149,7 +146,7 @@ impl WgpuRendererCore {
         // Uniforms: one slot per draw, at dynamic offsets.
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let stride = UNIFORM_SIZE.next_multiple_of(alignment);
-        let count = scene.retained_shapes.len() as u64;
+        let count = draws().count() as u64;
         if state
             .uniforms
             .as_ref()
@@ -181,7 +178,14 @@ impl WgpuRendererCore {
             });
         }
         let mut bytes = vec![0u8; (count * stride) as usize];
-        for (i, draw) in scene.retained_shapes.iter().enumerate() {
+        // Each draw's uniforms take its scene's target size.
+        let with_viewports = scenes.iter().flat_map(|(scene, viewport)| {
+            scene
+                .retained_shapes
+                .iter()
+                .map(move |draw| (draw, *viewport))
+        });
+        for (i, (draw, viewport)) in with_viewports.enumerate() {
             let uniforms = draw.uniforms(viewport);
             let at = i * stride as usize;
             bytes[at..at + UNIFORM_SIZE as usize].copy_from_slice(as_bytes(&[uniforms]));
@@ -192,7 +196,7 @@ impl WgpuRendererCore {
         Ok(stride)
     }
 
-    /// Draw `draws`, which start at index `first` of the scene's retained shapes.
+    /// Draw `draws`, which start at uniform slot `first` of the frame's retained shapes.
     pub(super) fn draw_retained_shapes(
         &self,
         draws: &[RetainedShapesDraw],

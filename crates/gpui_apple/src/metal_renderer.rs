@@ -132,6 +132,14 @@ pub struct MetalRenderer {
     backdrop_copy_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
     backdrop_composite_pipeline_state: metal::RenderPipelineState,
+    /// Composite a group's image over the target, adding to it (plus-lighter) and
+    /// replacing it (plus-darker).
+    group_composite_pipeline_states: GroupCompositePipelines,
+    /// Draws a group's backdrop into its (transparent) image.
+    backdrop_group_pipeline_state: metal::RenderPipelineState,
+    /// Group images and their blur and backdrop copies, reused across frames and
+    /// freed when a frame does not use them.
+    texture_pool: TexturePool,
     /// Pipelines of custom shaders by id; `None` for one that failed to compile
     /// (logged once).
     custom_shaders: HashMap<gpui::ShaderId, Option<metal::RenderPipelineState>>,
@@ -391,6 +399,10 @@ impl MetalRenderer {
         );
         let backdrop_composite_pipeline_state =
             build_backdrop_composite_pipeline_state(&device, &library, MTLPixelFormat::BGRA8Unorm);
+        let group_composite_pipeline_states =
+            GroupCompositePipelines::new(&device, &library, MTLPixelFormat::BGRA8Unorm);
+        let backdrop_group_pipeline_state =
+            build_backdrop_group_pipeline_state(&device, &library, MTLPixelFormat::BGRA8Unorm);
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &library,
@@ -500,6 +512,9 @@ impl MetalRenderer {
             backdrop_copy_pipeline_state,
             backdrop_blur_pipeline_state,
             backdrop_composite_pipeline_state,
+            group_composite_pipeline_states,
+            backdrop_group_pipeline_state,
+            texture_pool: TexturePool::default(),
             custom_shaders: HashMap::new(),
             custom_shader_sampler,
             blank_texture,
@@ -842,61 +857,82 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         self.sync_retained_shapes(scene, writer, command_buffer)?;
 
-        let mut command_encoder = new_command_encoder_for_texture(
-            command_buffer,
+        let result = self.draw_scene(
+            scene,
+            scene,
+            instance_bindings,
+            writer,
             texture,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+            command_buffer,
         );
+        // Keep the images and copies this frame used; free the rest.
+        self.texture_pool.end_frame();
+        result?;
+        Ok(command_buffer.to_owned())
+    }
+
+    /// Draws `scene` (the window's, or a group's at `depth`) into `texture`, cleared
+    /// to `clear` first (or drawn over). `root` is the window's scene, which holds the
+    /// shader sources and uniforms. Passes reopen only when a batch draws into them.
+    fn draw_scene(
+        &mut self,
+        root: &Scene,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        writer: &mut InstanceBufferWriter,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear: Option<metal::MTLClearColor>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        let mut encoder = clear.map(|clear| {
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, Some(clear))
+        });
+        let open =
+            |encoder: &mut Option<_>| open_encoder(encoder, command_buffer, texture, viewport_size);
 
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                    self.draw_shadows(range, instance_bindings, viewport_size, open(&mut encoder))
                 }
                 PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
+                    self.draw_quads(range, instance_bindings, viewport_size, open(&mut encoder))
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    command_encoder.end_encoding();
-
+                    close_encoder(&mut encoder);
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
                         writer,
                         viewport_size,
                         command_buffer,
                     )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
-
                     if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
-                            writer,
-                            viewport_size,
-                            command_encoder,
-                        ) {
-                            command_encoder.end_encoding();
+                        let encoder = open(&mut encoder);
+                        if let Err(error) =
+                            self.draw_paths_from_intermediate(paths, writer, viewport_size, encoder)
+                        {
+                            encoder.end_encoding();
                             return Err(error);
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                    range,
+                    instance_bindings,
+                    viewport_size,
+                    open(&mut encoder),
+                ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
                         instance_bindings,
                         viewport_size,
-                        command_encoder,
+                        open(&mut encoder),
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
                     .draw_polychrome_sprites(
@@ -904,26 +940,26 @@ impl MetalRenderer {
                         range,
                         instance_bindings,
                         viewport_size,
-                        command_encoder,
+                        open(&mut encoder),
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
                     instance_bindings,
                     viewport_size,
-                    command_encoder,
+                    open(&mut encoder),
                 ),
                 PrimitiveBatch::RetainedShapes(range) => self.draw_retained_shapes(
                     &scene.retained_shapes[range],
                     viewport_size,
-                    command_encoder,
+                    open(&mut encoder),
                 ),
                 PrimitiveBatch::BackdropFilters(range) => {
-                    command_encoder.end_encoding();
+                    close_encoder(&mut encoder);
                     for filter in &scene.backdrop_filters[range] {
-                        if let Some(shader) = filter.shader.shader(scene) {
+                        if let Some(shader) = filter.shader.shader(root) {
                             self.draw_custom_shader(
-                                scene,
+                                root,
                                 filter,
                                 shader,
                                 texture,
@@ -935,31 +971,172 @@ impl MetalRenderer {
                         // Read what is drawn so far, filter it offscreen, draw it back.
                         let filtered =
                             self.filter_backdrop(filter, texture, viewport_size, command_buffer);
-                        let encoder = new_command_encoder_for_texture(
-                            command_buffer,
+                        if let Some((filtered, region)) = filtered {
+                            let encoder = new_command_encoder_for_texture(
+                                command_buffer,
+                                texture,
+                                viewport_size,
+                                None,
+                            );
+                            self.draw_backdrop(filter, &filtered, region, viewport_size, encoder);
+                            encoder.end_encoding();
+                            self.texture_pool.release(&filtered);
+                        }
+                    }
+                }
+                PrimitiveBatch::Groups(range) => {
+                    close_encoder(&mut encoder);
+                    for group in &scene.groups[range] {
+                        self.draw_group(
+                            root,
+                            group,
+                            writer,
                             texture,
                             viewport_size,
-                            None,
-                        );
-                        if let Some((filtered, region)) = filtered {
-                            self.draw_backdrop(filter, &filtered, region, viewport_size, encoder);
-                        }
-                        encoder.end_encoding();
+                            command_buffer,
+                        )?;
                     }
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
-        command_encoder.end_encoding();
+        close_encoder(&mut encoder);
+        Ok(())
+    }
 
-        Ok(command_buffer.to_owned())
+    /// Draws a group's scene into an image the size of its bounds, starting with its
+    /// filtered backdrop, then blurs it, reads what is behind it when its blend mode
+    /// needs that, and composites it onto `target` (`viewport_size` device pixels).
+    fn draw_group(
+        &mut self,
+        root: &Scene,
+        group: &gpui::CompositedGroup,
+        writer: &mut InstanceBufferWriter,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        let size = group.image_size(viewport_size);
+        if group.target_region(viewport_size).is_none() || size.width.0 <= 0 || size.height.0 <= 0 {
+            return Ok(());
+        }
+        if size.width.0 > MAX_GROUP_IMAGE || size.height.0 > MAX_GROUP_IMAGE {
+            log::error!("compositing group image of {size:?} is too large; not drawn");
+            return Ok(());
+        }
+        let origin = [group.bounds.origin.x.0, group.bounds.origin.y.0];
+        let image = self.texture_pool.acquire(
+            &self.device,
+            bucket(size.width.0 as u64),
+            bucket(size.height.0 as u64),
+        );
+        let transparent = metal::MTLClearColor::new(0., 0., 0., 0.);
+        // The image starts with what is behind the group, filtered (its backdrop).
+        let mut clear = Some(transparent);
+        if let Some(filter) = &group.effects.backdrop
+            && let Some((filtered, mut region)) =
+                self.filter_backdrop(filter, target, viewport_size, command_buffer)
+        {
+            let filter = filter.translated(-group.bounds.origin);
+            region[0] -= origin[0];
+            region[1] -= origin[1];
+            let encoder =
+                new_command_encoder_for_texture(command_buffer, &image, size, clear.take());
+            self.draw_backdrop_with(
+                &self.backdrop_group_pipeline_state,
+                &filter,
+                &filtered,
+                region,
+                size,
+                encoder,
+            );
+            encoder.end_encoding();
+            self.texture_pool.release(&filtered);
+        }
+        let instance_bindings = write_instances(&group.scene, writer)?;
+        self.draw_scene(
+            root,
+            &group.scene,
+            &instance_bindings,
+            writer,
+            &image,
+            size,
+            clear,
+            command_buffer,
+        )?;
+        let viewport = [viewport_size.width.0 as f32, viewport_size.height.0 as f32];
+        let blurred = if group.effects.blur_radius.0 >= 0.5 {
+            let whole = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), group.bounds.size);
+            match self.copy_region(&image, whole, group.effects.blur_radius.0, command_buffer) {
+                Some((texture, region)) => Some((texture, region)),
+                None => {
+                    self.texture_pool.release(&image);
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        let (source, source_region) = match &blurred {
+            Some((texture, region)) => (
+                texture.clone(),
+                [
+                    region[0] + origin[0],
+                    region[1] + origin[1],
+                    region[2],
+                    region[3],
+                ],
+            ),
+            None => (
+                image.clone(),
+                [
+                    origin[0],
+                    origin[1],
+                    image.width() as f32,
+                    image.height() as f32,
+                ],
+            ),
+        };
+        let backdrop = match group.target_region(viewport_size) {
+            Some(region) if group.effects.blend_mode.reads_backdrop() => {
+                self.copy_region(target, region, 0., command_buffer)
+            }
+            _ => None,
+        };
+        let (backdrop_texture, backdrop_region) = match &backdrop {
+            Some((texture, region)) => (texture.as_ref(), *region),
+            None => (source.as_ref(), source_region),
+        };
+        let uniforms = group.composite_uniforms(source_region, backdrop_region, viewport);
+        let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
+        encoder.set_render_pipeline_state(
+            self.group_composite_pipeline_states
+                .for_blend_mode(group.effects.blend_mode),
+        );
+        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        let uniforms_size = mem::size_of_val(&uniforms) as u64;
+        let pointer = &uniforms as *const gpui::GroupCompositeUniforms as *const _;
+        encoder.set_vertex_bytes(1, uniforms_size, pointer);
+        encoder.set_fragment_bytes(1, uniforms_size, pointer);
+        encoder.set_fragment_texture(0, Some(&source));
+        encoder.set_fragment_texture(1, Some(backdrop_texture));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
+        // Later passes reuse these; Metal orders them after this composite.
+        self.texture_pool.release(&image);
+        if let Some((texture, _)) = &blurred {
+            self.texture_pool.release(texture);
+        }
+        if let Some((texture, _)) = &backdrop {
+            self.texture_pool.release(texture);
+        }
+        Ok(())
+    }
+
+    /// Bytes of the group images and copies kept now (for tests and stats).
+    pub fn group_texture_bytes(&self) -> u64 {
+        self.texture_pool.bytes()
     }
 
     /// Bring each retained buffer drawn this frame up to date: changed ranges are
@@ -973,12 +1150,13 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> Result<()> {
         self.frame_index += 1;
-        if scene.retained_shapes.is_empty() {
+        let scenes = scene.scenes();
+        if scenes.iter().all(|scene| scene.retained_shapes.is_empty()) {
             return Ok(());
         }
         let mut blit: Option<&metal::BlitCommandEncoderRef> = None;
         let mut uploaded = 0usize;
-        for draw in &scene.retained_shapes {
+        for draw in scenes.iter().flat_map(|scene| &scene.retained_shapes) {
             let id = draw.shapes.id();
             let frame = self.frame_index;
             let entry = self
@@ -1146,6 +1324,15 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        // The target may be smaller than the intermediate texture (a group's image).
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: viewport_size.width.0 as f64,
+            height: viewport_size.height.0 as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -1277,6 +1464,20 @@ impl MetalRenderer {
             .sample_bounds()
             .intersect(&filter.content_mask.bounds.dilate(filter.blur_radius * 3.))
             .intersect(&viewport);
+        self.copy_region(target, region, filter.blur_radius.0, command_buffer)
+    }
+
+    /// Copies `region` (within the target) of `target` and blurs it with standard
+    /// deviation `sigma` (at a lower resolution for large ones); returns the texture
+    /// and where it sits in the target (origin and size, whole device pixels). `None`
+    /// if the region is empty.
+    fn copy_region(
+        &self,
+        target: &metal::TextureRef,
+        region: Bounds<ScaledPixels>,
+        sigma: f32,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<(metal::Texture, [f32; 4])> {
         let (x, y) = (region.origin.x.0.floor(), region.origin.y.0.floor());
         let width = (region.origin.x.0 + region.size.width.0).ceil() - x;
         let height = (region.origin.y.0 + region.size.height.0).ceil() - y;
@@ -1284,7 +1485,7 @@ impl MetalRenderer {
             return None;
         }
         let (width, height) = (width as u64, height as u64);
-        let copy = self.backdrop_texture(width, height);
+        let copy = self.texture_pool.acquire(&self.device, width, height);
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target,
@@ -1307,7 +1508,6 @@ impl MetalRenderer {
         );
         blit.end_encoding();
 
-        let sigma = filter.blur_radius.0;
         let region = [x, y, width as f32, height as f32];
         if sigma < 0.5 {
             return Some((copy, region));
@@ -1319,8 +1519,12 @@ impl MetalRenderer {
             width: DevicePixels(((width as f32) / scale).ceil().max(1.) as i32),
             height: DevicePixels(((height as f32) / scale).ceil().max(1.) as i32),
         };
-        let a = self.backdrop_texture(small.width.0 as u64, small.height.0 as u64);
-        let b = self.backdrop_texture(small.width.0 as u64, small.height.0 as u64);
+        let a =
+            self.texture_pool
+                .acquire(&self.device, small.width.0 as u64, small.height.0 as u64);
+        let b =
+            self.texture_pool
+                .acquire(&self.device, small.width.0 as u64, small.height.0 as u64);
         let pass = |source: &metal::TextureRef,
                     destination: &metal::TextureRef,
                     blur: Option<BackdropBlurParams>| {
@@ -1366,6 +1570,8 @@ impl MetalRenderer {
                 radius,
             }),
         );
+        self.texture_pool.release(&copy);
+        self.texture_pool.release(&b);
         Some((a, region))
     }
 
@@ -1373,7 +1579,7 @@ impl MetalRenderer {
     /// compiled on first use. A shader that fails to compile draws nothing.
     fn draw_custom_shader(
         &mut self,
-        scene: &Scene,
+        root: &Scene,
         filter: &BackdropFilter,
         shader: &gpui::Shader,
         target: &metal::TextureRef,
@@ -1394,12 +1600,12 @@ impl MetalRenderer {
             })
             .clone();
         let Some(pipeline) = pipeline else { return };
-        let backdrop = if filter.shader.reads_backdrop() {
+        let filtered = if filter.shader.reads_backdrop() {
             self.filter_backdrop(filter, target, viewport_size, command_buffer)
         } else {
             None
         };
-        let (backdrop, region) = match &backdrop {
+        let (backdrop, region) = match &filtered {
             Some((texture, region)) => (texture.as_ref(), *region),
             None => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
         };
@@ -1414,21 +1620,13 @@ impl MetalRenderer {
             &pipeline,
             &self.custom_shader_sampler,
             &params,
-            filter.shader.uniforms(scene),
+            filter.shader.uniforms(root),
             backdrop,
         );
         encoder.end_encoding();
-    }
-
-    fn backdrop_texture(&self, width: u64, height: u64) -> metal::Texture {
-        let descriptor = metal::TextureDescriptor::new();
-        descriptor.set_width(width);
-        descriptor.set_height(height);
-        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.device.new_texture(&descriptor)
+        if let Some((texture, _)) = &filtered {
+            self.texture_pool.release(texture);
+        }
     }
 
     fn draw_backdrop(
@@ -1439,7 +1637,26 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         encoder: &metal::RenderCommandEncoderRef,
     ) {
-        encoder.set_render_pipeline_state(&self.backdrop_composite_pipeline_state);
+        self.draw_backdrop_with(
+            &self.backdrop_composite_pipeline_state,
+            filter,
+            filtered,
+            region,
+            viewport_size,
+            encoder,
+        );
+    }
+
+    fn draw_backdrop_with(
+        &self,
+        pipeline: &metal::RenderPipelineStateRef,
+        filter: &BackdropFilter,
+        filtered: &metal::TextureRef,
+        region: [f32; 4],
+        viewport_size: Size<DevicePixels>,
+        encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        encoder.set_render_pipeline_state(pipeline);
         encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
         let filter_size = mem::size_of::<BackdropFilter>() as u64;
         let filter_ptr = filter as *const BackdropFilter as *const _;
@@ -1780,6 +1997,25 @@ impl MetalRenderer {
     }
 }
 
+/// The pass `encoder` holds, or a new one that loads `texture`.
+fn open_encoder<'a>(
+    encoder: &mut Option<&'a metal::RenderCommandEncoderRef>,
+    command_buffer: &'a metal::CommandBufferRef,
+    texture: &'a metal::TextureRef,
+    viewport_size: Size<DevicePixels>,
+) -> &'a metal::RenderCommandEncoderRef {
+    encoder.get_or_insert_with(|| {
+        new_command_encoder_for_texture(command_buffer, texture, viewport_size, None)
+    })
+}
+
+/// Ends the pass `encoder` holds, if any.
+fn close_encoder(encoder: &mut Option<&metal::RenderCommandEncoderRef>) {
+    if let Some(encoder) = encoder.take() {
+        encoder.end_encoding();
+    }
+}
+
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
@@ -1929,6 +2165,181 @@ fn build_backdrop_composite_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::Zero);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// Group images are allocated in steps of this many device pixels per side, so a
+/// group that changes size a little reuses its image.
+const GROUP_IMAGE_STEP: u64 = 64;
+
+/// The largest group image, per side: Metal's 2D texture limit on every GPU family
+/// GPUI supports.
+const MAX_GROUP_IMAGE: i32 = 16384 - GROUP_IMAGE_STEP as i32;
+
+fn bucket(size: u64) -> u64 {
+    size.max(1).next_multiple_of(GROUP_IMAGE_STEP)
+}
+
+/// Offscreen textures (group images, blur and backdrop copies) by size, reused
+/// within and across frames. A texture released during a frame is reused later in
+/// it: Metal orders the later pass after the earlier ones. Textures a frame did not
+/// use are freed at its end.
+#[derive(Default)]
+struct TexturePool {
+    entries: std::cell::RefCell<Vec<PooledTexture>>,
+}
+
+struct PooledTexture {
+    texture: metal::Texture,
+    in_use: bool,
+    used: bool,
+}
+
+impl TexturePool {
+    fn acquire(&self, device: &metal::DeviceRef, width: u64, height: u64) -> metal::Texture {
+        let mut entries = self.entries.borrow_mut();
+        if let Some(entry) = entries.iter_mut().find(|entry| {
+            !entry.in_use && entry.texture.width() == width && entry.texture.height() == height
+        }) {
+            entry.in_use = true;
+            entry.used = true;
+            return entry.texture.clone();
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        entries.push(PooledTexture {
+            texture: texture.clone(),
+            in_use: true,
+            used: true,
+        });
+        texture
+    }
+
+    fn release(&self, texture: &metal::TextureRef) {
+        if let Some(entry) = self
+            .entries
+            .borrow_mut()
+            .iter_mut()
+            .find(|entry| std::ptr::eq(entry.texture.as_ref(), texture))
+        {
+            entry.in_use = false;
+        }
+    }
+
+    fn end_frame(&self) {
+        let mut entries = self.entries.borrow_mut();
+        entries.retain(|entry| entry.used);
+        for entry in entries.iter_mut() {
+            entry.used = false;
+            entry.in_use = false;
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.entries
+            .borrow()
+            .iter()
+            .map(|entry| entry.texture.width() * entry.texture.height() * 4)
+            .sum()
+    }
+}
+
+/// The group composite pipelines, one per kind of hardware blending.
+struct GroupCompositePipelines {
+    /// Premultiplied source over: normal and the blend modes, which read the backdrop.
+    over: metal::RenderPipelineState,
+    /// Adds (plus-lighter).
+    add: metal::RenderPipelineState,
+    /// Replaces the target with the shader's result (plus-darker).
+    replace: metal::RenderPipelineState,
+}
+
+impl GroupCompositePipelines {
+    fn new(
+        device: &metal::DeviceRef,
+        library: &metal::LibraryRef,
+        pixel_format: metal::MTLPixelFormat,
+    ) -> Self {
+        let build = |label: &str, destination: Option<metal::MTLBlendFactor>| {
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_label(label);
+            let vertex_fn = library
+                .get_function("group_composite_vertex", None)
+                .expect("error locating vertex function");
+            let fragment_fn = library
+                .get_function("group_composite_fragment", None)
+                .expect("error locating fragment function");
+            descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+            descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+            let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+            color_attachment.set_pixel_format(pixel_format);
+            if let Some(destination) = destination {
+                color_attachment.set_blending_enabled(true);
+                color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+                color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+                color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+                color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+                color_attachment.set_destination_rgb_blend_factor(destination);
+                color_attachment.set_destination_alpha_blend_factor(destination);
+            } else {
+                color_attachment.set_blending_enabled(false);
+            }
+            device
+                .new_render_pipeline_state(&descriptor)
+                .expect("could not create render pipeline state")
+        };
+        Self {
+            over: build(
+                "group_composite_over",
+                Some(metal::MTLBlendFactor::OneMinusSourceAlpha),
+            ),
+            add: build("group_composite_add", Some(metal::MTLBlendFactor::One)),
+            replace: build("group_composite_replace", None),
+        }
+    }
+
+    fn for_blend_mode(&self, blend_mode: gpui::BlendMode) -> &metal::RenderPipelineStateRef {
+        match blend_mode {
+            gpui::BlendMode::PlusLighter => &self.add,
+            gpui::BlendMode::PlusDarker => &self.replace,
+            _ => &self.over,
+        }
+    }
+}
+
+/// A group's filtered backdrop, premultiplied, over its transparent image.
+fn build_backdrop_group_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label("backdrop_group");
+    let vertex_fn = library
+        .get_function("backdrop_composite_vertex", None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function("backdrop_group_fragment", None)
+        .expect("error locating fragment function");
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create render pipeline state")
@@ -2459,6 +2870,197 @@ mod tests {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+    }
+
+    /// Frame costs with and without compositing groups. Run with
+    /// `cargo test -p gpui_apple --release --lib group_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn group_frame_cost() {
+        use gpui::compositing_group_bench_scene as b;
+        let (width, height) = (2880, 1800);
+        let size = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let time = |f: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            f();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        // Scene building (CPU) without groups: 10,000 quads.
+        let build: Vec<f64> = (0..200)
+            .map(|_| time(&mut || drop(b::flat(10_000, width as f32, height as f32))))
+            .collect();
+        println!("build 10k quads, no groups: {:.3} ms", median(build));
+        let flat = b::flat(10_000, width as f32, height as f32);
+        let encode: Vec<f64> = (0..200)
+            .map(|_| {
+                time(&mut || {
+                    gpui::PlatformHeadlessRenderer::render_scene(&mut renderer, &flat, size)
+                        .expect("render");
+                })
+            })
+            .collect();
+        println!("encode 10k quads, no groups: {:.3} ms", median(encode));
+        for depth in [0, 1, 10] {
+            let scene = b::nested(depth, 2_000, width as f32, height as f32);
+            assert_eq!(scene.group_depth(), depth);
+            let frames: Vec<f64> = (0..40)
+                .map(|_| {
+                    time(&mut || {
+                        gpui::PlatformHeadlessRenderer::render_scene_to_image(
+                            &mut renderer,
+                            &scene,
+                            size,
+                        )
+                        .expect("render");
+                    })
+                })
+                .collect();
+            println!(
+                "{depth} nested groups, 2k quads, {width}x{height}: {:.3} ms per frame (rendered and read back), {} group image bytes",
+                median(frames),
+                renderer.renderer.group_texture_bytes()
+            );
+        }
+        let cases = [
+            (
+                "one 300x200 card at 2x",
+                b::cards(1, 600., 400., (width as f32, height as f32)),
+            ),
+            (
+                "ten nested 300x200 cards",
+                b::cards(10, 600., 400., (width as f32, height as f32)),
+            ),
+            (
+                "one full-screen group",
+                b::nested(1, 2_000, width as f32, height as f32),
+            ),
+        ];
+        for (label, scene) in cases {
+            let frames: Vec<f64> = (0..40)
+                .map(|_| {
+                    time(&mut || {
+                        gpui::PlatformHeadlessRenderer::render_scene_to_image(
+                            &mut renderer,
+                            &scene,
+                            size,
+                        )
+                        .expect("render");
+                    })
+                })
+                .collect();
+            println!(
+                "{label}: {:.3} ms per frame, {} group image bytes",
+                median(frames),
+                renderer.renderer.group_texture_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn compositing_groups_render_and_free_their_images() {
+        use gpui::compositing_group_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let size = size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1));
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("groups_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        // Images sized to the groups' bounds (in steps of 64 px) and the blur's copies,
+        // reused across the frame: well under one window-sized image per group.
+        let kept = renderer.renderer.group_texture_bytes();
+        assert!(kept > 0 && kept <= 6 * 64 * 64 * 4, "{kept} bytes");
+        // A frame without groups frees them.
+        let mut empty = Scene::default();
+        empty.finish();
+        gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &empty, size)
+            .expect("render");
+        assert_eq!(renderer.renderer.group_texture_bytes(), 0);
+    }
+
+    #[test]
+    fn texture_pool_reuses_released_textures_and_frees_unused_ones() {
+        let renderer = MetalHeadlessRenderer::new();
+        let device = &renderer.renderer.device;
+        let pool = TexturePool::default();
+        let one = 64 * 64 * 4;
+        let a = pool.acquire(device, 64, 64);
+        let b = pool.acquire(device, 64, 64);
+        assert!(
+            !std::ptr::eq(a.as_ref(), b.as_ref()),
+            "both in use: two textures"
+        );
+        pool.release(&a);
+        let c = pool.acquire(device, 64, 64);
+        assert!(std::ptr::eq(a.as_ref(), c.as_ref()), "released: reused");
+        let d = pool.acquire(device, 128, 64);
+        assert_eq!(pool.bytes(), 4 * one);
+        pool.end_frame();
+        assert_eq!(pool.bytes(), 4 * one, "all used this frame: kept");
+        let e = pool.acquire(device, 64, 64);
+        pool.release(&e);
+        pool.end_frame();
+        assert_eq!(pool.bytes(), one, "unused last frame: freed");
+        pool.end_frame();
+        assert_eq!(pool.bytes(), 0);
+        drop((b, d));
+    }
+
+    #[test]
+    fn group_content_draws_in_image_coordinates() {
+        use gpui::compositing_group_content_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("group_content_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    #[test]
+    fn blend_modes_match_the_reference() {
+        use gpui::blend_mode_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("blend_metal.png"))
+                .expect("dump");
+        }
+        let failures: Vec<String> = probes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let actual = image.get_pixel(p.x, p.y).0;
+                let ok = actual.iter().zip(p.rgba).all(|(a, e)| a.abs_diff(e) <= 3);
+                (!ok).then(|| format!("{}: {actual:?}, expected {:?}", t::describe(i), p.rgba))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
