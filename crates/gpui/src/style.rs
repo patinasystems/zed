@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    AbsoluteLength, App, Background, BackgroundTag, BlendMode, BorderStyle, Bounds,
+    CompositingGroup, ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength,
+    DevicePixels, Edges, EdgesRefinement, Filter, Font, FontFallbacks, FontFeatures, FontStyle,
+    FontWeight, GridLocation, Hsla, Length, Pixels, Point, PointRefinement, Rgba, SharedString,
+    Size, SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -174,6 +174,15 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+/// How an element is composited as a group ([`Style::compositing`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Compositing {
+    /// Filters the group's image (CSS `filter`).
+    pub filter: Filter,
+    /// How the image blends onto what is behind it (CSS `mix-blend-mode`).
+    pub blend_mode: BlendMode,
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -296,6 +305,14 @@ pub struct Style {
     /// from its final style, so it follows the div's state styles, opacity and
     /// visibility; other elements paint it under the element opacity they set.
     pub backdrop_filter: Option<crate::Backdrop>,
+
+    /// Paints the element and its children as one compositing group
+    /// ([`Window::with_compositing_group`]), as CSS composites a stacking context:
+    /// the element opacity (`opacity`) fades the group as a whole, and the filter and
+    /// blend mode apply to it. Its own `backdrop_filter` reads what is behind the
+    /// element and starts the group's image, under the group's effects (Filter
+    /// Effects 2). `None` fades each primitive with `opacity`.
+    pub compositing: Option<Compositing>,
 
     /// A shader that paints the element's border box (within its corner radii)
     /// over its background color, as CSS paints a background image. A div paints
@@ -730,9 +747,49 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
+        match &self.compositing {
+            Some(compositing) => {
+                // Opacity 1: the group takes the element opacity, which includes this
+                // style's. The backdrop filter reads what is behind the element and
+                // starts the group's image.
+                let group = CompositingGroup {
+                    opacity: 1.,
+                    filter: compositing.filter.clone(),
+                    blend_mode: compositing.blend_mode,
+                    backdrop: self.backdrop_filter.map(|backdrop| crate::GroupBackdrop {
+                        bounds,
+                        corner_radii,
+                        backdrop,
+                    }),
+                };
+                window.with_compositing_group(&group, |window| {
+                    self.paint_box(bounds, corner_radii, false, window, cx, continuation)
+                });
+            }
+            None => self.paint_box(bounds, corner_radii, true, window, cx, continuation),
+        }
+
+        #[cfg(debug_assertions)]
+        if self.debug_below {
+            cx.remove_global::<DebugBelow>();
+        }
+    }
+
+    /// Paints the shadows, the backdrop filter (when `backdrop`), the background, the
+    /// children (`continuation`) and the border.
+    fn paint_box(
+        &self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        backdrop: bool,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let rem_size = window.rem_size();
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
-        if let Some(backdrop) = self.backdrop_filter {
+        if backdrop && let Some(backdrop) = self.backdrop_filter {
             window.paint_backdrop_filter(bounds, corner_radii, backdrop);
         }
 
@@ -791,11 +848,6 @@ impl Style {
                 self.border_style,
             ));
         }
-
-        #[cfg(debug_assertions)]
-        if self.debug_below {
-            cx.remove_global::<DebugBelow>();
-        }
     }
 
     fn is_border_visible(&self) -> bool {
@@ -844,6 +896,7 @@ impl Default for Style {
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             backdrop_filter: None,
+            compositing: None,
             shader: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
