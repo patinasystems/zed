@@ -62,6 +62,9 @@ pub struct WebPlatformOptions {
     /// `height` 100%). The window follows the element's size and the device
     /// pixel ratio. `None` appends the canvas to the document body.
     pub container: Option<web_sys::Element>,
+    /// The family `.SystemUIFont` (GPUI's default text family) resolves to, for
+    /// example a UI font the application loads. `None`: IBM Plex Sans.
+    pub system_font_family: Option<String>,
 }
 
 /// Gesture feel for the browser, chosen so touch scrolling matches the host
@@ -199,6 +202,7 @@ impl WebPlatform {
             backend_preference,
             canvas_font_fallback,
             container,
+            system_font_family,
         } = options;
         let browser_window =
             web_sys::window().expect("must be running in a browser window context");
@@ -209,7 +213,10 @@ impl WebPlatform {
         ));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
-        let text_system = Arc::new(WebTextSystem::new("IBM Plex Sans", canvas_font_fallback));
+        let text_system = Arc::new(WebTextSystem::new(
+            system_font_family.as_deref().unwrap_or("IBM Plex Sans"),
+            canvas_font_fallback,
+        ));
         let text_system: Arc<dyn PlatformTextSystem> = text_system;
         let active_display: Rc<dyn PlatformDisplay> =
             Rc::new(WebDisplay::new(browser_window.clone()));
