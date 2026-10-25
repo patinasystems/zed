@@ -1,4 +1,5 @@
-//! GPUI's browser platform uses one document-owned canvas and supports one top-level window.
+//! GPUI's browser platform uses one canvas, in the document body or a container element
+//! ([`WebPlatformOptions::container`]), and supports one top-level window.
 //! Browser WebGPU is preferred by default, with an automatic WebGL2 fallback. Applications can
 //! force either backend with `WebBackendPreference`. Opening a second top-level window, or
 //! reopening one after it closes, returns `WebWindowError`.
@@ -49,6 +50,6 @@ pub use keyboard::WebKeyboardLayout;
 #[cfg(target_family = "wasm")]
 pub use logging::init_logging;
 #[cfg(target_family = "wasm")]
-pub use platform::{WebPlatform, WebWindowError};
+pub use platform::{WebPlatform, WebPlatformOptions, WebWindowError};
 #[cfg(target_family = "wasm")]
 pub use window::WebWindow;

@@ -40,6 +40,7 @@ pub struct WebPlatform {
     active_display: Rc<dyn PlatformDisplay>,
     callbacks: RefCell<WebPlatformCallbacks>,
     backend_preference: WebBackendPreference,
+    container: Option<web_sys::Element>,
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
     prepared_window: Rc<RefCell<Option<PreparedWebWindow>>>,
     window_lifecycle: Rc<Cell<WebWindowLifecycle>>,
@@ -47,6 +48,20 @@ pub struct WebPlatform {
     last_cursor_css: Rc<Cell<&'static str>>,
     gestures: Rc<WebGestures>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
+}
+
+/// How a [`WebPlatform`] starts and where its window lives in the page.
+#[derive(Clone, Debug, Default)]
+pub struct WebPlatformOptions {
+    /// Run background work on web workers (needs the `multithreaded` feature and a
+    /// cross-origin isolated page).
+    pub allow_multi_threading: bool,
+    pub backend_preference: WebBackendPreference,
+    pub canvas_font_fallback: CanvasFontFallback,
+    /// The element the window's canvas is appended to and fills (`width` and
+    /// `height` 100%). The window follows the element's size and the device
+    /// pixel ratio. `None` appends the canvas to the document body.
+    pub container: Option<web_sys::Element>,
 }
 
 /// Gesture feel for the browser, chosen so touch scrolling matches the host
@@ -169,6 +184,22 @@ impl WebPlatform {
         backend_preference: WebBackendPreference,
         canvas_font_fallback: CanvasFontFallback,
     ) -> Self {
+        Self::with_options(WebPlatformOptions {
+            allow_multi_threading,
+            backend_preference,
+            canvas_font_fallback,
+            ..WebPlatformOptions::default()
+        })
+    }
+
+    /// Creates the platform from [`WebPlatformOptions`].
+    pub fn with_options(options: WebPlatformOptions) -> Self {
+        let WebPlatformOptions {
+            allow_multi_threading,
+            backend_preference,
+            canvas_font_fallback,
+            container,
+        } = options;
         let browser_window =
             web_sys::window().expect("must be running in a browser window context");
         let platform_info = crate::events::platform_info(&browser_window);
@@ -205,6 +236,7 @@ impl WebPlatform {
             active_display,
             callbacks: RefCell::new(WebPlatformCallbacks::default()),
             backend_preference,
+            container,
             wgpu_context: Rc::new(RefCell::new(None)),
             prepared_window: Rc::new(RefCell::new(None)),
             window_lifecycle: Rc::new(Cell::new(WebWindowLifecycle::Available)),
@@ -231,6 +263,7 @@ impl WebPlatform {
 
 async fn initialize_graphics(
     browser_window: &web_sys::Window,
+    container: Option<&web_sys::Element>,
     preference: WebBackendPreference,
 ) -> anyhow::Result<(
     web_sys::HtmlCanvasElement,
@@ -239,7 +272,7 @@ async fn initialize_graphics(
 )> {
     match preference {
         WebBackendPreference::Auto => {
-            let webgpu_canvas = WebWindow::prepare_canvas(browser_window)?;
+            let webgpu_canvas = WebWindow::prepare_canvas(browser_window, container)?;
             let webgpu_result = if wgpu::util::is_browser_webgpu_supported().await {
                 WgpuContext::new_web(&webgpu_canvas, WebBackendPreference::WebGpu).await
             } else {
@@ -259,7 +292,7 @@ async fn initialize_graphics(
                     );
 
                     let webgl_canvas =
-                        WebWindow::prepare_canvas(browser_window).map_err(|error| {
+                        WebWindow::prepare_canvas(browser_window, container).map_err(|error| {
                             anyhow::anyhow!(
                                 "WebGPU initialization failed: {webgpu_error:#}. \
                              Failed to prepare a replacement canvas for WebGL2: {error:#}"
@@ -289,7 +322,7 @@ async fn initialize_graphics(
             } else {
                 "WebGL2"
             };
-            let canvas = WebWindow::prepare_canvas(browser_window)?;
+            let canvas = WebWindow::prepare_canvas(browser_window, container)?;
             match WgpuContext::new_web(&canvas, preference).await {
                 Ok(PreparedWebGraphics { context, surface }) => Ok((canvas, context, surface)),
                 Err(error) => {
@@ -333,8 +366,10 @@ impl Platform for WebPlatform {
         let window_lifecycle = self.window_lifecycle.clone();
         let browser_window = self.browser_window.clone();
         let backend_preference = self.backend_preference;
+        let container = self.container.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            match initialize_graphics(&browser_window, backend_preference).await {
+            match initialize_graphics(&browser_window, container.as_ref(), backend_preference).await
+            {
                 Ok((canvas, context, surface)) => {
                     log::info!(
                         "Browser graphics initialized successfully with {:?}",
