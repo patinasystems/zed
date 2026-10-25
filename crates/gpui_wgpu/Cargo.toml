@@ -28,6 +28,9 @@ etagere.workspace = true
 itertools.workspace = true
 image = { workspace = true, optional = true }
 log.workspace = true
+# Validates custom shaders (`gpui::Shader`) before wgpu compiles them, with the
+# Naga revision wgpu uses.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["wgsl-in"] }
 parking_lot.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
@@ -55,8 +58,6 @@ wgpu = { workspace = true, features = ["webgl"] }
 criterion.workspace = true
 gpui = { workspace = true, features = ["bench-support"] }
 image.workspace = true
-# Validate shaders with the same Naga revision that wgpu uses at runtime.
-naga = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["wgsl-in"] }
 
 [[bench]]
 name = "layout_line"
