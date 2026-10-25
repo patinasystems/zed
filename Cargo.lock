@@ -7523,6 +7523,7 @@ dependencies = [
  "log",
  "mach2",
  "metal",
+ "naga",
  "objc2 0.6.3",
  "objc2-core-foundation",
  "objc2-core-text",

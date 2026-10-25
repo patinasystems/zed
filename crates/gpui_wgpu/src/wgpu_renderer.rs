@@ -270,6 +270,8 @@ impl WgpuResources {
 
 struct WgpuRendererCore {
     resources: WgpuResources,
+    /// Pipelines of custom shaders (`gpui::Shader`).
+    custom_shaders: crate::custom_shaders::CustomShaders,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
@@ -1517,8 +1519,10 @@ impl WgpuRendererCore {
             ],
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
+        let custom_shaders = crate::custom_shaders::CustomShaders::new(&device, &queue);
 
         Self {
+            custom_shaders,
             resources: WgpuResources {
                 device,
                 queue,
@@ -1821,6 +1825,34 @@ impl WgpuRendererCore {
                             .as_ref()
                             .context("backdrop filters draw to an offscreen frame")?;
                         for filter in &scene.backdrop_filters[range] {
+                            if let Some(shader) = filter.shader.shader(scene) {
+                                let backdrop = filter
+                                    .shader
+                                    .reads_backdrop()
+                                    .then(|| {
+                                        self.filter_backdrop(
+                                            &mut encoder,
+                                            filter,
+                                            frame_texture,
+                                            size,
+                                        )
+                                    })
+                                    .flatten();
+                                let resources = &self.resources;
+                                self.custom_shaders.draw(
+                                    &resources.device,
+                                    &resources.queue,
+                                    self.target_format,
+                                    &mut encoder,
+                                    target_view,
+                                    shader,
+                                    filter,
+                                    filter.shader.uniforms(scene),
+                                    backdrop.as_ref().map(|(view, region)| (view, *region)),
+                                    [size.width.0 as f32, size.height.0 as f32],
+                                );
+                                continue;
+                            }
                             let filtered =
                                 self.filter_backdrop(&mut encoder, filter, frame_texture, size);
                             let Some((filtered_view, region)) = filtered else {
@@ -3074,7 +3106,7 @@ impl RenderingParameters {
 }
 
 /// A render pass that keeps what `view` holds.
-fn begin_load_pass<'a>(
+pub(crate) fn begin_load_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
     view: &'a wgpu::TextureView,
     label: &str,
@@ -3282,6 +3314,34 @@ mod tests {
             image.save(std::path::Path::new(&dir).join("backdrop_wgpu.png"))?;
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+        Ok(())
+    }
+
+    /// The shared custom shader scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn custom_shaders_render() -> anyhow::Result<()> {
+        use gpui::custom_shader_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("custom_shaders_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
         Ok(())
     }
 

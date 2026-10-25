@@ -44,6 +44,9 @@ libc.workspace = true
 log.workspace = true
 mach2.workspace = true
 metal.workspace = true
+# Custom shaders (`gpui::Shader`) are WGSL, translated to MSL at runtime with the
+# Naga revision wgpu uses.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["wgsl-in", "msl-out"] }
 objc2.workspace = true
 objc2-core-foundation = { workspace = true, features = ["std", "CFData", "CFDictionary", "CFString", "CFNumber", "CFBase"] }
 objc2-core-text = { workspace = true, optional = true }

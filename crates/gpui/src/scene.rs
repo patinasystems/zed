@@ -53,6 +53,10 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub retained_shapes: Vec<RetainedShapesDraw>,
     pub backdrop_filters: Vec<BackdropFilter>,
+    /// The sources of the shaders this frame's backdrop filters run, once each.
+    pub shaders: Vec<Shader>,
+    /// Their uniforms, each draw's at [`ShaderDraw::uniforms`], 16-byte aligned.
+    pub shader_uniforms: Vec<u8>,
 }
 
 #[expect(missing_docs)]
@@ -71,6 +75,36 @@ impl Scene {
         self.surfaces.clear();
         self.retained_shapes.clear();
         self.backdrop_filters.clear();
+        self.shaders.clear();
+        self.shader_uniforms.clear();
+    }
+
+    /// Records a shader draw's source (once per frame) and uniforms.
+    pub fn add_shader(
+        &mut self,
+        shader: &Shader,
+        uniforms: &[u8],
+        reads_backdrop: bool,
+        scale_factor: f32,
+    ) -> ShaderDraw {
+        let index = match self.shaders.iter().position(|known| known.id == shader.id) {
+            Some(index) => index,
+            None => {
+                self.shaders.push(shader.clone());
+                self.shaders.len() - 1
+            }
+        };
+        let start = self.shader_uniforms.len();
+        self.shader_uniforms.extend_from_slice(uniforms);
+        let padded = self.shader_uniforms.len().next_multiple_of(16);
+        self.shader_uniforms.resize(padded, 0);
+        ShaderDraw {
+            shader: index as u32 + 1,
+            uniforms_start: start as u32,
+            uniforms_len: uniforms.len() as u32,
+            reads_backdrop: reads_backdrop.into(),
+            scale_factor,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -173,6 +207,21 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
+                // A shader draw refers to its frame's sources and uniforms: copy them over.
+                PaintOperation::Primitive(Primitive::BackdropFilter(filter))
+                    if filter.shader.shader != 0 =>
+                {
+                    let mut filter = *filter;
+                    if let Some(shader) = filter.shader.shader(prev_scene) {
+                        filter.shader = self.add_shader(
+                            shader,
+                            filter.shader.uniforms(prev_scene),
+                            filter.shader.reads_backdrop(),
+                            filter.shader.scale_factor,
+                        );
+                        self.insert_primitive(filter);
+                    }
+                }
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -749,6 +798,9 @@ pub struct BackdropFilter {
     pub brightness: f32,
     /// 1 leaves colors as they are; 0 is mid gray.
     pub contrast: f32,
+    /// A custom shader that draws the element's box instead of the filters above
+    /// ([`crate::Window::paint_shader`]); [`ShaderDraw::NONE`] for none.
+    pub shader: ShaderDraw,
 }
 
 impl Default for BackdropFilter {
@@ -764,6 +816,7 @@ impl Default for BackdropFilter {
             saturate: 1.,
             brightness: 1.,
             contrast: 1.,
+            shader: ShaderDraw::NONE,
         }
     }
 }
@@ -774,6 +827,108 @@ impl BackdropFilter {
         self.bounds.dilate(self.blur_radius * 3.)
     }
 }
+
+/// A WGSL shader that draws an element's box ([`crate::Window::paint_shader`]).
+///
+/// The source defines `fn shade(input: ShaderInput) -> vec4<f32>`, returning a
+/// straight-alpha color for each pixel; [`SHADER_PRELUDE`] declares `ShaderInput`
+/// and `backdrop(uv)`, which samples what is drawn behind the element. Uniforms
+/// passed to `paint_shader` bind at `@group(0) @binding(3)`. GPUI clips the result
+/// to the element's corner radii and content mask and fades it with the element
+/// opacity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shader {
+    /// A hash of the source; renderers cache pipelines by it.
+    pub id: ShaderId,
+    /// The WGSL source, without the prelude.
+    pub source: std::sync::Arc<str>,
+}
+
+impl Shader {
+    /// A shader from WGSL source.
+    pub fn new(source: impl Into<std::sync::Arc<str>>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let source = source.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        Self {
+            id: ShaderId(hasher.finish()),
+            source,
+        }
+    }
+
+    /// The prelude and the source: the WGSL module renderers compile.
+    pub fn module_source(&self) -> String {
+        format!("{SHADER_PRELUDE}\n{}", self.source)
+    }
+}
+
+/// Identifies a [`Shader`] by its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct ShaderId(pub u64);
+
+/// What a [`Shader`] reads besides its uniforms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderInput {
+    /// Nothing: `backdrop(uv)` returns transparent black.
+    None,
+    /// What is drawn behind the element, through `backdrop(uv)`.
+    Backdrop,
+}
+
+/// A shader draw within a [`BackdropFilter`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct ShaderDraw {
+    /// One more than the shader's index in [`Scene::shaders`]; 0 for none.
+    pub shader: u32,
+    /// Where its uniforms start in [`Scene::shader_uniforms`], in bytes.
+    pub uniforms_start: u32,
+    /// Their length in bytes.
+    pub uniforms_len: u32,
+    /// Whether it reads the backdrop.
+    pub reads_backdrop: PaddedBool32,
+    /// Device pixels per logical pixel, for `ShaderInput`.
+    pub scale_factor: f32,
+}
+
+impl ShaderDraw {
+    /// No shader.
+    pub const NONE: Self = Self {
+        shader: 0,
+        uniforms_start: 0,
+        uniforms_len: 0,
+        reads_backdrop: PaddedBool32(0),
+        scale_factor: 1.,
+    };
+
+    /// The shader this draws, if any.
+    pub fn shader<'a>(&self, scene: &'a Scene) -> Option<&'a Shader> {
+        (self.shader as usize)
+            .checked_sub(1)
+            .and_then(|index| scene.shaders.get(index))
+    }
+
+    /// Whether the shader reads the backdrop.
+    pub fn reads_backdrop(&self) -> bool {
+        self.reads_backdrop.0 != 0
+    }
+
+    /// Its uniform bytes in `scene`.
+    pub fn uniforms<'a>(&self, scene: &'a Scene) -> &'a [u8] {
+        let start = self.uniforms_start as usize;
+        scene
+            .shader_uniforms
+            .get(start..start + self.uniforms_len as usize)
+            .unwrap_or_default()
+    }
+}
+
+/// The WGSL every [`Shader`] is compiled with: its bindings (group 0, bindings 0
+/// to 2; uniforms are binding 3), `ShaderInput`, `backdrop(uv)`, and the entry
+/// points `gpui_shader_vertex` and `gpui_shader_fragment`, which call `shade`.
+pub const SHADER_PRELUDE: &str = include_str!("shader_prelude.wgsl");
 
 impl From<BackdropFilter> for Primitive {
     fn from(filter: BackdropFilter) -> Self {
@@ -1593,6 +1748,50 @@ mod tests {
     }
 
     #[test]
+    fn shader_draws_keep_one_source_and_aligned_uniforms() {
+        let mut scene = Scene::default();
+        let shader =
+            Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
+        let a = scene.add_shader(&shader, &[1, 2, 3, 4, 5], true, 2.);
+        let b = scene.add_shader(&shader, &[6; 8], false, 2.);
+        assert_eq!(scene.shaders.len(), 1, "one source per frame");
+        assert_eq!(a.shader(&scene), Some(&shader));
+        assert_eq!(a.uniforms(&scene), &[1, 2, 3, 4, 5]);
+        assert_eq!(b.uniforms_start, 16, "uniforms start 16-byte aligned");
+        assert_eq!(b.uniforms(&scene), &[6; 8]);
+        assert!(a.reads_backdrop() && !b.reads_backdrop());
+        assert_eq!(ShaderDraw::NONE.shader(&scene), None);
+        scene.clear();
+        assert!(scene.shaders.is_empty() && scene.shader_uniforms.is_empty());
+    }
+
+    #[test]
+    fn replayed_shader_draws_bring_their_source_and_uniforms() {
+        let mut previous = Scene::default();
+        let other =
+            Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0); }");
+        let shader =
+            Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
+        previous.add_shader(&other, &[9; 32], false, 1.);
+        let draw = previous.add_shader(&shader, &[1, 2, 3, 4], true, 2.);
+        previous.insert_primitive(BackdropFilter {
+            bounds: scaled_bounds(0., 0., 10., 10.),
+            content_mask: ContentMask {
+                bounds: scaled_bounds(0., 0., 10., 10.),
+            },
+            shader: draw,
+            ..Default::default()
+        });
+        let mut next = Scene::default();
+        next.replay(0..previous.paint_operations.len(), &previous);
+        let replayed = next.backdrop_filters[0].shader;
+        assert_eq!(replayed.shader(&next), Some(&shader));
+        assert_eq!(replayed.uniforms(&next), &[1, 2, 3, 4]);
+        assert!(replayed.reads_backdrop());
+        assert_eq!(replayed.scale_factor, 2.);
+    }
+
+    #[test]
     fn backdrop_filters_inside_a_layer_keep_paint_order() {
         let mut scene = Scene::default();
         let layer = scaled_bounds(0., 0., 40., 40.);
@@ -1714,5 +1913,138 @@ mod tests {
         scene.insert_primitive(draw);
         scene.finish();
         assert!(scene.retained_shapes.is_empty());
+    }
+}
+
+/// Custom shaders ([`Shader`]), for renderer tests: every backend renders it and
+/// must hit the same probe colors.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod custom_shader_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    /// A uniform color.
+    pub const SOLID: &str = "
+struct Params { color: vec4<f32> }
+@group(0) @binding(3) var<uniform> params: Params;
+fn shade(input: ShaderInput) -> vec4<f32> { return params.color; }
+";
+    /// The backdrop, inverted.
+    pub const INVERT: &str = "
+fn shade(input: ShaderInput) -> vec4<f32> {
+    let behind = backdrop(input.uv);
+    return vec4<f32>(1.0 - behind.rgb, 1.0);
+}
+";
+    /// Red from 0 to 1 across the element, green 1 past 8 logical pixels down.
+    pub const GRADIENT: &str = "
+fn shade(input: ShaderInput) -> vec4<f32> {
+    return vec4<f32>(input.uv.x, select(0.0, 1.0, input.position.y > 8.0), 0.0, 1.0);
+}
+";
+
+    fn color(r: f32, g: f32, b: f32) -> Hsla {
+        Rgba { r, g, b, a: 1.0 }.into()
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    fn draw(
+        scene: &mut Scene,
+        source: &str,
+        uniforms: &[f32],
+        at: Bounds<ScaledPixels>,
+        radius: f32,
+        opacity: f32,
+        reads_backdrop: bool,
+    ) {
+        let full = ContentMask {
+            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
+        };
+        let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
+        // Scale factor 2: the gradient's 8 logical pixels are 16 device pixels.
+        let shader = scene.add_shader(&Shader::new(source), &bytes, reads_backdrop, 2.);
+        scene.insert_primitive(BackdropFilter {
+            bounds: at,
+            content_mask: full,
+            corner_radii: Corners::all(ScaledPixels(radius)),
+            opacity,
+            shader,
+            ..Default::default()
+        });
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask {
+            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
+        };
+        let mut scene = Scene::default();
+        // A red band behind the inverting shader.
+        scene.insert_primitive(Quad {
+            bounds: bounds(0., 40., SIZE.0 as f32, 24.),
+            content_mask: full,
+            background: color(1., 0., 0.).into(),
+            ..Default::default()
+        });
+        // A blue rounded square from a uniform, and a half-faded one.
+        draw(
+            &mut scene,
+            SOLID,
+            &[0., 0., 1., 1.],
+            bounds(4., 4., 24., 24.),
+            10.,
+            1.,
+            false,
+        );
+        draw(
+            &mut scene,
+            SOLID,
+            &[0., 1., 0., 1.],
+            bounds(36., 4., 12., 12.),
+            0.,
+            0.5,
+            false,
+        );
+        // A gradient across x 36..52, y 20..36 (green below 16 device pixels).
+        draw(
+            &mut scene,
+            GRADIENT,
+            &[],
+            bounds(36., 20., 16., 32.),
+            0.,
+            1.,
+            false,
+        );
+        // The red band inverted to cyan.
+        draw(
+            &mut scene,
+            INVERT,
+            &[],
+            bounds(4., 44., 24., 16.),
+            0.,
+            1.,
+            true,
+        );
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let probes = vec![
+            probe("uniform color", 16, 16, [0, 0, 255, 255]),
+            probe("rounded corner stays clear", 4, 4, [0, 0, 0, 255]),
+            probe("half-faded uniform color", 42, 10, [0, 128, 0, 255]),
+            probe("gradient start", 36, 24, [8, 0, 0, 255]),
+            probe("gradient middle", 44, 24, [135, 0, 0, 255]),
+            probe("gradient below 8 logical pixels", 36, 40, [8, 255, 0, 255]),
+            probe("inverted red", 16, 52, [0, 255, 255, 255]),
+            probe("red outside the shader", 32, 52, [255, 0, 0, 255]),
+        ];
+        (scene, probes)
     }
 }

@@ -4976,6 +4976,50 @@ impl Window {
             saturate: backdrop.saturate,
             brightness: backdrop.brightness,
             contrast: backdrop.contrast,
+            shader: crate::ShaderDraw::NONE,
+        });
+    }
+
+    /// Paints `shader` over `bounds`, clipped to `corner_radii` and the content
+    /// mask and faded by the element opacity. `uniforms` bind at `@group(0)
+    /// @binding(3)` (at most 4096 bytes; laid out as the shader declares them).
+    /// With [`ShaderInput::Backdrop`], `backdrop(uv)` reads what is drawn behind
+    /// `bounds`, which orders the draw after it, like a backdrop filter. Under an
+    /// element transformation it draws the transformed bounding box.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shader: &crate::Shader,
+        uniforms: &[u8],
+        input: crate::ShaderInput,
+    ) {
+        self.invalidator.debug_assert_paint();
+        debug_assert!(uniforms.len() <= 4096, "shader uniforms over 4096 bytes");
+        let uniforms = &uniforms[..uniforms.len().min(4096)];
+        let scale_factor = self.scale_factor();
+        let bounds = match self.element_transformation_stack.last() {
+            Some(transformation) => transform_pixel_bounds(transformation, bounds),
+            None => bounds,
+        };
+        let draw = self.next_frame.scene.add_shader(
+            shader,
+            uniforms,
+            input == crate::ShaderInput::Backdrop,
+            scale_factor,
+        );
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            opacity: self.element_opacity(),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii
+                .clamp_radii_for_quad_size(bounds.size)
+                .scale(scale_factor),
+            shader: draw,
+            ..BackdropFilter::default()
         });
     }
 
@@ -8349,6 +8393,54 @@ mod tests {
         WindowOptions, canvas, div, hsla, point, px, size,
     };
 
+    /// A canvas that paints a shader at half opacity.
+    struct ShaderProbe;
+
+    impl Render for ShaderProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| {},
+                |_, _, window, _| {
+                    let shader = crate::Shader::new(
+                        "fn shade(input: ShaderInput) -> vec4<f32> { return backdrop(input.uv); }",
+                    );
+                    let bounds = Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)));
+                    window.with_element_opacity(Some(0.5), |window| {
+                        window.paint_shader(
+                            bounds,
+                            crate::Corners::all(px(4.)),
+                            &shader,
+                            &1f32.to_le_bytes(),
+                            crate::ShaderInput::Backdrop,
+                        );
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn test_paint_shader_records_a_shader_draw(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| ShaderProbe);
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            let scene = &window.rendered_frame.scene;
+            let filter = &scene.backdrop_filters[0];
+            assert_eq!(filter.opacity, 0.5, "fades with the element");
+            assert_eq!(filter.bounds.origin.x, ScaledPixels(10. * scale));
+            assert_eq!(filter.corner_radii.top_left, ScaledPixels(4. * scale));
+            assert!(filter.shader.reads_backdrop());
+            assert_eq!(filter.shader.scale_factor, scale);
+            assert_eq!(filter.shader.uniforms(scene), &1f32.to_le_bytes());
+            assert!(filter.shader.shader(scene).is_some());
+        })
+        .unwrap();
+    }
+
     /// A div with a backdrop filter that a hover style hides.
     struct HoverGlass;
 
@@ -8379,7 +8471,10 @@ mod tests {
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
                 window.draw(cx).clear(cx);
-                (window.rendered_frame.scene.backdrop_filters.clone(), window.scale_factor())
+                (
+                    window.rendered_frame.scene.backdrop_filters.clone(),
+                    window.scale_factor(),
+                )
             })
             .unwrap()
         };
@@ -11024,13 +11119,7 @@ mod inspector_tests {
 
 /// What [`Window::paint_backdrop_filter`] does to the backdrop.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    schemars::JsonSchema,
+    Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Backdrop {
     /// The blur's standard deviation (CSS `blur()`); zero for none.

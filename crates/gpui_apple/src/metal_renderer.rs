@@ -132,6 +132,13 @@ pub struct MetalRenderer {
     backdrop_copy_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
     backdrop_composite_pipeline_state: metal::RenderPipelineState,
+    /// Pipelines of custom shaders by id; `None` for one that failed to compile
+    /// (logged once).
+    custom_shaders: HashMap<gpui::ShaderId, Option<metal::RenderPipelineState>>,
+    /// Samples a custom shader's backdrop.
+    custom_shader_sampler: metal::SamplerState,
+    /// The backdrop of a custom shader that reads none.
+    blank_texture: metal::Texture,
     /// GPU copies of retained shape buffers, by buffer id.
     retained_shapes: HashMap<u64, RetainedGpu>,
     frame_index: u64,
@@ -333,6 +340,30 @@ impl MetalRenderer {
             },
         );
 
+        let custom_shader_sampler = {
+            let descriptor = metal::SamplerDescriptor::new();
+            descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+            descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+            device.new_sampler(&descriptor)
+        };
+        let blank_texture = {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(1);
+            descriptor.set_height(1);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            let texture = device.new_texture(&descriptor);
+            texture.replace_region(
+                metal::MTLRegion::new_2d(0, 0, 1, 1),
+                0,
+                [0u8; 4].as_ptr() as *const _,
+                4,
+            );
+            texture
+        };
         let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
             &device,
             &library,
@@ -469,6 +500,9 @@ impl MetalRenderer {
             backdrop_copy_pipeline_state,
             backdrop_blur_pipeline_state,
             backdrop_composite_pipeline_state,
+            custom_shaders: HashMap::new(),
+            custom_shader_sampler,
+            blank_texture,
             retained_shapes: HashMap::new(),
             frame_index: 0,
             retained_uploaded_bytes: 0,
@@ -887,6 +921,17 @@ impl MetalRenderer {
                 PrimitiveBatch::BackdropFilters(range) => {
                     command_encoder.end_encoding();
                     for filter in &scene.backdrop_filters[range] {
+                        if let Some(shader) = filter.shader.shader(scene) {
+                            self.draw_custom_shader(
+                                scene,
+                                filter,
+                                shader,
+                                texture,
+                                viewport_size,
+                                command_buffer,
+                            );
+                            continue;
+                        }
                         // Read what is drawn so far, filter it offscreen, draw it back.
                         let filtered =
                             self.filter_backdrop(filter, texture, viewport_size, command_buffer);
@@ -1322,6 +1367,57 @@ impl MetalRenderer {
             }),
         );
         Some((a, region))
+    }
+
+    /// Draws a custom shader: reads its backdrop (when it does) and runs its pipeline,
+    /// compiled on first use. A shader that fails to compile draws nothing.
+    fn draw_custom_shader(
+        &mut self,
+        scene: &Scene,
+        filter: &BackdropFilter,
+        shader: &gpui::Shader,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        let pipeline = self
+            .custom_shaders
+            .entry(shader.id)
+            .or_insert_with(|| {
+                crate::metal_custom_shader::build_pipeline(
+                    &self.device,
+                    shader,
+                    MTLPixelFormat::BGRA8Unorm,
+                )
+                .inspect_err(|error| log::error!("custom shader: {error:#}"))
+                .ok()
+            })
+            .clone();
+        let Some(pipeline) = pipeline else { return };
+        let backdrop = if filter.shader.reads_backdrop() {
+            self.filter_backdrop(filter, target, viewport_size, command_buffer)
+        } else {
+            None
+        };
+        let (backdrop, region) = match &backdrop {
+            Some((texture, region)) => (texture.as_ref(), *region),
+            None => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
+        };
+        let params = crate::metal_custom_shader::ShaderParams::new(
+            filter,
+            region,
+            [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+        );
+        let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
+        crate::metal_custom_shader::draw(
+            encoder,
+            &pipeline,
+            &self.custom_shader_sampler,
+            &params,
+            filter.shader.uniforms(scene),
+            backdrop,
+        );
+        encoder.end_encoding();
     }
 
     fn backdrop_texture(&self, width: u64, height: u64) -> metal::Texture {
@@ -2334,6 +2430,7 @@ mod tests {
             // Mid gray where there is color; nothing where there is none.
             contrast: 0.,
             order: 0,
+            shader: gpui::ShaderDraw::NONE,
         });
         scene.finish();
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
@@ -2362,6 +2459,25 @@ mod tests {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+    }
+
+    #[test]
+    fn custom_shaders_render() {
+        use gpui::custom_shader_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("custom_shaders_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
     }
 
     #[test]
