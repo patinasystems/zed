@@ -8441,6 +8441,68 @@ mod tests {
         .unwrap();
     }
 
+    /// A div painted by a shader, rounder on hover.
+    struct HoverShaded;
+
+    impl Render for HoverShaded {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().p(px(50.)).child(
+                div()
+                    .id("shaded")
+                    .size(px(40.))
+                    .opacity(0.5)
+                    .shader(crate::ShaderFill {
+                        shader: crate::Shader::new(
+                            "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }",
+                        ),
+                        uniforms: 2f32.to_le_bytes().to_vec(),
+                        input: crate::ShaderInput::None,
+                    })
+                    .hover(|style| style.rounded(px(12.))),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_style_shader_follows_the_painted_style(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| HoverShaded);
+        cx.run_until_parked();
+        let draws = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let scene = &window.rendered_frame.scene;
+                let filter = scene.backdrop_filters.first().copied();
+                let uniforms = filter.map(|f| f.shader.uniforms(scene).to_vec());
+                (filter, uniforms, window.scale_factor())
+            })
+            .unwrap()
+        };
+        let (filter, uniforms, scale) = draws(cx);
+        let filter = filter.expect("the shader draws");
+        assert_eq!(filter.opacity, 0.5, "fades with the div");
+        assert_eq!(filter.corner_radii.top_left, ScaledPixels(0.));
+        assert_eq!(uniforms.as_deref(), Some(&2f32.to_le_bytes()[..]));
+        // Hovered: the hover style's radii.
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position: point(px(70.), px(70.)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (filter, _, _) = draws(cx);
+        assert_eq!(
+            filter.unwrap().corner_radii.top_left,
+            ScaledPixels(12. * scale)
+        );
+    }
+
     /// A div with a backdrop filter that a hover style hides.
     struct HoverGlass;
 

@@ -863,13 +863,47 @@ impl Shader {
     }
 }
 
+impl Serialize for Shader {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.source)
+    }
+}
+
+impl<'de> Deserialize<'de> for Shader {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Shader::new)
+    }
+}
+
+impl JsonSchema for Shader {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Shader".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "description": "WGSL that defines `shade`" })
+    }
+}
+
+/// A [`Shader`] that paints an element's background ([`crate::Style::shader`]),
+/// with its uniforms and what it reads.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ShaderFill {
+    /// The shader.
+    pub shader: Shader,
+    /// Its uniforms (`@group(0) @binding(3)`), at most 4096 bytes.
+    pub uniforms: Vec<u8>,
+    /// What it reads besides its uniforms.
+    pub input: ShaderInput,
+}
+
 /// Identifies a [`Shader`] by its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct ShaderId(pub u64);
 
 /// What a [`Shader`] reads besides its uniforms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ShaderInput {
     /// Nothing: `backdrop(uv)` returns transparent black.
     None,
