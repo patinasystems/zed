@@ -58,6 +58,22 @@ pub(crate) fn validate(shader: &Shader) -> Result<String> {
     )
     .validate(&module)
     .map_err(|error| anyhow!(error.emit_to_string(&source)))?;
+    for (_, variable) in module.global_variables.iter() {
+        if let Some(binding) = &variable.binding
+            && !gpui::shader_binding_allowed(
+                binding.group,
+                binding.binding,
+                variable.name.as_deref(),
+                variable.space == naga::AddressSpace::Uniform,
+            )
+        {
+            return Err(anyhow!(
+                "@group({}) @binding({}) is not bound by GPUI: uniforms are a `var<uniform>` at @group(0) @binding(3)",
+                binding.group,
+                binding.binding
+            ));
+        }
+    }
     Ok(source)
 }
 
@@ -285,6 +301,20 @@ mod tests {
         for source in [t::SOLID, t::INVERT, t::GRADIENT] {
             validate(&Shader::new(source)).unwrap();
         }
+    }
+
+    #[test]
+    fn shaders_may_bind_only_what_gpui_binds() {
+        let extra = "@group(0) @binding(4) var<uniform> extra: vec4<f32>;
+fn shade(input: ShaderInput) -> vec4<f32> { return extra; }";
+        let error = validate(&Shader::new(extra)).unwrap_err().to_string();
+        assert!(error.contains("@binding(4)"), "{error}");
+        let texture = "@group(0) @binding(3) var t: texture_2d<f32>;
+fn shade(input: ShaderInput) -> vec4<f32> { return textureLoad(t, vec2<i32>(0), 0); }";
+        assert!(validate(&Shader::new(texture)).is_err());
+        let uniforms = "@group(0) @binding(3) var<uniform> u: vec4<f32>;
+fn shade(input: ShaderInput) -> vec4<f32> { return u; }";
+        validate(&Shader::new(uniforms)).unwrap();
     }
 
     #[test]
