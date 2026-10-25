@@ -756,7 +756,7 @@ pub trait Styled: Sized {
     }
 
     /// Paints this element's box with a shader ([`crate::Window::paint_shader`]),
-    /// before its background color.
+    /// over its background color.
     fn shader(mut self, fill: crate::ShaderFill) -> Self {
         self.style().shader = Some(fill);
         self
