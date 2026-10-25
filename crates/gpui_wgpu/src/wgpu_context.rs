@@ -120,6 +120,27 @@ impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
     }
 }
 
+/// Backend options for browser instances.
+///
+/// WebGL2 cannot block on a fence: browsers cap `clientWaitSync` at a zero timeout
+/// (WebKit, Chromium) or one second (Gecko). Every `poll(Wait)` therefore times
+/// out while the GPU is still busy, and wgpu-core's surface reconfigure, which
+/// waits for the device to go idle, treats that timeout as unreachable and
+/// panics on the first canvas resize. GL already orders commands and defers
+/// object deletion until the GPU is done with them, so waits on WebGL have
+/// nothing to protect: `AutoFinish` makes them complete immediately. WebGPU
+/// ignores the GL options.
+#[cfg(any(target_family = "wasm", test))]
+fn web_backend_options() -> wgpu::BackendOptions {
+    wgpu::BackendOptions {
+        gl: wgpu::GlBackendOptions {
+            fence_behavior: wgpu::GlFenceBehavior::AutoFinish,
+            ..wgpu::GlBackendOptions::default()
+        },
+        ..wgpu::BackendOptions::default()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct CompositorGpuHint {
     pub vendor_id: u32,
@@ -366,7 +387,7 @@ impl WgpuContext {
         let descriptor = wgpu::InstanceDescriptor {
             backends,
             flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
+            backend_options: web_backend_options(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(Box::new(WebDisplaySource)),
         };
@@ -781,7 +802,16 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceErrorState, parse_pci_id};
+    use super::{DeviceErrorState, parse_pci_id, web_backend_options};
+
+    #[test]
+    fn browser_gl_waits_complete_without_blocking() {
+        let options = web_backend_options();
+        assert_eq!(options.gl.fence_behavior, wgpu::GlFenceBehavior::AutoFinish);
+        let defaults = wgpu::GlBackendOptions::default();
+        assert_eq!(options.gl.gles_minor_version, defaults.gles_minor_version);
+        assert_eq!(options.gl.debug_fns, defaults.debug_fns);
+    }
 
     #[test]
     fn device_errors_are_observed_independently() {
