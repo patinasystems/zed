@@ -297,6 +297,12 @@ pub struct Style {
     /// visibility; other elements paint it under the element opacity they set.
     pub backdrop_filter: Option<crate::Backdrop>,
 
+    /// A shader that paints the element's border box (within its corner radii)
+    /// after the backdrop filter and before the background color. A div paints
+    /// it from its final style, so it follows the div's state styles, opacity
+    /// and visibility.
+    pub shader: Option<crate::ShaderFill>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -730,6 +736,16 @@ impl Style {
             window.paint_backdrop_filter(bounds, corner_radii, backdrop);
         }
 
+        if let Some(fill) = &self.shader {
+            window.paint_shader(
+                bounds,
+                corner_radii,
+                &fill.shader,
+                &fill.uniforms,
+                fill.input,
+            );
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -827,6 +843,7 @@ impl Default for Style {
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             backdrop_filter: None,
+            shader: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

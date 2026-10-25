@@ -755,6 +755,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Paints this element's box with a shader ([`crate::Window::paint_shader`]),
+    /// before its background color.
+    fn shader(mut self, fill: crate::ShaderFill) -> Self {
+        self.style().shader = Some(fill);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
