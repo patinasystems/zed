@@ -959,6 +959,20 @@ impl ShaderDraw {
     }
 }
 
+/// Whether a shader module may declare a resource at `group`/`binding`: only the
+/// prelude's (bindings 0 to 2, by name) and a uniform buffer at binding 3, which
+/// are what renderers bind. `name` is the variable's name; `uniform` whether it
+/// is in the uniform address space.
+pub fn shader_binding_allowed(group: u32, binding: u32, name: Option<&str>, uniform: bool) -> bool {
+    match (group, binding) {
+        (0, 0) => name == Some("gpui_shader"),
+        (0, 1) => name == Some("gpui_backdrop_texture"),
+        (0, 2) => name == Some("gpui_backdrop_sampler"),
+        (0, 3) => uniform,
+        _ => false,
+    }
+}
+
 /// The WGSL every [`Shader`] is compiled with: its bindings (group 0, bindings 0
 /// to 2; uniforms are binding 3), `ShaderInput`, `backdrop(uv)`, and the entry
 /// points `gpui_shader_vertex` and `gpui_shader_fragment`, which call `shade`.

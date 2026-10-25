@@ -66,6 +66,22 @@ pub(crate) fn translate(shader: &Shader) -> Result<(String, String, String)> {
     )
     .validate(&module)
     .map_err(|error| anyhow!(error.emit_to_string(&source)))?;
+    for (_, variable) in module.global_variables.iter() {
+        if let Some(binding) = &variable.binding
+            && !gpui::shader_binding_allowed(
+                binding.group,
+                binding.binding,
+                variable.name.as_deref(),
+                variable.space == naga::AddressSpace::Uniform,
+            )
+        {
+            return Err(anyhow!(
+                "@group({}) @binding({}) is not bound by GPUI: uniforms are a `var<uniform>` at @group(0) @binding(3)",
+                binding.group,
+                binding.binding
+            ));
+        }
+    }
     let binding = |binding| naga::ResourceBinding { group: 0, binding };
     let resources = msl::EntryPointResources {
         resources: BTreeMap::from([
@@ -207,6 +223,14 @@ mod tests {
             let (msl, vertex, fragment) = translate(&Shader::new(source)).unwrap();
             assert!(msl.contains(&vertex) && msl.contains(&fragment));
         }
+    }
+
+    #[test]
+    fn shaders_may_bind_only_what_gpui_binds() {
+        let extra = "@group(0) @binding(4) var<uniform> extra: vec4<f32>;
+fn shade(input: ShaderInput) -> vec4<f32> { return extra; }";
+        let error = translate(&Shader::new(extra)).unwrap_err().to_string();
+        assert!(error.contains("@binding(4)"), "{error}");
     }
 
     #[test]
