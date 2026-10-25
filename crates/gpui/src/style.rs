@@ -291,6 +291,12 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// Filters what is behind the element's border box (within its corner radii)
+    /// before the background paints, like CSS `backdrop-filter`. A div paints it
+    /// from its final style, so it follows the div's state styles, opacity and
+    /// visibility; other elements paint it under the element opacity they set.
+    pub backdrop_filter: Option<crate::Backdrop>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -720,6 +726,10 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
+        if let Some(backdrop) = self.backdrop_filter {
+            window.paint_backdrop_filter(bounds, corner_radii, backdrop);
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -816,6 +826,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            backdrop_filter: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

@@ -748,6 +748,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Filters what is behind this element (blur, saturate, brightness,
+    /// contrast) before its background paints, like CSS `backdrop-filter`.
+    fn backdrop_filter(mut self, backdrop: crate::Backdrop) -> Self {
+        self.style().backdrop_filter = Some(backdrop);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
