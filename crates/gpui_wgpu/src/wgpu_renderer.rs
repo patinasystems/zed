@@ -4114,6 +4114,34 @@ mod tests {
         Ok(())
     }
 
+    /// The shared shaped-corner scene (CSS `corner-shape`) on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn corner_shapes_render() -> anyhow::Result<()> {
+        use gpui::corner_shape_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("corner_shapes_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        Ok(())
+    }
+
     /// The shared group mask scene (alpha and luminance masks, a mask moving with an
     /// offscreen group, a smaller mask, an empty one) on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
@@ -4474,7 +4502,7 @@ mod tests {
                 rotation_scale: [[34.0, 35.0], [36.0, 37.0]],
                 translation: [38.0, 39.0],
             },
-            pad: [0; 2],
+            corner_shapes: [0; 2],
         };
 
         let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };

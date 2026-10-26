@@ -395,6 +395,57 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
 //
 // See comments on similar code using `quad_sdf_impl` in `fs_quad` for
 // explanation.
+// The superellipse parameter K of the corner nearest `center_to_point` (CSS
+// `corner-shape`, `CornerShapes::gpu`): 1 is round; +/-1e9 stand for square and notch.
+fn pick_corner_shape(center_to_point: vec2<f32>, shapes: vec2<u32>) -> f32 {
+    let top = (center_to_point.y < 0.0);
+    let right = (center_to_point.x >= 0.0);
+    let word = select(shapes.y, shapes.x, top);
+    // Top right and bottom left are the high halves.
+    let high = (top == right);
+    let bits = select(word & 0xffffu, word >> 16u, high);
+    // Sign-extend the 16-bit code.
+    let code = bitcast<i32>(bits << 16u) >> 16u;
+    if (code == 32767) {
+        return 1e9;
+    }
+    if (code == -32768) {
+        return -1e9;
+    }
+    return 1.0 + f32(code) / 1024.0;
+}
+
+// Approximate signed distance (positive outside) to a corner's superellipse
+// `|u.x|^n + |u.y|^n = 1`, n = 2^k, where u is `p` (from the corner's center toward its
+// outer corner) over `radii`; a negative k is the concave curve of -k, around the
+// outer corner. The value over its gradient is the distance near the curve.
+fn shaped_corner_sdf(p: vec2<f32>, radii: vec2<f32>, k: f32) -> f32 {
+    let r = max(radii, vec2<f32>(1e-4));
+    if (k > 30.0) {
+        return max(p.x - r.x, p.y - r.y);
+    }
+    if (k < -30.0) {
+        return min(p.x, p.y);
+    }
+    let u = p / r;
+    var f = 0.0;
+    var gradient = vec2<f32>(0.0);
+    if (k >= 0.0) {
+        let n = exp2(min(k, 8.0));
+        let v = max(u, vec2<f32>(1e-6));
+        let s = pow(v.x, n) + pow(v.y, n);
+        f = pow(s, 1.0 / n) - 1.0;
+        gradient = pow(v, vec2<f32>(n - 1.0)) * pow(s, 1.0 / n - 1.0);
+    } else {
+        let m = exp2(min(-k, 8.0));
+        let v = max(1.0 - u, vec2<f32>(1e-6));
+        let s = pow(v.x, m) + pow(v.y, m);
+        f = 1.0 - pow(s, 1.0 / m);
+        gradient = pow(v, vec2<f32>(m - 1.0)) * pow(s, 1.0 / m - 1.0);
+    }
+    return f / max(length(gradient / r), 1e-6);
+}
+
 fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     let half_size = bounds.size / 2.0;
     let center = bounds.origin + half_size;
@@ -687,7 +738,8 @@ struct Quad {
     corner_radii: Corners,
     border_widths: Edges,
     transformation: TransformationMatrix,
-    pad: vec2<u32>,
+    // `gpui::CornerShapes::gpu`.
+    corner_shapes: vec2<u32>,
 }
 
 struct QuadVarying {
@@ -859,13 +911,26 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // points in an inscribed rectangle, or some other quick linear check.
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
-    if (is_within_inner_straight_border && !is_near_rounded_corner) {
+    // A shaped corner (CSS `corner-shape`) replaces the round one. A concave curve
+    // meets the straight edges at an angle, so its border reaches a border's width
+    // past the corner's box.
+    let corner_shape = pick_corner_shape(center_to_point, quad.corner_shapes);
+    let shaped = corner_shape != 1.0 && corner_radius > 0.0 &&
+        (is_near_rounded_corner ||
+         (corner_shape < 0.0 && corner_center_to_point.x >= -reduced_border.x &&
+          corner_center_to_point.y >= -reduced_border.y));
+
+    if (is_within_inner_straight_border && !is_near_rounded_corner && !shaped) {
         return blend_color(background_color, 1.0);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    var outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    if (shaped) {
+        outer_sdf = max(shaped_corner_sdf(corner_center_to_point, vec2<f32>(corner_radius), corner_shape),
+                        max(corner_to_point.x, corner_to_point.y));
+    }
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -876,10 +941,19 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     //   nearest-point-on-ellipse.
     // * When it is quickly known to be outside the edge, -1.0 is used.
     var inner_sdf = 0.0;
-    if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
+    if (!shaped && (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0)) {
         // Fast paths for straight borders.
         inner_sdf = -max(straight_border_inner_corner_to_point.x,
                          straight_border_inner_corner_to_point.y);
+    } else if (shaped) {
+        // A shaped corner's inner edge follows its curve (a concave one reaches past the
+        // straight borders' inner corner): the outer curve inset by the border.
+        if (reduced_border.x == reduced_border.y) {
+            inner_sdf = -(outer_sdf + reduced_border.x);
+        } else {
+            let inner_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
+            inner_sdf = -shaped_corner_sdf(corner_center_to_point, inner_radii, corner_shape);
+        }
     } else if (is_beyond_inner_straight_border) {
         // Fast path for points that must be outside the inner edge.
         inner_sdf = -1.0;

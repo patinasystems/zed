@@ -1180,7 +1180,81 @@ pub struct Quad {
     pub border_widths: Edges<ScaledPixels>,
     /// Applied to the quad after layout, in device pixels (see [`Window::with_element_transformation`]).
     pub transformation: TransformationMatrix,
-    pub pad: [u32; 2], // align to 16 bytes (WebGL reads quads as whole texels)
+    /// The superellipse shape of each corner ([`CornerShapes::gpu`]); zero is round.
+    /// Also aligns the quad to 16 bytes (WebGL reads quads as whole texels).
+    pub corner_shapes: [u32; 2],
+}
+
+/// The shape of each corner of a rounded quad (CSS Borders 4 `corner-shape`): the
+/// superellipse parameter `K` of `superellipse(K)`, whose corner curve is
+/// `|x|^(2^K) + |y|^(2^K) = 1`; a negative `K` is the concave curve of `-K`. `1` is
+/// `round` (the default), `2` `squircle`, `0` `bevel`, `-1` `scoop`, infinity
+/// `square` and minus infinity `notch`. Corners without a radius stay square.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CornerShapes {
+    /// `K` of the top left corner.
+    pub top_left: f32,
+    /// `K` of the top right corner.
+    pub top_right: f32,
+    /// `K` of the bottom right corner.
+    pub bottom_right: f32,
+    /// `K` of the bottom left corner.
+    pub bottom_left: f32,
+}
+
+impl Default for CornerShapes {
+    fn default() -> Self {
+        Self::ROUND
+    }
+}
+
+impl CornerShapes {
+    /// Every corner round.
+    pub const ROUND: CornerShapes = CornerShapes {
+        top_left: 1.,
+        top_right: 1.,
+        bottom_right: 1.,
+        bottom_left: 1.,
+    };
+
+    /// The same shape at every corner.
+    pub fn all(k: f32) -> Self {
+        CornerShapes {
+            top_left: k,
+            top_right: k,
+            bottom_right: k,
+            bottom_left: k,
+        }
+    }
+
+    /// Whether every corner is round.
+    pub fn is_round(&self) -> bool {
+        *self == Self::ROUND
+    }
+
+    /// The renderers' encoding ([`Quad::corner_shapes`]): `K - 1` in 1/1024 steps as
+    /// a signed 16-bit value per corner (zero is round; the extremes are square and
+    /// notch, and anything beyond ±31 rounds to them), top left and top right in the
+    /// first word's low and high halves, bottom right and bottom left in the second's.
+    pub fn gpu(&self) -> [u32; 2] {
+        let code = |k: f32| -> u32 {
+            let v = if k.is_nan() {
+                0
+            } else if k >= 32. {
+                i16::MAX
+            } else if k <= -30. {
+                i16::MIN
+            } else {
+                ((k - 1.) * 1024.).round().clamp(-32767., 32766.) as i16
+            };
+            v as u16 as u32
+        };
+        let c = self;
+        [
+            code(c.top_left) | code(c.top_right) << 16,
+            code(c.bottom_right) | code(c.bottom_left) << 16,
+        ]
+    }
 }
 
 impl From<Quad> for Primitive {
@@ -3122,6 +3196,136 @@ pub mod group_mask_test_scene {
                 [255, 255, 255, 255],
             ),
         ];
+        (scene, probes)
+    }
+}
+
+/// Shaped corners (CSS `corner-shape`), for renderer tests: two red quads over white,
+/// each corner a different shape, probed along each corner's diagonal well inside
+/// and outside its curve.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod corner_shape_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    const RADIUS: f32 = 12.;
+
+    /// (bounds, shapes: top left, top right, bottom right, bottom left).
+    pub const QUADS: [([f32; 4], [f32; 4]); 2] = [
+        ([2., 2., 60., 28.], [1., 2., 0., -1.]),
+        (
+            [2., 34., 60., 28.],
+            [f32::INFINITY, f32::NEG_INFINITY, 4., -2.],
+        ),
+    ];
+
+    /// Whether `u` (from a corner's center toward its outer corner, over its radius)
+    /// is inside a corner of shape `k`.
+    pub fn inside(u: [f32; 2], k: f32) -> bool {
+        let [x, y] = u;
+        if x <= 0. || y <= 0. {
+            // Beside the corner's box: the straight edges.
+            return true;
+        }
+        if k == f32::INFINITY {
+            return x <= 1. && y <= 1.;
+        }
+        if k == f32::NEG_INFINITY {
+            return false;
+        }
+        if k >= 0. {
+            let n = 2f32.powf(k);
+            x.powf(n) + y.powf(n) <= 1.
+        } else {
+            let m = 2f32.powf(-k);
+            x <= 1. && y <= 1. && (1. - x).powf(m) + (1. - y).powf(m) >= 1.
+        }
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+            ),
+        };
+        let color = |r: f32, g: f32, b: f32| -> Hsla { Rgba { r, g, b, a: 1. }.into() };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: color(1., 1., 1.).into(),
+            ..Default::default()
+        });
+        let mut probes = Vec::new();
+        for ([x, y, w, h], [tl, tr, br, bl]) in QUADS {
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(x), ScaledPixels(y)),
+                    size(ScaledPixels(w), ScaledPixels(h)),
+                ),
+                content_mask: full,
+                background: color(1., 0., 0.).into(),
+                corner_radii: Corners::all(ScaledPixels(RADIUS)),
+                corner_shapes: CornerShapes {
+                    top_left: tl,
+                    top_right: tr,
+                    bottom_right: br,
+                    bottom_left: bl,
+                }
+                .gpu(),
+                ..Default::default()
+            });
+            // Each corner: its center and the direction to its outer corner.
+            let corners = [
+                ([x + RADIUS, y + RADIUS], [-1., -1.], tl),
+                ([x + w - RADIUS, y + RADIUS], [1., -1.], tr),
+                ([x + w - RADIUS, y + h - RADIUS], [1., 1.], br),
+                ([x + RADIUS, y + h - RADIUS], [-1., 1.], bl),
+            ];
+            for (center, [dx, dy], k) in corners {
+                for step in 1..12 {
+                    let t = step as f32 / 12.;
+                    let px = (center[0] + dx * t * RADIUS).floor();
+                    let py = (center[1] + dy * t * RADIUS).floor();
+                    // The pixel's center, and points 1.5 px either way along the diagonal:
+                    // keep the probe only when all three agree (clear of the antialiased edge).
+                    let at = |d: f32| {
+                        let cx = px + 0.5 + dx * d;
+                        let cy = py + 0.5 + dy * d;
+                        inside(
+                            [
+                                (cx - center[0]) * dx / RADIUS,
+                                (cy - center[1]) * dy / RADIUS,
+                            ],
+                            k,
+                        )
+                    };
+                    let here = at(0.);
+                    if at(-1.5) != here || at(1.5) != here {
+                        continue;
+                    }
+                    probes.push(Probe {
+                        what: if here {
+                            "inside a shaped corner"
+                        } else {
+                            "outside a shaped corner"
+                        },
+                        x: px as u32,
+                        y: py as u32,
+                        rgba: if here {
+                            [255, 0, 0, 255]
+                        } else {
+                            [255, 255, 255, 255]
+                        },
+                    });
+                }
+            }
+        }
+        scene.finish();
         (scene, probes)
     }
 }

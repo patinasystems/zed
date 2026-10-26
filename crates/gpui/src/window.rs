@@ -7,10 +7,10 @@ use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BlendMode,
-    BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, Corners, CursorHideMode,
-    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
-    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
-    GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
+    BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, CornerShapes, Corners,
+    CursorHideMode, CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
+    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
+    Global, GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
     InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
@@ -5306,6 +5306,17 @@ impl Window {
         corner_radii: Corners<Pixels>,
         gradient: &Gradient,
     ) {
+        self.paint_gradient_with_corner_shapes(bounds, corner_radii, CornerShapes::ROUND, gradient)
+    }
+
+    /// [`Window::paint_gradient`] inside corners of the given shapes (CSS `corner-shape`).
+    pub fn paint_gradient_with_corner_shapes(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_shapes: CornerShapes,
+        gradient: &Gradient,
+    ) {
         self.invalidator.debug_assert_paint();
         if gradient.is_transparent() {
             return;
@@ -5318,14 +5329,17 @@ impl Window {
             return;
         };
         let start = self.next_frame.scene.add_gradient(&record.texels);
-        self.paint_quad(PaintQuad {
-            bounds,
-            corner_radii,
-            background: Background::painted_gradient(start, gradient.first_color()),
-            border_widths: Edges::default(),
-            border_color: transparent_black(),
-            border_style: BorderStyle::default(),
-        });
+        self.paint_quad_with_corner_shapes(
+            PaintQuad {
+                bounds,
+                corner_radii,
+                background: Background::painted_gradient(start, gradient.first_color()),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::default(),
+            },
+            corner_shapes,
+        );
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
@@ -5338,6 +5352,13 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.paint_quad_with_corner_shapes(quad, CornerShapes::ROUND)
+    }
+
+    /// [`Window::paint_quad`] with corners of the given shapes (CSS `corner-shape`): the
+    /// background and the border follow them. Renderers without them (DirectX) draw
+    /// round corners.
+    pub fn paint_quad_with_corner_shapes(&mut self, quad: PaintQuad, corner_shapes: CornerShapes) {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
@@ -5353,7 +5374,7 @@ impl Window {
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
             transformation: self.device_element_transformation(),
-            pad: [0; 2],
+            corner_shapes: corner_shapes.gpu(),
         };
 
         // The strips below are clipped with window-space masks, so a transformed quad

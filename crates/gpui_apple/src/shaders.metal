@@ -31,6 +31,8 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
+float pick_corner_shape(float2 center_to_point, uint2 shapes);
+float shaped_corner_sdf(float2 p, float2 radii, float k);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
@@ -249,13 +251,26 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     straight_border_inner_corner_to_point.x < -antialias_threshold &&
     straight_border_inner_corner_to_point.y < -antialias_threshold;
 
+  // A shaped corner (CSS `corner-shape`) replaces the round one. A concave curve
+  // meets the straight edges at an angle, so its border reaches a border's width
+  // past the corner's box.
+  float corner_shape = pick_corner_shape(center_to_point, uint2(quad.corner_shapes[0], quad.corner_shapes[1]));
+  bool shaped = corner_shape != 1. && corner_radius > 0. &&
+    (is_near_rounded_corner ||
+     (corner_shape < 0. && corner_center_to_point.x >= -reduced_border.x &&
+      corner_center_to_point.y >= -reduced_border.y));
+
   // Fast path for points that must be part of the background
-  if (is_within_inner_straight_border && !is_near_rounded_corner) {
+  if (is_within_inner_straight_border && !is_near_rounded_corner && !shaped) {
     return background_color;
   }
 
   // Signed distance of the point to the outside edge of the quad's border
   float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  if (shaped) {
+    outer_sdf = max(shaped_corner_sdf(corner_center_to_point, float2(corner_radius), corner_shape),
+                    max(corner_to_point.x, corner_to_point.y));
+  }
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -266,10 +281,19 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   //   nearest-point-on-ellipse.
   // * When it is quickly known to be outside the edge, -1.0 is used.
   float inner_sdf = 0.0;
-  if (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0) {
+  if (!shaped && (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0)) {
     // Fast paths for straight borders
     inner_sdf = -max(straight_border_inner_corner_to_point.x,
                      straight_border_inner_corner_to_point.y);
+  } else if (shaped) {
+    // A shaped corner's inner edge follows its curve (a concave one reaches past the
+    // straight borders' inner corner): the outer curve inset by the border.
+    if (reduced_border.x == reduced_border.y) {
+      inner_sdf = -(outer_sdf + reduced_border.x);
+    } else {
+      float2 inner_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
+      inner_sdf = -shaped_corner_sdf(corner_center_to_point, inner_radii, corner_shape);
+    }
   } else if (is_beyond_inner_straight_border) {
     // Fast path for points that must be outside the inner edge
     inner_sdf = -1.0;
@@ -1168,6 +1192,52 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
   float2 tile_size = float2(tile.bounds.size.width, tile.bounds.size.height);
   return (tile_origin + unit_vertex * tile_size) /
          float2((float)atlas_size->width, (float)atlas_size->height);
+}
+
+// The superellipse parameter K of the corner nearest `center_to_point` (CSS
+// `corner-shape`, `CornerShapes::gpu`): 1 is round; +/-1e9 stand for square and notch.
+float pick_corner_shape(float2 center_to_point, uint2 shapes) {
+  uint word = center_to_point.y < 0. ? shapes.x : shapes.y;
+  bool high = center_to_point.y < 0. ? center_to_point.x >= 0. : center_to_point.x < 0.;
+  int code = int(short(high ? (word >> 16) : (word & 0xffffu)));
+  if (code == 32767) {
+    return 1e9;
+  }
+  if (code == -32768) {
+    return -1e9;
+  }
+  return 1. + float(code) / 1024.;
+}
+
+// Approximate signed distance (positive outside) to a corner's superellipse
+// `|u.x|^n + |u.y|^n = 1`, n = 2^k, where u is `p` (from the corner's center toward its
+// outer corner) over `radii`; a negative k is the concave curve of -k, around the
+// outer corner. The value over its gradient is the distance near the curve.
+float shaped_corner_sdf(float2 p, float2 radii, float k) {
+  float2 r = max(radii, float2(1e-4));
+  if (k > 30.) {
+    return max(p.x - r.x, p.y - r.y);
+  }
+  if (k < -30.) {
+    return min(p.x, p.y);
+  }
+  float2 u = p / r;
+  float f;
+  float2 gradient;
+  if (k >= 0.) {
+    float n = exp2(min(k, 8.));
+    float2 v = max(u, float2(1e-6));
+    float s = pow(v.x, n) + pow(v.y, n);
+    f = pow(s, 1. / n) - 1.;
+    gradient = pow(v, float2(n - 1.)) * pow(s, 1. / n - 1.);
+  } else {
+    float m = exp2(min(-k, 8.));
+    float2 v = max(1. - u, float2(1e-6));
+    float s = pow(v.x, m) + pow(v.y, m);
+    f = 1. - pow(s, 1. / m);
+    gradient = pow(v, float2(m - 1.)) * pow(s, 1. / m - 1.);
+  }
+  return f / max(length(gradient / r), 1e-6);
 }
 
 // Selects corner radius based on quadrant.
