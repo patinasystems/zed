@@ -446,7 +446,12 @@ impl PlatformWindow for TestWindow {
 
     fn set_app_id(&mut self, _app_id: &str) {}
 
-    fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, background: WindowBackgroundAppearance) {
+        // A headless window's renderer clears as a real window would.
+        if let Some(renderer) = &mut self.0.lock().renderer {
+            renderer.set_transparent(background != WindowBackgroundAppearance::Opaque);
+        }
+    }
 
     fn set_edited(&mut self, edited: bool) {
         self.0.lock().edited = edited;
