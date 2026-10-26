@@ -38,5 +38,7 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+        // Image cursors are not supported here: the arrow.
+        CursorStyle::Image(_) => Shape::Default,
     }
 }

@@ -3065,6 +3065,57 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// An image registered with [`register_cursor_image`] (corresponds to
+    /// the CSS cursor value `url(…) x y`). Platforms without image cursors
+    /// show the arrow.
+    Image(CursorImageId),
+}
+
+/// A pointer image (see [`CursorStyle::Image`]): `width` x `height` RGBA8
+/// pixels, straight alpha, drawn at `scale` pixels per point, with its hot
+/// spot (the point that clicks) in points from the top left.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorImage {
+    /// Rows of RGBA8 pixels, top first.
+    pub rgba: Arc<[u8]>,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Pixels per point (2 for a Retina image).
+    pub scale: f32,
+    /// The hot spot, in points from the top left.
+    pub hotspot: Point<f32>,
+}
+
+impl CursorImage {
+    /// The image as PNG bytes (the web's `url(data:…)` cursors).
+    pub fn png(&self) -> Option<Vec<u8>> {
+        let image = image::RgbaImage::from_raw(self.width, self.height, self.rgba.to_vec())?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).ok()?;
+        Some(out.into_inner())
+    }
+}
+
+/// A registered [`CursorImage`]; see [`register_cursor_image`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct CursorImageId(pub u32);
+
+static CURSOR_IMAGES: parking_lot::RwLock<Vec<Arc<CursorImage>>> = parking_lot::RwLock::new(Vec::new());
+
+/// Registers a pointer image for the process: [`CursorStyle::Image`] with
+/// the returned id shows it. Images stay registered; register each once.
+pub fn register_cursor_image(image: CursorImage) -> CursorImageId {
+    let mut images = CURSOR_IMAGES.write();
+    images.push(Arc::new(image));
+    CursorImageId(images.len() as u32 - 1)
+}
+
+/// The image registered as `id`.
+pub fn cursor_image(id: CursorImageId) -> Option<Arc<CursorImage>> {
+    CURSOR_IMAGES.read().get(id.0 as usize).cloned()
 }
 
 /// A clipboard item that should be copied to the clipboard
@@ -3933,5 +3984,30 @@ mod tests {
     #[test]
     fn test_window_button_layout_parse_all_invalid() {
         assert!(WindowButtonLayout::parse("asdfghjkl").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cursor_image_tests {
+    use super::*;
+
+    #[test]
+    fn a_registered_cursor_image_comes_back_and_encodes_as_png() {
+        let rgba: Vec<u8> = (0..4 * 3 * 2).map(|i| (i * 7 % 256) as u8).collect();
+        let image = CursorImage { rgba: rgba.clone().into(), width: 3, height: 2, scale: 2.0, hotspot: Point::new(0.5, 1.0) };
+        let id = register_cursor_image(image.clone());
+        let other = register_cursor_image(CursorImage { width: 1, height: 1, rgba: vec![0; 4].into(), ..image.clone() });
+        assert_ne!(id, other);
+        assert_eq!(*cursor_image(id).unwrap(), image);
+        assert!(cursor_image(CursorImageId(u32::MAX)).is_none());
+        let png = image.png().expect("encodes");
+        let back = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!((back.width(), back.height()), (3, 2));
+        assert_eq!(back.into_raw(), rgba);
+        // Too few bytes for its size: no PNG.
+        assert!(CursorImage { width: 9, ..image }.png().is_none());
+        // The style round-trips.
+        let style = CursorStyle::Image(id);
+        assert_eq!(serde_json::from_str::<CursorStyle>(&serde_json::to_string(&style).unwrap()).unwrap(), style);
     }
 }
