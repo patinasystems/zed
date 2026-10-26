@@ -271,6 +271,9 @@ impl TextSystem {
                 font("Noto Sans"),    // KDE
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
+                // The platform's UI font: the only one a platform without system fonts
+                // (the web) is sure to have (`gpui_web`'s system font family).
+                font(".SystemUIFont"),
             ],
             font_generation: Arc::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
@@ -622,7 +625,23 @@ impl TextSystem {
             if let Some(font_id) = lookup_font(font) {
                 Some(font_id)
             } else {
-                let font_id = self.fallback_font_stack.iter().find_map(lookup_font);
+                let font_id = self
+                    .fallback_font_stack
+                    .iter()
+                    .find_map(&mut lookup_font)
+                    .or_else(|| {
+                        // Last resort: any family the platform has, in the requested
+                        // weight and style, so no family name fails while a font is loaded.
+                        self.platform_text_system
+                            .all_font_names()
+                            .into_iter()
+                            .find_map(|family| {
+                                lookup_font(&Font {
+                                    family: family.into(),
+                                    ..font.clone()
+                                })
+                            })
+                    });
                 if let Some(font_id) = font_id {
                     font_ids.with_upgraded(|font_ids| {
                         font_ids.insert(font.clone(), CachedFont::Fallback(font_id));
@@ -635,8 +654,9 @@ impl TextSystem {
             log::warn!("failed to load font {font:?}: {error:#}");
         }
         font_id.unwrap_or_else(|| {
+            // Only a platform with no font at all gets here.
             panic!(
-                "failed to resolve font '{}' or any of the fallbacks: {}",
+                "failed to resolve font '{}' or any of the fallbacks, or any font the platform has: {}",
                 font.family,
                 self.fallback_font_stack
                     .iter()
@@ -1543,6 +1563,63 @@ mod font_resolution_tests {
 
         text_system.fallback_font_stack.clear();
         assert_eq!(text_system.resolve_font(&requested), FontId(42));
+    }
+    /// A platform with one family, "Bundled" (as the web build has only its bundled
+    /// fonts): every other name is missing.
+    struct OneFamily(NoopTextSystem);
+
+    impl PlatformTextSystem for OneFamily {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.0.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            vec!["Bundled".into()]
+        }
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            if descriptor.family.as_ref() == "Bundled" {
+                Ok(FontId(7))
+            } else {
+                Err(anyhow::anyhow!("no family {}", descriptor.family))
+            }
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.0.font_metrics(font_id)
+        }
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.0.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.0.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.0.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.0.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.0.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.0.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(&self, font_id: FontId, font_size: Pixels) -> TextRenderingMode {
+            self.0.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    #[test]
+    fn no_family_name_fails_while_the_platform_has_a_font() {
+        let text_system = TextSystem::new(Arc::new(OneFamily(NoopTextSystem::new())));
+        for family in ["WeldSans", "", "Nope, Other", ".ZedSans", "\u{0}", "😀 emoji family"] {
+            for requested in [font(family), font(family).bold().italic()] {
+                assert_eq!(text_system.resolve_font(&requested), FontId(7), "{family:?}");
+            }
+        }
     }
 }
 
