@@ -16,6 +16,7 @@ doctest = false
 default = []
 bench-support = ["gpui/bench-support"]
 test-support = ["gpui/test-support"]
+window-capture = ["gpui/window-capture"]
 runtime_shaders = []
 font-kit = ["dep:font-kit", "dep:core-text", "dep:objc2-core-text", "dep:pathfinder_geometry"]
 

@@ -21,6 +21,7 @@ bench-support = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_wgpu/be
 font-kit = ["gpui_macos/font-kit"]
 inspector = ["gpui/inspector"]
 test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support", "gpui_wgpu/test-support"]
+window-capture = ["gpui/window-capture", "gpui_macos/window-capture"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders", "gpui_ios/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
