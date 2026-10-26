@@ -6,10 +6,11 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BlendMode, BorderStyle, Bounds,
-    CompositingGroup, ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength,
-    DevicePixels, Edges, EdgesRefinement, Filter, Font, FontFallbacks, FontFeatures, FontStyle,
-    FontWeight, GridLocation, Hsla, Length, Pixels, Point, PointRefinement, Rgba, SharedString,
-    Size, SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad, rems, size,
+    CompositingGroup, ContentMask, CornerShapes, Corners, CornersRefinement, CursorStyle,
+    DefiniteLength, DevicePixels, Edges, EdgesRefinement, Filter, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -296,6 +297,10 @@ pub struct Style {
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
+
+    /// The shape of each rounded corner (CSS `corner-shape`): the background, a
+    /// background gradient and the border follow it.
+    pub corner_shapes: CornerShapes,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
@@ -811,18 +816,26 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+            window.paint_quad_with_corner_shapes(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                ),
+                self.corner_shapes,
+            );
         }
 
         if let Some(Fill::Gradient(gradient)) = &self.background {
-            window.paint_gradient(bounds, corner_radii, gradient);
+            window.paint_gradient_with_corner_shapes(
+                bounds,
+                corner_radii,
+                self.corner_shapes,
+                gradient,
+            );
         }
 
         // Over the background color, as CSS paints a background image.
@@ -844,14 +857,17 @@ impl Style {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad_with_corner_shapes(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                ),
+                self.corner_shapes,
+            );
         }
     }
 
@@ -899,6 +915,7 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_shapes: CornerShapes::ROUND,
             box_shadow: Default::default(),
             backdrop_filter: None,
             compositing: None,

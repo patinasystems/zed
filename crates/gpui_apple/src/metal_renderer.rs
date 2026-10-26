@@ -3242,6 +3242,26 @@ mod tests {
     }
 
     #[test]
+    fn corner_shapes_render() {
+        use gpui::corner_shape_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        assert!(probes.len() > 40, "{} probes", probes.len());
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("corner_shapes_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    #[test]
     fn blend_modes_match_the_reference() {
         use gpui::blend_mode_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();
