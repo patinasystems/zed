@@ -323,20 +323,51 @@ fn system_ui_font_files() -> HashMap<String, std::path::PathBuf> {
 /// Every PostScript name in the font files Core Text makes available and in the system font
 /// directory (which also holds the hidden system fonts, such as SF Mono), with its file.
 fn available_font_files() -> HashMap<String, std::path::PathBuf> {
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("/System/Library/Fonts")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
-    let urls = unsafe { core_text::font_manager::CTFontManagerCopyAvailableFontURLs() };
-    if !urls.is_null() {
-        let urls: CFArray<core_foundation::url::CFURL> =
-            unsafe { CFArray::wrap_under_create_rule(urls) };
-        paths.extend(urls.iter().filter_map(|url| url.to_path()));
-    }
+    let mut paths = system_font_files();
+    paths.extend(available_font_paths());
     names_in_files(paths)
+}
+
+/// The files in the system font directory. macOS keeps the system fonts at its top level;
+/// iOS keeps them one level down (`Core`, `CoreUI`, `CoreAddition`, …).
+fn system_font_files() -> Vec<std::path::PathBuf> {
+    let depth = if cfg!(target_os = "macos") { 0 } else { 1 };
+    let mut paths = Vec::new();
+    let mut dirs = vec![(std::path::PathBuf::from("/System/Library/Fonts"), 0)];
+    while let Some((dir, level)) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                paths.push(path);
+            } else if path.is_dir() && level < depth {
+                dirs.push((path, level + 1));
+            }
+        }
+    }
+    paths
+}
+
+/// The files of the fonts Core Text makes available (`CTFontManagerCopyAvailableFontURLs`
+/// is macOS only).
+#[cfg(target_os = "macos")]
+fn available_font_paths() -> Vec<std::path::PathBuf> {
+    let urls = unsafe { core_text::font_manager::CTFontManagerCopyAvailableFontURLs() };
+    if urls.is_null() {
+        return Vec::new();
+    }
+    let urls: CFArray<core_foundation::url::CFURL> =
+        unsafe { CFArray::wrap_under_create_rule(urls) };
+    urls.iter().filter_map(|url| url.to_path()).collect()
+}
+
+/// The files of the fonts Core Text makes available: the descriptors of its collection of
+/// every available font.
+#[cfg(not(target_os = "macos"))]
+fn available_font_paths() -> Vec<std::path::PathBuf> {
+    core_text::font_collection::create_for_all_families()
+        .get_descriptors()
+        .map(|descriptors| descriptors.iter().filter_map(|d| d.font_path()).collect())
+        .unwrap_or_default()
 }
 
 fn names_in_files(paths: Vec<std::path::PathBuf>) -> HashMap<String, std::path::PathBuf> {
