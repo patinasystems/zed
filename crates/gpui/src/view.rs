@@ -9,6 +9,7 @@ use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
 use std::mem;
+use std::rc::Rc;
 use std::{
     any::{TypeId, type_name},
     fmt,
@@ -45,6 +46,18 @@ impl AnyView {
     /// (or [Window::refresh] is called, which ignores caching).
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
         self.into_element().cached(style)
+    }
+
+    /// Embed this view cached and isolated: [`Context::notify`] on its entity
+    /// draws it again alone, inside the frames its cached ancestors reuse. See
+    /// [`ViewElement::isolated`].
+    pub fn isolated(self, style: StyleRefinement) -> ViewElement<AnyView> {
+        let view = self.clone();
+        self.into_element()
+            .cached(style)
+            .isolated(Rc::new(move |window, cx| {
+                render_view(view.clone(), window, cx)
+            }))
     }
 
     /// Convert this to a weak handle.
@@ -258,6 +271,19 @@ impl<T: Render> Entity<T> {
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
         ViewElement::with_type_name(self, type_name::<T>()).cached(style)
     }
+
+    /// Embed this entity cached and isolated: [`Context::notify`] on it draws
+    /// it again alone, inside the frames its cached ancestors reuse. See
+    /// [`ViewElement::isolated`].
+    #[track_caller]
+    pub fn isolated(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
+        let view = self.clone();
+        ViewElement::with_type_name(self, type_name::<T>())
+            .cached(style)
+            .isolated(Rc::new(move |window, cx| {
+                render_view(view.clone(), window, cx)
+            }))
+    }
 }
 
 /// The element type for [`View`] implementations. Wraps a `View` and hooks it
@@ -267,6 +293,8 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    /// Renders the view again on its own (see [`ViewElement::isolated`]).
+    island: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
     #[cfg(debug_assertions)]
@@ -289,6 +317,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            island: None,
             #[cfg(feature = "profiler")]
             view_type_name,
             view: Some(view),
@@ -310,6 +339,45 @@ impl<V: View> ViewElement<V> {
         self.cached_style = Some(style);
         self
     }
+
+    /// Isolate this cached view: a [`Context::notify`] on its entity marks
+    /// only it dirty, not its ancestors. Its cached ancestors reuse their
+    /// previous frames around it and draw it again alone, in the bounds,
+    /// content mask, transformation, opacity and text style it was last drawn
+    /// with, at the same place in paint order, hit testing and the dispatch
+    /// tree. So its layout box must not depend on its contents (it is laid out
+    /// from the cached style); a change that moves or resizes it notifies an
+    /// ancestor, which draws it again as usual. Inside a deferred draw it is
+    /// not isolated. `render` renders the view again on its own.
+    ///
+    /// Views that redraw often inside a large, mostly static tree (a canvas
+    /// inside application chrome) use it so their frames do not rebuild the
+    /// tree around them; with [`Window::set_root_cached`] the root is reused
+    /// too.
+    pub(crate) fn isolated(
+        mut self,
+        render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+    ) -> Self {
+        self.island = Some(render);
+        self
+    }
+}
+
+/// An isolated view drawn again inside a reused cached ancestor (see
+/// [`ViewElement::isolated`]): where it was, its dispatch node now, and what
+/// it rendered.
+pub(crate) struct Splice {
+    island: crate::window::Island,
+    node: Option<crate::DispatchNodeId>,
+    element: Option<AnyElement>,
+}
+
+/// What a view element's prepaint leaves for its paint: the rendered
+/// element (drawn), or the isolated views drawn again in a reused frame.
+#[doc(hidden)]
+pub struct ViewPrepaint {
+    element: Option<AnyElement>,
+    splices: Vec<Splice>,
 }
 
 impl<V: View> IntoElement for ViewElement<V> {
@@ -356,7 +424,7 @@ fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElemen
 
 impl<V: View> Element for ViewElement<V> {
     type RequestLayoutState = Option<AnyElement>;
-    type PrepaintState = Option<AnyElement>;
+    type PrepaintState = ViewPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         self.entity_id.map(ElementId::View)
@@ -412,7 +480,7 @@ impl<V: View> Element for ViewElement<V> {
         element: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<AnyElement> {
+    ) -> ViewPrepaint {
         if let Some(entity_id) = self.entity_id {
             // Stateful path.
             #[cfg(feature = "profiler")]
@@ -422,6 +490,7 @@ impl<V: View> Element for ViewElement<V> {
                 global_id,
                 bounds,
                 element,
+                self.island.as_ref(),
                 window,
                 cx,
                 &mut |window, cx| render_view(self.view.take().unwrap(), window, cx),
@@ -435,7 +504,10 @@ impl<V: View> Element for ViewElement<V> {
             prepainted
         } else {
             // Stateless path: just prepaint the element.
-            prepaint_component(type_name::<V>(), element, window, cx)
+            ViewPrepaint {
+                element: prepaint_component(type_name::<V>(), element, window, cx),
+                splices: Vec::new(),
+            }
         }
     }
 
@@ -456,6 +528,7 @@ impl<V: View> Element for ViewElement<V> {
             paint_view(
                 entity_id,
                 self.cached_style.is_some(),
+                self.island.is_some(),
                 global_id,
                 element,
                 window,
@@ -469,7 +542,7 @@ impl<V: View> Element for ViewElement<V> {
             );
         } else {
             // Stateless path: just paint the element.
-            paint_component(std::any::type_name::<V>(), element, window, cx);
+            paint_component(std::any::type_name::<V>(), &mut element.element, window, cx);
         }
     }
 }
@@ -524,23 +597,40 @@ fn request_layout_component(
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn prepaint_view(
     entity_id: EntityId,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
+    island: Option<&Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     window: &mut Window,
     cx: &mut App,
     render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
-) -> Option<AnyElement> {
+) -> ViewPrepaint {
     window.set_view_id(entity_id);
     window.with_rendered_view(entity_id, |window| {
         if let Some(mut element) = element.take() {
+            let prepaint_start = window.prepaint_index();
             element.prepaint(window, cx);
-            return Some(element);
+            if let Some(render) = island {
+                let range = prepaint_start..window.prepaint_index();
+                let record = window.island_here(
+                    entity_id,
+                    render.clone(),
+                    global_id.unwrap().clone(),
+                    bounds,
+                    range,
+                );
+                window.push_island(record);
+            }
+            return ViewPrepaint {
+                element: Some(element),
+                splices: Vec::new(),
+            };
         }
 
-        window.with_element_state::<ViewElementState, _>(
+        let (element, splices, range) = window.with_element_state::<ViewElementState, _>(
             global_id.unwrap(),
             |element_state, window| {
                 let content_mask = window.content_mask();
@@ -556,13 +646,17 @@ fn prepaint_view(
                     && !window.refreshing
                 {
                     let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
+                    let splices = reuse_prepaint_around_islands(
+                        element_state.prepaint_range.clone(),
+                        window,
+                        cx,
+                    );
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
-                    element_state.prepaint_range = prepaint_start..prepaint_end;
+                    element_state.prepaint_range = prepaint_start.clone()..prepaint_end.clone();
 
-                    return (None, element_state);
+                    return ((None, splices, prepaint_start..prepaint_end), element_state);
                 }
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
@@ -578,7 +672,11 @@ fn prepaint_view(
                 window.refreshing = refreshing;
 
                 (
-                    Some(element),
+                    (
+                        Some(element),
+                        Vec::new(),
+                        prepaint_start.clone()..prepaint_end.clone(),
+                    ),
                     ViewElementState {
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
@@ -592,8 +690,70 @@ fn prepaint_view(
                     },
                 )
             },
-        )
+        );
+        // An isolated view records where it drew, unless its whole frame was
+        // reused (the reuse carried its record over).
+        if let Some(render) = island
+            && (element.is_some() || !window.has_island(global_id.unwrap()))
+        {
+            let record = window.island_here(
+                entity_id,
+                render.clone(),
+                global_id.unwrap().clone(),
+                bounds,
+                range,
+            );
+            window.push_island(record);
+        }
+        ViewPrepaint { element, splices }
     })
+}
+
+/// Reuse the previous frame's prepaint `range` of a cached view, drawing the
+/// isolated views inside it that were notified again in place (see
+/// [`ViewElement::isolated`]).
+fn reuse_prepaint_around_islands(
+    range: Range<PrepaintStateIndex>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<Splice> {
+    let islands = window.dirty_islands_within(&range);
+    if islands.is_empty() {
+        window.reuse_prepaint(range);
+        return Vec::new();
+    }
+    let mut cursor = crate::key_dispatch::ReuseCursor::default();
+    let mut at = range.start.clone();
+    let mut splices = Vec::with_capacity(islands.len());
+    for island in islands {
+        window.reuse_prepaint_segment(&mut cursor, at..island.prepaint_range.start.clone());
+        let old_node = window.island_parent_node(&island);
+        window.reuse_close_until(&mut cursor, old_node);
+        let node = old_node.map(|n| cursor.refresh_node_id(n));
+        let element = window.with_island_state(&island, |window| {
+            let mut none = None;
+            prepaint_view(
+                island.view_id,
+                Some(&island.global_id),
+                island.bounds,
+                &mut none,
+                Some(&island.render),
+                window,
+                cx,
+                &mut |window, cx| (island.render)(window, cx),
+            )
+            .element
+        });
+        at = island.prepaint_range.end.clone();
+        splices.push(Splice {
+            island,
+            node,
+            element,
+        });
+    }
+    window.reuse_prepaint_segment(&mut cursor, at..range.end);
+    window.finish_reuse_prepaint(cursor);
+    splices
 }
 
 #[inline(never)]
@@ -610,16 +770,19 @@ fn prepaint_component(
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn paint_view(
     entity_id: EntityId,
     cached: bool,
+    isolated: bool,
     global_id: Option<&GlobalElementId>,
-    element: &mut Option<AnyElement>,
+    prepaint: &mut ViewPrepaint,
     window: &mut Window,
     cx: &mut App,
 ) {
     window.with_rendered_view(entity_id, |window| {
         let caching_disabled = window.is_inspector_picking(cx);
+        let paint_start = window.paint_index();
         if cached && !caching_disabled {
             window.with_element_state::<ViewElementState, _>(
                 global_id.unwrap(),
@@ -628,12 +791,38 @@ fn paint_view(
 
                     let paint_start = window.paint_index();
 
-                    if let Some(element) = element {
+                    if let Some(element) = prepaint.element.as_mut() {
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         element.paint(window, cx);
                         window.refreshing = refreshing;
                     } else {
-                        window.reuse_paint(element_state.paint_range.clone());
+                        // Reused, with the isolated views drawn again in their places.
+                        let mut at = element_state.paint_range.start.clone();
+                        for splice in prepaint.splices.iter_mut() {
+                            window.reuse_paint(at..splice.island.paint_range.start.clone());
+                            if let Some(node) = splice.node {
+                                window.next_frame.dispatch_tree.set_active_node(node);
+                            }
+                            let island = &splice.island;
+                            let element = &mut splice.element;
+                            window.with_island_state(island, |window| {
+                                let mut drawn = ViewPrepaint {
+                                    element: element.take(),
+                                    splices: Vec::new(),
+                                };
+                                paint_view(
+                                    island.view_id,
+                                    true,
+                                    true,
+                                    Some(&island.global_id),
+                                    &mut drawn,
+                                    window,
+                                    cx,
+                                );
+                            });
+                            at = splice.island.paint_range.end.clone();
+                        }
+                        window.reuse_paint(at..element_state.paint_range.end.clone());
                     }
 
                     let paint_end = window.paint_index();
@@ -643,7 +832,14 @@ fn paint_view(
                 },
             )
         } else {
-            element.as_mut().unwrap().paint(window, cx);
+            prepaint.element.as_mut().unwrap().paint(window, cx);
+        }
+        if isolated {
+            let range = paint_start..window.paint_index();
+            let opacity = window.element_opacity;
+            if let Some(global_id) = global_id {
+                window.note_island_paint(global_id, range, opacity);
+            }
         }
     });
 }
@@ -658,4 +854,377 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use crate::{
+        Context, Entity, Hsla, Modifiers, StyleRefinement, TestAppContext, VisualTestContext,
+        Window, div, point, prelude::*, px, rgb, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    /// A canvas that redraws often: an isolated view.
+    struct Canvas {
+        renders: Rc<Cell<usize>>,
+        color: Hsla,
+    }
+
+    impl Render for Canvas {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .id("canvas")
+                .debug_selector(|| "CANVAS".into())
+                .size_full()
+                .bg(self.color)
+                .child(
+                    div()
+                        .id("canvas-dot")
+                        .debug_selector(|| "DOT".into())
+                        .size(px(10.)),
+                )
+        }
+    }
+
+    /// Chrome around it: panels, a button after the canvas in paint order,
+    /// and an overlay above it.
+    struct Chrome {
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+        canvas: Entity<Canvas>,
+    }
+
+    impl Render for Chrome {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            div()
+                .key_context("Chrome")
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .w(px(100.))
+                        .h_full()
+                        .bg(rgb(0x202020))
+                        .debug_selector(|| "LEFT".into()),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w(px(300.))
+                        .h(px(300.))
+                        .child(
+                            self.canvas
+                                .clone()
+                                .isolated(StyleRefinement::default().size_full()),
+                        )
+                        .child(
+                            div()
+                                .id("overlay")
+                                .absolute()
+                                .top(px(10.))
+                                .left(px(10.))
+                                .size(px(40.))
+                                .bg(rgb(0x00ff00))
+                                .debug_selector(|| "OVERLAY".into())
+                                .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("right")
+                        .w(px(80.))
+                        .h_full()
+                        .debug_selector(|| "RIGHT".into()),
+                )
+        }
+    }
+
+    fn quad_colors(cx: &mut VisualTestContext) -> Vec<Hsla> {
+        cx.update(|window, _| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|q| q.background.solid)
+                .collect()
+        })
+    }
+
+    fn bounds(cx: &mut VisualTestContext, selector: &str) -> Option<crate::Bounds<crate::Pixels>> {
+        cx.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
+    }
+
+    #[gpui::test]
+    fn an_isolated_view_redraws_alone_inside_its_reused_ancestors(cx: &mut TestAppContext) {
+        let (chrome_renders, canvas_renders, clicks) = (
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        let (chrome, cx) = cx.add_window_view(|_, cx| {
+            let canvas = cx.new(|_| Canvas {
+                renders: canvas_renders.clone(),
+                color: rgb(0x0000ff).into(),
+            });
+            Chrome {
+                renders: chrome_renders.clone(),
+                clicks: clicks.clone(),
+                canvas,
+            }
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let (r0, c0) = (chrome_renders.get(), canvas_renders.get());
+        let before = (
+            bounds(cx, "LEFT"),
+            bounds(cx, "CANVAS"),
+            bounds(cx, "OVERLAY"),
+            bounds(cx, "RIGHT"),
+        );
+        assert!(before.1.is_some() && before.2.is_some());
+        let canvas = chrome.update(cx, |c, _| c.canvas.clone());
+        let canvas_id = canvas.entity_id();
+
+        for (k, color) in [0xff0000u32, 0x00ffff, 0xffff00].into_iter().enumerate() {
+            canvas.update(cx, |c, cx| {
+                c.color = rgb(color).into();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(chrome_renders.get(), r0, "the chrome is reused");
+            assert_eq!(canvas_renders.get(), c0 + k + 1, "the canvas draws again");
+            let colors = quad_colors(cx);
+            let new: Hsla = rgb(color).into();
+            let green: Hsla = rgb(0x00ff00).into();
+            let at = |c: Hsla| colors.iter().position(|x| *x == c);
+            assert!(at(new).is_some(), "the canvas's new color is painted");
+            assert!(at(new) < at(green), "under the overlay, as before");
+            assert_eq!(colors.iter().filter(|c| **c == new).count(), 1, "once");
+            assert_eq!(
+                (
+                    bounds(cx, "LEFT"),
+                    bounds(cx, "CANVAS"),
+                    bounds(cx, "OVERLAY"),
+                    bounds(cx, "RIGHT")
+                ),
+                before
+            );
+            assert!(bounds(cx, "DOT").is_some());
+            // The dispatch tree keeps the canvas under the chrome.
+            let path: Vec<_> = cx.update(|window, _| {
+                window
+                    .rendered_frame
+                    .dispatch_tree
+                    .view_path_reversed(canvas_id)
+                    .collect()
+            });
+            assert_eq!(path.len(), 2, "canvas, then chrome: {path:?}");
+        }
+        // Listeners after the canvas in the frame still fire (reused around it).
+        let overlay = before.2.unwrap();
+        cx.simulate_click(overlay.center(), Modifiers::default());
+        assert_eq!(clicks.get(), 1);
+
+        // The chrome notified: it renders (and the canvas with it, as any
+        // cached view inside a view that renders).
+        let r1 = chrome_renders.get();
+        chrome.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(chrome_renders.get(), r1 + 1);
+        // And the canvas again alone, from records made in that frame.
+        let c1 = canvas_renders.get();
+        canvas.update(cx, |c, cx| {
+            c.color = rgb(0x123456).into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            (chrome_renders.get(), canvas_renders.get()),
+            (r1 + 1, c1 + 1)
+        );
+        assert!(quad_colors(cx).contains(&rgb(0x123456).into()));
+        cx.simulate_click(overlay.center(), Modifiers::default());
+        assert_eq!(clicks.get(), 2);
+    }
+
+    use crate as gpui;
+    gpui::actions!(isolation_test, [Ping]);
+
+    /// A canvas with a focused element, a varying number of children (so its
+    /// dispatch nodes change count between frames), under chrome that handles
+    /// an action and opens a deferred popover after it.
+    struct Focused {
+        focus: crate::FocusHandle,
+        children: usize,
+    }
+
+    impl Render for Focused {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("focused-canvas")
+                .key_context("Canvas")
+                .track_focus(&self.focus)
+                .size_full()
+                .children(
+                    (0..self.children)
+                        .map(|i| div().id(("kid", i)).key_context("Kid").size(px(4.))),
+                )
+        }
+    }
+
+    struct ActionChrome {
+        canvas: Entity<Focused>,
+        pings: Rc<Cell<usize>>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for ActionChrome {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let pings = self.pings.clone();
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .key_context("Chrome")
+                .on_action(move |_: &Ping, _, _| pings.set(pings.get() + 1))
+                .size_full()
+                .child(
+                    div().size(px(200.)).child(
+                        self.canvas
+                            .clone()
+                            .isolated(StyleRefinement::default().size_full()),
+                    ),
+                )
+                .child(crate::deferred(
+                    crate::anchored().position(point(px(300.), px(10.))).child(
+                        div()
+                            .key_context("Popover")
+                            .debug_selector(|| "POPOVER".into())
+                            .size(px(30.)),
+                    ),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn actions_focus_and_deferred_draws_survive_isolated_redraws(cx: &mut TestAppContext) {
+        let (pings, renders) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (chrome, cx) = cx.add_window_view(|_, cx| {
+            let canvas = cx.new(|cx| Focused {
+                focus: cx.focus_handle(),
+                children: 1,
+            });
+            ActionChrome {
+                canvas,
+                pings: pings.clone(),
+                renders: renders.clone(),
+            }
+        });
+        cx.update(|window, _| window.set_root_cached(true));
+        let canvas = chrome.update(cx, |c, _| c.canvas.clone());
+        cx.update(|window, cx| window.focus(&canvas.read(cx).focus.clone(), cx));
+        cx.run_until_parked();
+        let r0 = renders.get();
+        for n in [5usize, 0, 3, 9, 2] {
+            canvas.update(cx, |c, cx| {
+                c.children = n;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(renders.get(), r0, "the chrome is reused");
+            let focused = cx.update(|window, cx| canvas.read(cx).focus.is_focused(window));
+            assert!(focused, "focus stays in the redrawn canvas");
+            let before = pings.get();
+            cx.dispatch_action(Ping);
+            assert_eq!(
+                pings.get(),
+                before + 1,
+                "the chrome's action handler is still on the focus path"
+            );
+            let popover =
+                cx.update(|window, _| window.rendered_frame.debug_bounds.get("POPOVER").copied());
+            assert!(
+                popover.is_some(),
+                "the deferred popover after the canvas is drawn"
+            );
+        }
+    }
+
+    /// A view drawn at two places (one isolated, one not) is not isolated:
+    /// its notify renders the ancestors, so both mounts draw it again.
+    #[gpui::test]
+    fn a_view_mounted_twice_is_not_isolated(cx: &mut TestAppContext) {
+        struct Twice {
+            renders: Rc<Cell<usize>>,
+            canvas: Entity<Canvas>,
+        }
+        impl Render for Twice {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div()
+                    .size_full()
+                    .child(div().size(px(50.)).child(self.canvas.clone().isolated(StyleRefinement::default().size_full())))
+                    .child(div().size(px(50.)).child(self.canvas.clone().cached(StyleRefinement::default().size_full())))
+            }
+        }
+        let renders = Rc::new(Cell::new(0));
+        let (root, cx) = cx.add_window_view(|_, cx| Twice {
+            renders: renders.clone(),
+            canvas: cx.new(|_| Canvas { renders: Rc::default(), color: rgb(0x0000ff).into() }),
+        });
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let r0 = renders.get();
+        let canvas = root.update(cx, |r, _| r.canvas.clone());
+        canvas.update(cx, |c, cx| {
+            c.color = rgb(0xff0000).into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(renders.get(), r0 + 1, "the root renders");
+        let red: Hsla = rgb(0xff0000).into();
+        assert_eq!(quad_colors(cx).iter().filter(|c| **c == red).count(), 2, "both mounts show the change");
+    }
+
+    /// Without isolation (and by default), a notify re-renders the ancestors.
+    #[gpui::test]
+    fn a_cached_view_s_notify_still_renders_its_ancestors(cx: &mut TestAppContext) {
+        struct Root {
+            renders: Rc<Cell<usize>>,
+            child: Entity<Canvas>,
+        }
+        impl Render for Root {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div().size_full().child(
+                    self.child
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                )
+            }
+        }
+        let renders = Rc::new(Cell::new(0));
+        let (root, cx) = cx.add_window_view(|_, cx| Root {
+            renders: renders.clone(),
+            child: cx.new(|_| Canvas {
+                renders: Rc::default(),
+                color: rgb(0).into(),
+            }),
+        });
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let r0 = renders.get();
+        let child = root.update(cx, |r, _| r.child.clone());
+        child.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(renders.get(), r0 + 1);
+        let _ = point(px(0.), px(0.));
+    }
 }
