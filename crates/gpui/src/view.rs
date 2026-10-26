@@ -350,6 +350,11 @@ impl<V: View> ViewElement<V> {
     /// ancestor, which draws it again as usual. Inside a deferred draw it is
     /// not isolated. `render` renders the view again on its own.
     ///
+    /// What it paints outside its box (overflow, shadows, deferred children
+    /// excepted) is clipped by the content mask it was last drawn with and
+    /// placed in paint order where it was: an ancestor that would clip or
+    /// order it differently draws it again when it renders.
+    ///
     /// Views that redraw often inside a large, mostly static tree (a canvas
     /// inside application chrome) use it so their frames do not rebuild the
     /// tree around them; with [`Window::set_root_cached`] the root is reused
@@ -1187,6 +1192,145 @@ mod isolation_tests {
         assert_eq!(renders.get(), r0 + 1, "the root renders");
         let red: Hsla = rgb(0xff0000).into();
         assert_eq!(quad_colors(cx).iter().filter(|c| **c == red).count(), 2, "both mounts show the change");
+    }
+
+    /// A text field in the chrome: its input handler is painted each frame.
+    struct Field {
+        focus: crate::FocusHandle,
+        text: String,
+    }
+
+    impl Render for Field {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let (view, focus) = (cx.entity(), self.focus.clone());
+            div().track_focus(&self.focus).size(px(80.)).child(
+                crate::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| window.handle_input(&focus, crate::ElementInputHandler::new(bounds, view), cx),
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    impl crate::EntityInputHandler for Field {
+        fn text_for_range(&mut self, _: std::ops::Range<usize>, _: &mut Option<std::ops::Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
+            Some(self.text.clone())
+        }
+        fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<crate::UTF16Selection> {
+            let n = self.text.encode_utf16().count();
+            Some(crate::UTF16Selection { range: n..n, reversed: false })
+        }
+        fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+            None
+        }
+        fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+        fn replace_text_in_range(&mut self, _: Option<std::ops::Range<usize>>, text: &str, _: &mut Window, _: &mut Context<Self>) {
+            self.text.push_str(text);
+        }
+        fn replace_and_mark_text_in_range(&mut self, _: Option<std::ops::Range<usize>>, _: &str, _: Option<std::ops::Range<usize>>, _: &mut Window, _: &mut Context<Self>) {}
+        fn bounds_for_range(&mut self, _: std::ops::Range<usize>, bounds: crate::Bounds<crate::Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<crate::Bounds<crate::Pixels>> {
+            Some(bounds)
+        }
+        fn character_index_for_point(&mut self, _: crate::Point<crate::Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+            None
+        }
+    }
+
+    struct Tip;
+
+    impl Render for Tip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().debug_selector(|| "TIP".into()).size(px(20.))
+        }
+    }
+
+    /// A canvas with its own deferred menu, redrawn alone.
+    struct MenuCanvas {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for MenuCanvas {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().id("menu-canvas").debug_selector(|| "CANVAS_AREA".into()).size_full().cursor(crate::CursorStyle::Crosshair).child(crate::deferred(
+                crate::anchored()
+                    .position(point(px(5.), px(5.)))
+                    .child(div().debug_selector(|| "CANVAS_MENU".into()).size(px(15.))),
+            ))
+        }
+    }
+
+    struct RichChrome {
+        renders: Rc<Cell<usize>>,
+        field: Entity<Field>,
+        canvas: Entity<MenuCanvas>,
+    }
+
+    impl Render for RichChrome {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .child(self.field.clone())
+                .child(div().id("link").size(px(40.)).cursor_pointer().debug_selector(|| "LINK".into()))
+                .child(
+                    div()
+                        .id("tip-target")
+                        .size(px(40.))
+                        .debug_selector(|| "TIP_TARGET".into())
+                        .tooltip(|_, cx| cx.new(|_| Tip).into()),
+                )
+                .child(div().size(px(200.)).child(self.canvas.clone().isolated(StyleRefinement::default().size_full())))
+        }
+    }
+
+    /// While the canvas redraws alone, the chrome's text field keeps its
+    /// input handler, its hitboxes their cursors, a shown tooltip stays, and
+    /// the canvas's own deferred menu draws.
+    #[gpui::test]
+    fn input_cursors_tooltips_and_deferred_children_survive_isolated_redraws(cx: &mut TestAppContext) {
+        let (chrome_renders, canvas_renders) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (chrome, cx) = cx.add_window_view(|_, cx| RichChrome {
+            renders: chrome_renders.clone(),
+            field: cx.new(|cx| Field { focus: cx.focus_handle(), text: String::new() }),
+            canvas: cx.new(|_| MenuCanvas { renders: canvas_renders.clone() }),
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.update(|window, _| window.set_root_cached(true));
+        let (field, canvas) = chrome.update(cx, |c, _| (c.field.clone(), c.canvas.clone()));
+        cx.update(|window, cx| window.focus(&field.read(cx).focus.clone(), cx));
+        cx.run_until_parked();
+        // Show the tooltip.
+        let tip_target = bounds(cx, "TIP_TARGET").unwrap();
+        cx.simulate_mouse_move(tip_target.center(), None, Modifiers::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(bounds(cx, "TIP").is_some(), "the tooltip shows");
+        let r0 = chrome_renders.get();
+        for k in 0..3 {
+            let c0 = canvas_renders.get();
+            canvas.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(canvas_renders.get(), c0 + 1, "round {k}: the canvas redraws");
+            assert_eq!(chrome_renders.get(), r0, "round {k}: the chrome is reused");
+            assert!(bounds(cx, "TIP").is_some(), "round {k}: the tooltip stays");
+            assert!(bounds(cx, "CANVAS_MENU").is_some(), "round {k}: the canvas's deferred menu draws");
+        }
+        // The field's input handler (painted in the reused chrome frame).
+        cx.simulate_input("hi");
+        assert_eq!(field.read_with(cx, |f, _| f.text.clone()), "hi");
+        // Cursors: the chrome's link (reused hitbox) and the redrawn canvas.
+        let link = bounds(cx, "LINK").unwrap();
+        cx.simulate_mouse_move(link.center(), None, Modifiers::default());
+        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::PointingHand));
+        let area = bounds(cx, "CANVAS_AREA").unwrap();
+        cx.simulate_mouse_move(point(area.center().x, area.origin.y + area.size.height - px(10.)), None, Modifiers::default());
+        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::Crosshair));
+        canvas.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::Crosshair));
     }
 
     /// Without isolation (and by default), a notify re-renders the ancestors.

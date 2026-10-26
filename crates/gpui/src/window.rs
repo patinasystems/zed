@@ -2481,11 +2481,16 @@ impl Window {
 
     /// Draw the root view cached: a frame where only isolated views changed
     /// (see [`crate::ViewElement::isolated`]) reuses the root's and draws them
-    /// again alone. Off by default: the root renders every frame.
+    /// again alone. Off by default: the root renders every frame. A change
+    /// takes effect at the next frame (the root renders then: its element
+    /// changed); outside a draw it schedules that frame, and while rendering it
+    /// does not (a view can set it as it renders without an extra frame).
     pub fn set_root_cached(&mut self, cached: bool) {
         if self.root_cached != cached {
             self.root_cached = cached;
-            self.refresh();
+            if self.invalidator.not_drawing() {
+                self.refresh();
+            }
         }
     }
 
