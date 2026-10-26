@@ -1530,6 +1530,13 @@ pub trait PlatformTextSystem: Send + Sync {
     fn all_font_names(&self) -> Vec<String>;
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// The font whose PostScript name (OpenType `name` ID 6) is `postscript_name`, if the
+    /// platform has it. Unlike [`Self::font_id`], this reaches faces that family matching
+    /// skips or cannot name: fallback fonts, color emoji fonts and the named instances of
+    /// variable fonts. Text shaped outside GPUI paints through it with the shaper's glyph ids.
+    fn font_id_for_postscript_name(&self, _postscript_name: &str) -> Option<FontId> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.

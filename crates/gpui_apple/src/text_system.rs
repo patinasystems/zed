@@ -76,6 +76,12 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// The PostScript names in the system UI font's files and its cascade's, with their file,
+    /// read on the first lookup Core Text cannot answer by name.
+    system_ui_font_files: Option<HashMap<String, std::path::PathBuf>>,
+    /// The same for every font file Core Text makes available, read on the first lookup the
+    /// UI fonts cannot answer.
+    available_font_files: Option<HashMap<String, std::path::PathBuf>>,
 }
 
 impl AppleTextSystem {
@@ -89,6 +95,8 @@ impl AppleTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            system_ui_font_files: None,
+            available_font_files: None,
         }))
     }
 }
@@ -187,6 +195,18 @@ impl PlatformTextSystem for AppleTextSystem {
         }
     }
 
+    fn font_id_for_postscript_name(&self, postscript_name: &str) -> Option<FontId> {
+        if let Some(font_id) = self
+            .0
+            .read()
+            .font_ids_by_postscript_name
+            .get(postscript_name)
+        {
+            return Some(*font_id);
+        }
+        self.0.write().font_id_for_postscript_name(postscript_name)
+    }
+
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         font_kit_metrics_to_metrics(self.0.read().fonts[font_id.0].metrics())
     }
@@ -242,6 +262,105 @@ impl PlatformTextSystem for AppleTextSystem {
         let level = ((4.0 * luminance) + 0.5).floor() as i32;
         level.clamp(0, 4) as u8
     }
+}
+
+unsafe extern "C" {
+    fn CTFontCopyDefaultCascadeListForLanguages(
+        font: core_text::font::CTFontRef,
+        language_pref_list: core_foundation::array::CFArrayRef,
+    ) -> CFArrayRef;
+}
+
+/// The faces in a font file, as Core Text reads them (one per named instance of a variable font).
+fn file_descriptors(path: &std::path::Path) -> Vec<CTFontDescriptor> {
+    let Some(url) = core_foundation::url::CFURL::from_path(path, false) else {
+        return Vec::new();
+    };
+    let array = unsafe {
+        core_text::font_manager::CTFontManagerCreateFontDescriptorsFromURL(
+            url.as_concrete_TypeRef(),
+        )
+    };
+    if array.is_null() {
+        return Vec::new();
+    }
+    let array: CFArray<CTFontDescriptor> = unsafe { CFArray::wrap_under_create_rule(array) };
+    array.iter().map(|descriptor| descriptor.clone()).collect()
+}
+
+/// Every PostScript name in the files of the system UI font and of the fonts its cascade lists
+/// for the languages with their own fallbacks (CJK), with the file it is in.
+fn system_ui_font_files() -> HashMap<String, std::path::PathBuf> {
+    let ui = core_text::font::new_ui_font_for_language(
+        core_text::font::kCTFontSystemFontType,
+        12.,
+        None,
+    );
+    let mut paths = Vec::new();
+    paths.extend(ui.copy_descriptor().font_path());
+    for language in ["en", "ja", "zh-Hans", "zh-Hant", "zh-HK", "ko"] {
+        let languages = CFArray::from_CFTypes(&[CFString::new(language)]);
+        let cascade = unsafe {
+            CTFontCopyDefaultCascadeListForLanguages(
+                ui.as_concrete_TypeRef(),
+                languages.as_concrete_TypeRef(),
+            )
+        };
+        if cascade.is_null() {
+            continue;
+        }
+        let cascade: CFArray<CTFontDescriptor> =
+            unsafe { CFArray::wrap_under_create_rule(cascade) };
+        for descriptor in cascade.iter() {
+            // Cascade entries can be aliases (`.AppleJapaneseFont`): the font they open has the file.
+            let font = core_text::font::new_from_descriptor(&descriptor, 12.);
+            paths.extend(font.copy_descriptor().font_path());
+        }
+    }
+    names_in_files(paths)
+}
+
+/// Every PostScript name in the font files Core Text makes available and in the system font
+/// directory (which also holds the hidden system fonts, such as SF Mono), with its file.
+fn available_font_files() -> HashMap<String, std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("/System/Library/Fonts")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    let urls = unsafe { core_text::font_manager::CTFontManagerCopyAvailableFontURLs() };
+    if !urls.is_null() {
+        let urls: CFArray<core_foundation::url::CFURL> =
+            unsafe { CFArray::wrap_under_create_rule(urls) };
+        paths.extend(urls.iter().filter_map(|url| url.to_path()));
+    }
+    names_in_files(paths)
+}
+
+fn names_in_files(paths: Vec<std::path::PathBuf>) -> HashMap<String, std::path::PathBuf> {
+    let mut names = HashMap::default();
+    let mut seen = HashSet::default();
+    for path in paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        for descriptor in file_descriptors(&path) {
+            names
+                .entry(descriptor.font_name())
+                .or_insert_with(|| path.clone());
+        }
+    }
+    names
+}
+
+/// The face named `postscript_name` in the font file at `path`.
+fn font_from_file(path: &std::path::Path, postscript_name: &str) -> Option<CTFont> {
+    file_descriptors(path)
+        .into_iter()
+        .find(|descriptor| descriptor.font_name() == postscript_name)
+        .map(|descriptor| core_text::font::new_from_descriptor(&descriptor, 12.))
 }
 
 #[cfg(target_os = "macos")]
@@ -406,6 +525,50 @@ impl AppleTextSystemState {
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
+    }
+
+    fn font_id_for_postscript_name(&mut self, postscript_name: &str) -> Option<FontId> {
+        if let Some(font_id) = self.font_ids_by_postscript_name.get(postscript_name) {
+            return Some(*font_id);
+        }
+        // Fonts added with `add_fonts` are not registered with Core Text, so look there first.
+        if let Ok(handle) = self
+            .memory_source
+            .select_by_postscript_name(postscript_name)
+        {
+            let font = handle.load().ok()?;
+            let font_id = FontId(self.fonts.len());
+            self.font_ids_by_postscript_name
+                .insert(postscript_name.to_string(), font_id);
+            self.postscript_names_by_font_id
+                .insert(font_id, postscript_name.to_string());
+            self.fonts.push(font);
+            return Some(font_id);
+        }
+        // Core Text substitutes another font for a name it does not know: check the name.
+        if let Ok(font) = core_text::font::new_from_name(postscript_name, 12.)
+            && font.postscript_name() == postscript_name
+        {
+            return Some(self.id_for_native_font(font));
+        }
+        // Core Text opens the system UI fonts (their names start with a period) only through
+        // the UI font APIs or their files, so look in the files of the UI font and its cascade.
+        let mut path = self
+            .system_ui_font_files
+            .get_or_insert_with(system_ui_font_files)
+            .get(postscript_name)
+            .cloned();
+        if path.is_none() {
+            // Other hidden system fonts (`.SFNSMono-Regular`, the system monospaced font):
+            // every font file Core Text makes available, read once.
+            path = self
+                .available_font_files
+                .get_or_insert_with(available_font_files)
+                .get(postscript_name)
+                .cloned();
+        }
+        let font = font_from_file(&path?, postscript_name)?;
+        Some(self.id_for_native_font(font))
     }
 
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
@@ -884,6 +1047,69 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_font_id_for_postscript_name() {
+        use gpui::{Font, FontWeight};
+        let fonts = AppleTextSystem::new();
+        // A family's face resolves to the id family matching gave it.
+        let helvetica = fonts.font_id(&font("Helvetica")).unwrap();
+        assert_eq!(
+            fonts.font_id_for_postscript_name("Helvetica"),
+            Some(helvetica)
+        );
+        // A named instance of the variable system font is that instance: its advances match
+        // the face CSS weight matching picks.
+        let bold = fonts.font_id_for_postscript_name(".SFNS-Bold").unwrap();
+        let matched = fonts
+            .font_id(&Font {
+                weight: FontWeight::BOLD,
+                ..font(".SystemUIFont")
+            })
+            .unwrap();
+        let regular = fonts.font_id_for_postscript_name(".SFNS-Regular").unwrap();
+        let h = fonts.glyph_for_char(bold, 'H').unwrap();
+        let advance = |id| fonts.advance(id, h).unwrap().width;
+        assert_eq!(advance(bold), advance(matched));
+        assert!(advance(bold) > advance(regular));
+        // Faces family matching skips (no 'm' glyph) are reachable by name.
+        let emoji = fonts
+            .font_id_for_postscript_name("AppleColorEmoji")
+            .unwrap();
+        assert!(fonts.0.read().is_emoji(emoji));
+        assert_eq!(
+            fonts.font_id_for_postscript_name("AppleColorEmoji"),
+            Some(emoji)
+        );
+        // System UI faces Core Text opens only through its UI font APIs: the UI emoji font and
+        // fallback fonts of the UI font's cascade.
+        for name in [
+            ".AppleColorEmojiUI",
+            ".SFHebrew-Regular",
+            ".SFArabic-Bold",
+            ".SFNSMono-Regular",
+        ] {
+            let id = fonts.font_id_for_postscript_name(name).unwrap();
+            assert_eq!(
+                fonts
+                    .0
+                    .read()
+                    .postscript_names_by_font_id
+                    .get(&id)
+                    .map(String::as_str),
+                Some(name)
+            );
+        }
+        // Core Text substitutes a font for unknown names; the lookup does not.
+        assert_eq!(
+            fonts.font_id_for_postscript_name("NoSuchFont-Regular"),
+            None
+        );
+        assert_eq!(
+            fonts.font_id_for_postscript_name(".NoSuchFont-Regular"),
+            None
+        );
     }
 
     #[test]

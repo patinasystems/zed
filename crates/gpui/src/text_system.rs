@@ -343,6 +343,15 @@ impl TextSystem {
             .next()
     }
 
+    /// The font whose PostScript name (OpenType `name` ID 6) is `postscript_name`, if the
+    /// platform has it: the face a text shaper outside GPUI chose, by name, so its glyph ids
+    /// paint with [`Window::paint_glyph`](crate::Window::paint_glyph). Unlike
+    /// [`Self::resolve_font`], it does not fall back to another font.
+    pub fn font_id_for_postscript_name(&self, postscript_name: &str) -> Option<FontId> {
+        self.platform_text_system
+            .font_id_for_postscript_name(postscript_name)
+    }
+
     /// Resolves the specified font, falling back to the default font stack if
     /// the font fails to load.
     ///
