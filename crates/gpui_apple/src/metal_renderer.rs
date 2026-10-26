@@ -667,7 +667,8 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let gradients = write_gradients(scene, &mut writer)?;
+        let instance_bindings = write_instances(&gradients, scene, &mut writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -990,6 +991,7 @@ impl MetalRenderer {
                         self.draw_group(
                             root,
                             group,
+                            &instance_bindings.gradients,
                             writer,
                             texture,
                             viewport_size,
@@ -1012,6 +1014,7 @@ impl MetalRenderer {
         &mut self,
         root: &Scene,
         group: &gpui::CompositedGroup,
+        gradients: &InstanceBinding,
         writer: &mut InstanceBufferWriter,
         target: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -1054,7 +1057,7 @@ impl MetalRenderer {
             encoder.end_encoding();
             self.texture_pool.release(&filtered);
         }
-        let instance_bindings = write_instances(&group.scene, writer)?;
+        let instance_bindings = write_instances(gradients, &group.scene, writer)?;
         self.draw_scene(
             root,
             &group.scene,
@@ -1427,6 +1430,16 @@ impl MetalRenderer {
             QuadInputIndex::Quads as u64,
             Some(&instance_bindings.quads.buffer),
             instance_bindings.quads.offset as u64,
+        );
+        command_encoder.set_vertex_buffer(
+            QuadInputIndex::Gradients as u64,
+            Some(&instance_bindings.gradients.buffer),
+            instance_bindings.gradients.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            QuadInputIndex::Gradients as u64,
+            Some(&instance_bindings.gradients.buffer),
+            instance_bindings.gradients.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             QuadInputIndex::ViewportSize as u64,
@@ -2439,10 +2452,28 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    /// The window scene's gradient records, which quads in every scene refer to.
+    gradients: InstanceBinding,
 }
 
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
+/// Writes the window scene's gradient records once per frame; every scene's quads
+/// read them. One texel at least, so the binding never sits at the end of the buffer.
+fn write_gradients(root: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBinding> {
+    if root.gradients.is_empty() {
+        writer.write(&[[0f32; 4]])
+    } else {
+        writer.write(&root.gradients)
+    }
+}
+
+/// Writes `scene`'s instances; its quads read `gradients` (the window scene's).
+fn write_instances(
+    gradients: &InstanceBinding,
+    scene: &Scene,
+    writer: &mut InstanceBufferWriter,
+) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
+        gradients: gradients.clone(),
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
@@ -2598,6 +2629,7 @@ enum QuadInputIndex {
     Vertices = 0,
     Quads = 1,
     ViewportSize = 2,
+    Gradients = 3,
 }
 
 #[repr(C)]
@@ -2779,7 +2811,8 @@ mod tests {
                     &renderer.instance_buffer_pool,
                     renderer.is_unified_memory,
                 );
-                let bindings = write_instances(&scene, &mut writer).unwrap();
+                let gradients = write_gradients(&scene, &mut writer).unwrap();
+                let bindings = write_instances(&gradients, &scene, &mut writer).unwrap();
                 let cb = renderer
                     .draw_primitives_to_texture(&scene, &bindings, &mut writer, &texture, size)
                     .unwrap();
@@ -2870,6 +2903,79 @@ mod tests {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+    }
+
+    #[test]
+    fn gradients_render() {
+        use gpui::gradient_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("gradients_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 2);
+    }
+
+    /// Gradients against solid fills: 200 overlapping quarter-screen quads with rounded
+    /// corners at 2880x1800 (about 260 million shaded pixels). Fills alternate each
+    /// round; each line is the median GPU time of a frame. Run with
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib gradient_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gradient_frame_cost() {
+        use gpui::gradient_test_scene::{BenchFill, bench};
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
+        let (width, height) = (2880, 1800);
+        let size = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let fills = [
+            BenchFill::Solid,
+            BenchFill::TwoStop,
+            BenchFill::Linear(2),
+            BenchFill::Linear(8),
+            BenchFill::Radial(4),
+            BenchFill::Radial(16),
+        ];
+        let scenes: Vec<Scene> = fills
+            .iter()
+            .map(|fill| bench(200, width as f32, height as f32, *fill))
+            .collect();
+        let mut gpu = vec![Vec::new(); scenes.len()];
+        for _ in 0..60 {
+            for (scene, times) in scenes.iter().zip(&mut gpu) {
+                gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, size)
+                    .expect("render");
+                // The completion handler runs after the wait returns: let it record.
+                let mut recorded = retained_stats::take_gpu();
+                for _ in 0..100 {
+                    if !recorded.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    recorded = retained_stats::take_gpu();
+                }
+                times.extend(recorded);
+            }
+        }
+        for (fill, times) in fills.iter().zip(&mut gpu) {
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{fill:?}: GPU {:.3} ms per frame (median of {})",
+                times[times.len() / 2],
+                times.len()
+            );
+        }
     }
 
     /// Frame costs with and without compositing groups. Run with
@@ -3324,6 +3430,16 @@ mod retained_stats {
 
     pub fn record_gpu(ms: f64) {
         with(|s| s.gpu.push(ms));
+    }
+
+    /// The GPU times recorded so far, cleared (benchmarks).
+    #[cfg(test)]
+    pub fn take_gpu() -> Vec<f64> {
+        STATS
+            .lock()
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.gpu))
+            .unwrap_or_default()
     }
 
     pub fn record_encode(ms: f64) {

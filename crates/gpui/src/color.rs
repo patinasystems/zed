@@ -747,6 +747,11 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    /// A [`crate::Gradient`] painted by [`crate::Window::paint_gradient`]. `gradient` is
+    /// the first texel of its record in the frame's [`crate::Scene::gradients`]; `solid`
+    /// is its first color, a flat stand-in for renderers that do not draw gradients; and
+    /// `colors[0].color.a` is the opacity it is drawn with.
+    Gradient = 4,
 }
 
 /// A color space for color interpolation.
@@ -782,8 +787,8 @@ pub struct Background {
     pub(crate) solid: Hsla,
     pub(crate) gradient_angle_or_pattern_height: f32,
     pub(crate) colors: [LinearColorStop; 2],
-    /// Padding for alignment for repr(C) layout.
-    pad: u32,
+    /// A [`BackgroundTag::Gradient`]'s record in [`crate::Scene::gradients`]; 0 otherwise.
+    pub(crate) gradient: u32,
 }
 
 impl std::fmt::Debug for Background {
@@ -805,6 +810,11 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::Gradient => write!(
+                f,
+                "Gradient(texel {}, opacity {})",
+                self.gradient, self.colors[0].color.a
+            ),
         }
     }
 }
@@ -818,7 +828,7 @@ impl Default for Background {
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
-            pad: 0,
+            gradient: 0,
         }
     }
 }
@@ -943,6 +953,23 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::Gradient => self.colors[0].color.is_transparent(),
+        }
+    }
+
+    /// A painted gradient's background: its record starts at texel `gradient` of the
+    /// frame's gradients, and renderers without gradients draw `stand_in`.
+    pub(crate) fn painted_gradient(gradient: u32, stand_in: Hsla) -> Self {
+        let opaque = LinearColorStop {
+            color: crate::white(),
+            percentage: 0.,
+        };
+        Background {
+            tag: BackgroundTag::Gradient,
+            solid: stand_in,
+            colors: [opaque, LinearColorStop::default()],
+            gradient,
+            ..Default::default()
         }
     }
 }

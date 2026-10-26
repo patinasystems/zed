@@ -353,7 +353,8 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
 
 GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
     GradientColor output;
-    if (tag == 0 || tag == 2 || tag == 3) {
+    // A painted gradient (4) draws its first color: this renderer has no gradients.
+    if (tag == 0 || tag == 2 || tag == 3 || tag == 4) {
         output.solid = hsla_to_rgba(solid);
     } else if (tag == 1) {
         output.color0 = hsla_to_rgba(colors[0].color);
@@ -385,6 +386,7 @@ float4 gradient_color(Background background,
 
     switch (background.tag) {
         case 0:
+        case 4:
             color = solid_color;
             break;
         case 1: {

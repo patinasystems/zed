@@ -1,4 +1,13 @@
 @group(1) @binding(0) var t_instances: texture_2d<u32>;
+// The frame's gradient records (`gpui::GradientRecord`), for quads, written first in
+// the frame's instance data, so they start at texel 0.
+@group(2) @binding(0) var t_gradients: texture_2d<u32>;
+
+fn load_gradient_texel(index: u32) -> vec4<f32> {
+    let width = textureDimensions(t_gradients).x;
+    let coordinate = vec2<i32>(i32(index % width), i32(index / width));
+    return bitcast<vec4<f32>>(textureLoad(t_gradients, coordinate, 0));
+}
 
 // Each texel of `t_instances` packs four 32-bit words of instance data. Most
 // records are read strictly front to back through a cursor that keeps the

@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
-    Pixels, Point, Radians, RetainedShapesDraw, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, BackgroundTag, Bounds, ContentMask, Corners,
+    DevicePixels, Edges, Hsla, Pixels, Point, Radians, RetainedShapesDraw, ScaledPixels, Size,
+    bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -71,6 +72,9 @@ pub struct Scene {
     pub shader_uniforms: Vec<u8>,
     /// Groups drawn offscreen and composited as one image ([`Scene::push_group`]).
     pub groups: Vec<CompositedGroup>,
+    /// The records of the gradients this frame's quads paint ([`crate::GradientRecord`]),
+    /// in 16-byte texels. A group's scene refers to the window's.
+    pub gradients: Vec<[f32; 4]>,
 }
 
 #[expect(missing_docs)]
@@ -96,6 +100,27 @@ impl Scene {
         self.backdrop_filters.clear();
         self.shaders.clear();
         self.shader_uniforms.clear();
+        self.gradients.clear();
+    }
+
+    /// Records a gradient's texels; returns the index of its first.
+    pub fn add_gradient(&mut self, texels: &[[f32; 4]]) -> u32 {
+        let start = self.gradients.len() as u32;
+        self.gradients.extend_from_slice(texels);
+        start
+    }
+
+    /// The texels of the gradient a quad from `from` paints, copied into this scene,
+    /// so that the quad can be inserted here.
+    fn adopt_gradient(&mut self, quad: &mut Quad, from: &Scene) {
+        let start = quad.background.gradient as usize;
+        let Some(header) = from.gradients.get(start) else {
+            return;
+        };
+        let len = 2 + 2 * header[1] as usize;
+        if let Some(texels) = from.gradients.get(start..start + len) {
+            quad.background.gradient = self.add_gradient(texels);
+        }
     }
 
     /// Records a shader draw's source (once per frame) and uniforms.
@@ -357,6 +382,14 @@ impl Scene {
                         self.insert_primitive(filter);
                     }
                 }
+                // So does a gradient quad, to its frame's gradients.
+                PaintOperation::Primitive(Primitive::Quad(quad))
+                    if quad.background.tag == BackgroundTag::Gradient =>
+                {
+                    let mut quad = *quad;
+                    self.adopt_gradient(&mut quad, prev_scene);
+                    self.insert_primitive(quad);
+                }
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -422,6 +455,11 @@ impl Scene {
                             filter.shader.reads_backdrop(),
                             filter.shader.scale_factor,
                         );
+                    }
+                    if let Primitive::Quad(quad) = &mut primitive
+                        && quad.background.tag == BackgroundTag::Gradient
+                    {
+                        scene.adopt_gradient(quad, self);
                     }
                     if opacity < 1. {
                         primitive.fade(opacity);
