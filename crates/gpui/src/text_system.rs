@@ -271,9 +271,6 @@ impl TextSystem {
                 font("Noto Sans"),    // KDE
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
-                // The platform's UI font: the only one a platform without system fonts
-                // (the web) is sure to have (`gpui_web`'s system font family).
-                font(".SystemUIFont"),
             ],
             font_generation: Arc::default(),
             missing_glyph_reporter: Arc::new(MissingGlyphReporter {
@@ -630,14 +627,21 @@ impl TextSystem {
                     .iter()
                     .find_map(&mut lookup_font)
                     .or_else(|| {
-                        // Last resort: any family the platform has, in the requested
-                        // weight and style, so no family name fails while a font is loaded.
-                        self.platform_text_system
-                            .all_font_names()
-                            .into_iter()
+                        // Last resort, in the requested weight and style: the platform's
+                        // UI font, the only one a platform without system fonts (the web,
+                        // where it is `gpui_web`'s bundled system family) is sure to have,
+                        // then any family the platform has. No family name fails while a
+                        // font is loaded.
+                        std::iter::once(SharedString::from(".SystemUIFont"))
+                            .chain(
+                                self.platform_text_system
+                                    .all_font_names()
+                                    .into_iter()
+                                    .map(SharedString::from),
+                            )
                             .find_map(|family| {
                                 lookup_font(&Font {
-                                    family: family.into(),
+                                    family,
                                     ..font.clone()
                                 })
                             })
@@ -1366,20 +1370,24 @@ mod font_resolution_tests {
         text_system.fallback_font_stack.clear();
         assert_eq!(text_system.resolve_font(&requested), FontId(42));
     }
-    /// A platform with one family, "Bundled" (as the web build has only its bundled
-    /// fonts): every other name is missing.
-    struct OneFamily(NoopTextSystem);
+    /// A platform with one family (as the web build has only its bundled fonts): every
+    /// other name is missing. Its bold face is `FontId(8)`, every other face `FontId(7)`.
+    struct OneFamily(NoopTextSystem, &'static str);
 
     impl PlatformTextSystem for OneFamily {
         fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
             self.0.add_fonts(fonts)
         }
         fn all_font_names(&self) -> Vec<String> {
-            vec!["Bundled".into()]
+            vec![self.1.into()]
         }
         fn font_id(&self, descriptor: &Font) -> Result<FontId> {
-            if descriptor.family.as_ref() == "Bundled" {
-                Ok(FontId(7))
+            if descriptor.family.as_ref() == self.1 {
+                Ok(FontId(if descriptor.weight == FontWeight::BOLD {
+                    8
+                } else {
+                    7
+                }))
             } else {
                 Err(anyhow::anyhow!("no family {}", descriptor.family))
             }
@@ -1420,20 +1428,27 @@ mod font_resolution_tests {
 
     #[test]
     fn no_family_name_fails_while_the_platform_has_a_font() {
-        let text_system = TextSystem::new(Arc::new(OneFamily(NoopTextSystem::new())));
-        for family in [
-            "WeldSans",
-            "",
-            "Nope, Other",
-            ".ZedSans",
-            "\u{0}",
-            "😀 emoji family",
-        ] {
-            for requested in [font(family), font(family).bold().italic()] {
+        // The web's case (only the UI font) and a platform whose one family is not it;
+        // either way the fallback keeps the requested weight.
+        for only in [".SystemUIFont", "Bundled"] {
+            let text_system = TextSystem::new(Arc::new(OneFamily(NoopTextSystem::new(), only)));
+            for family in [
+                "WeldSans",
+                "",
+                "Nope, Other",
+                ".ZedSans",
+                "\u{0}",
+                "😀 emoji family",
+            ] {
                 assert_eq!(
-                    text_system.resolve_font(&requested),
+                    text_system.resolve_font(&font(family)),
                     FontId(7),
-                    "{family:?}"
+                    "{only} {family:?}"
+                );
+                assert_eq!(
+                    text_system.resolve_font(&font(family).bold().italic()),
+                    FontId(8),
+                    "{only} {family:?}"
                 );
             }
         }
