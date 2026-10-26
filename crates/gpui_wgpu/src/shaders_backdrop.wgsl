@@ -338,20 +338,20 @@ fn group_blend(b: vec3<f32>, s: vec3<f32>, mode: u32) -> vec3<f32> {
         case 5u: {
             return max(b, s);
         }
+        // Color dodge and burn are not clamped here: WebKit (Core Graphics) mixes the
+        // unclamped result with the backdrop and clamps after (`fs_group_composite`).
         case 6u: {
-            let dodge = min(vec3<f32>(1.0), b / max(1.0 - s, vec3<f32>(1e-6)));
-            return select(select(dodge, vec3<f32>(1.0), s >= vec3<f32>(1.0)), vec3<f32>(0.0), b <= vec3<f32>(0.0));
+            return select(b / max(1.0 - s, vec3<f32>(1e-6)), vec3<f32>(0.0), b <= vec3<f32>(0.0));
         }
         case 7u: {
-            let burn = 1.0 - min(vec3<f32>(1.0), (1.0 - b) / max(s, vec3<f32>(1e-6)));
-            return select(select(burn, vec3<f32>(0.0), s <= vec3<f32>(0.0)), vec3<f32>(1.0), b >= vec3<f32>(1.0));
+            return select(1.0 - (1.0 - b) / max(s, vec3<f32>(1e-6)), vec3<f32>(1.0), b >= vec3<f32>(1.0));
         }
         case 8u: {
             return group_hard_light(b, s);
         }
+        // Soft light as WebKit (Core Graphics) draws it: one curve for every source.
         case 9u: {
-            let d = select(sqrt(b), ((16.0 * b - 12.0) * b + 4.0) * b, b <= vec3<f32>(0.25));
-            return select(b + (2.0 * s - 1.0) * (d - b), b - (1.0 - 2.0 * s) * b * (1.0 - b), s <= vec3<f32>(0.5));
+            return b + (2.0 * s - 1.0) * b * (1.0 - b);
         }
         case 10u: {
             return abs(b - s);
@@ -424,6 +424,12 @@ fn fs_group_composite(input: GroupVarying) -> @location(0) vec4<f32> {
     }
     let source = color.rgb / max(color.a, 1e-6);
     let behind = backdrop.rgb / max(backdrop.a, 1e-6);
+    if (mode == 6u || mode == 7u) {
+        // The whole result, clamped once (drawn with the replacing pipeline).
+        let unclamped = (1.0 - backdrop.a) * source + backdrop.a * group_blend(behind, source, mode);
+        let alpha = color.a + backdrop.a * (1.0 - color.a);
+        return vec4<f32>(clamp(unclamped * color.a + backdrop.rgb * (1.0 - color.a), vec3<f32>(0.0), vec3<f32>(alpha)), alpha);
+    }
     let mixed = (1.0 - backdrop.a) * source + backdrop.a * saturate(group_blend(behind, source, mode));
     return vec4<f32>(mixed * color.a, color.a);
 }

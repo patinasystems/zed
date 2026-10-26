@@ -2354,7 +2354,9 @@ impl GroupCompositePipelines {
     fn for_blend_mode(&self, blend_mode: gpui::BlendMode) -> &metal::RenderPipelineStateRef {
         match blend_mode {
             gpui::BlendMode::PlusLighter => &self.add,
-            gpui::BlendMode::PlusDarker => &self.replace,
+            gpui::BlendMode::PlusDarker
+            | gpui::BlendMode::ColorDodge
+            | gpui::BlendMode::ColorBurn => &self.replace,
             _ => &self.over,
         }
     }
