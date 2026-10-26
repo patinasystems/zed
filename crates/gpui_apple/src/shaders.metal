@@ -2010,9 +2010,10 @@ struct GroupCompositeParams {
   float opacity;
   uint blend_mode;  // `BlendMode`
   uint filter_count;
-  uint pad0;
+  uint mask_mode;  // 0 none, 1 alpha, 2 luminance (`MaskMode::gpu`)
   uint pad1;
   uint pad2;
+  float4 mask_region;  // where the mask's image sits
 };
 
 struct GroupCompositeOutput {
@@ -2167,7 +2168,8 @@ float3 group_blend(float3 b, float3 s, uint mode) {
 fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
                                          constant GroupCompositeParams &params [[buffer(1)]],
                                          texture2d<float> source [[texture(0)]],
-                                         texture2d<float> backdrop [[texture(1)]]) {
+                                         texture2d<float> backdrop [[texture(1)]],
+                                         texture2d<float> mask [[texture(2)]]) {
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear,
                                    address::clamp_to_edge);
   float2 position = input.position.xy;
@@ -2180,6 +2182,13 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
                                params.filter_amounts[i / 4][i % 4]);
     }
     color = float4(rgb * color.a, color.a);
+  }
+  // The mask (premultiplied, so its luminance is already times its alpha); nothing
+  // outside its image.
+  if (params.mask_mode != 0) {
+    float2 uv = (position - params.mask_region.xy) / params.mask_region.zw;
+    float4 m = all(uv >= 0.) && all(uv <= 1.) ? mask.sample(linear_sampler, uv) : float4(0.);
+    color *= params.mask_mode == 2 ? dot(m.rgb, float3(0.2125, 0.7154, 0.0721)) : m.a;
   }
   color *= params.opacity;
   uint mode = params.blend_mode;

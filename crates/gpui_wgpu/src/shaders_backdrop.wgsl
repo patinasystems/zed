@@ -176,14 +176,19 @@ struct GroupParams {
     // `gpui::BlendMode`.
     blend_mode: u32,
     filter_count: u32,
-    pad0: u32,
+    // 0 none, 1 alpha, 2 luminance (`gpui::MaskMode::gpu`).
+    mask_mode: u32,
     pad1: u32,
     pad2: u32,
+    // Where the mask's image sits in the target.
+    mask_region: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> group_params: GroupParams;
 @group(2) @binding(0) var t_group_backdrop: texture_2d<f32>;
 @group(2) @binding(1) var s_group_backdrop: sampler;
+@group(3) @binding(0) var t_group_mask: texture_2d<f32>;
+@group(3) @binding(1) var s_group_mask: sampler;
 
 struct GroupVarying {
     @builtin(position) position: vec4<f32>,
@@ -392,6 +397,18 @@ fn fs_group_composite(input: GroupVarying) -> @location(0) vec4<f32> {
             );
         }
         color = vec4<f32>(rgb * color.a, color.a);
+    }
+    // The mask (premultiplied, so its luminance is already times its alpha); nothing
+    // outside its image. Sampled outside the branch: uniform control flow.
+    let mask_uv = (position - group_params.mask_region.xy) / group_params.mask_region.zw;
+    let mask = textureSampleLevel(t_group_mask, s_group_mask, mask_uv, 0.0);
+    if (group_params.mask_mode != 0u) {
+        let inside = all(mask_uv >= vec2<f32>(0.0)) && all(mask_uv <= vec2<f32>(1.0));
+        var amount = mask.a;
+        if (group_params.mask_mode == 2u) {
+            amount = dot(mask.rgb, vec3<f32>(0.2125, 0.7154, 0.0721));
+        }
+        color *= select(0.0, amount, inside);
     }
     color *= group_params.opacity;
     let mode = group_params.blend_mode;

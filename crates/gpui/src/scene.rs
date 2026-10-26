@@ -220,7 +220,19 @@ impl Scene {
         let Some(group) = self.open_groups.pop() else {
             return;
         };
+        let masks_parent = group.effects.masks_parent;
         let closed = group.close();
+        // A mask group's image masks the group around it (outside any group, nothing).
+        if let Some(mode) = masks_parent {
+            if let Some(parent) = self.open_groups.last_mut() {
+                let image = match closed {
+                    ClosedGroup::Offscreen(image) => Some(image),
+                    _ => None,
+                };
+                parent.set_mask(mode, image);
+            }
+            return;
+        }
         match self.open_groups.last_mut() {
             Some(parent) => closed.apply(parent),
             None => closed.apply(self),
@@ -427,6 +439,9 @@ impl Scene {
             out.push(scene);
             for group in &scene.groups {
                 visit(&group.scene, out);
+                if let Some(mask) = &group.mask {
+                    visit(&mask.image.scene, out);
+                }
             }
         }
         let mut out = SmallVec::new();
@@ -441,8 +456,25 @@ impl Scene {
     pub fn without_groups(&self) -> Scene {
         let mut scene = Scene::default();
         let mut opacities = vec![1f32];
+        // Inside a mask group, how many groups deep: masks are not drawn (content
+        // draws unmasked).
+        let mut in_mask = 0usize;
         for operation in &self.paint_operations {
             let opacity = opacities.last().copied().unwrap_or(1.);
+            if in_mask > 0 {
+                match operation {
+                    PaintOperation::StartGroup(_) => in_mask += 1,
+                    PaintOperation::EndGroup => in_mask -= 1,
+                    _ => {}
+                }
+                continue;
+            }
+            if let PaintOperation::StartGroup(effects) = operation
+                && effects.masks_parent.is_some()
+            {
+                in_mask = 1;
+                continue;
+            }
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
@@ -559,6 +591,11 @@ impl Scene {
                 bounds(&mut filter.bounds);
                 mask(&mut filter.content_mask);
             }
+            // A mask's image draws in its own coordinates; where it sits moves.
+            if let Some(group_mask) = &mut group.mask {
+                bounds(&mut group_mask.image.bounds);
+                mask(&mut group_mask.image.effects.content_mask);
+            }
         }
     }
 
@@ -567,7 +604,13 @@ impl Scene {
     pub fn group_depth(&self) -> usize {
         self.groups
             .iter()
-            .map(|group| 1 + group.scene.group_depth())
+            .map(|group| {
+                let mask = group
+                    .mask
+                    .as_ref()
+                    .map_or(0, |mask| 1 + mask.image.scene.group_depth());
+                (1 + group.scene.group_depth()).max(mask)
+            })
             .max()
             .unwrap_or(0)
     }
@@ -1514,6 +1557,42 @@ pub struct GroupEffects {
     /// `mix-blend-mode`, Filter Effects 2). It reads the target the group composites
     /// onto, not the group, and is drawn before what the group paints.
     pub backdrop: Option<BackdropFilter>,
+    /// Set on a group painted inside another: its image is not drawn but masks the
+    /// group around it, by its alpha or its luminance (CSS `mask-image`, SVG
+    /// `<mask>`; [`GroupMask`]). Its other effects do not apply.
+    pub masks_parent: Option<MaskMode>,
+}
+
+/// What a mask image's pixels mask with (CSS Masking 1 `mask-mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MaskMode {
+    /// The image's alpha.
+    #[default]
+    Alpha,
+    /// The image's luminance times its alpha (sRGB coefficients 0.2125, 0.7154,
+    /// 0.0721, as SVG `<mask>` uses by default).
+    Luminance,
+}
+
+impl MaskMode {
+    /// The code renderers composite with (`GroupCompositeUniforms::mask_mode`).
+    pub fn gpu(self) -> u32 {
+        match self {
+            MaskMode::Alpha => 1,
+            MaskMode::Luminance => 2,
+        }
+    }
+}
+
+/// A group's mask: an image whose alpha or luminance multiplies the group's image
+/// where they overlap; outside it the group draws nothing.
+pub struct GroupMask {
+    /// How its pixels mask.
+    pub mode: MaskMode,
+    /// The mask's image: drawn offscreen like a group's (its own scene, in the
+    /// coordinates of its image), never composited itself. Its bounds are in the
+    /// same space as the masked group's.
+    pub image: Box<CompositedGroup>,
 }
 
 impl Default for GroupEffects {
@@ -1526,6 +1605,7 @@ impl Default for GroupEffects {
             blend_mode: BlendMode::Normal,
             content_mask: ContentMask::default(),
             backdrop: None,
+            masks_parent: None,
         }
     }
 }
@@ -1557,6 +1637,9 @@ pub struct CompositedGroup {
     /// Shader draws in it refer to the sources and uniforms of the scene the window
     /// painted.
     pub scene: Scene,
+    /// Masks its image after its filters, before its opacity (CSS Masking 1); its
+    /// bounds lie inside the mask's.
+    pub mask: Option<GroupMask>,
 }
 
 impl CompositedGroup {
@@ -1598,13 +1681,14 @@ impl CompositedGroup {
     }
 
     /// The uniforms renderers composite the group with. `source_region` is where its
-    /// (blurred) image sits in the target and `backdrop_region` where the copy of what
-    /// is behind it does (origin and size, device pixels); `viewport` is the target's
-    /// size.
+    /// (blurred) image sits in the target, `backdrop_region` where the copy of what
+    /// is behind it does and `mask_region` where its mask's image does (origin and
+    /// size, device pixels; unused without a mask); `viewport` is the target's size.
     pub fn composite_uniforms(
         &self,
         source_region: [f32; 4],
         backdrop_region: [f32; 4],
+        mask_region: [f32; 4],
         viewport: [f32; 2],
     ) -> GroupCompositeUniforms {
         let rect =
@@ -1628,13 +1712,15 @@ impl CompositedGroup {
             opacity: self.effects.opacity.clamp(0., 1.),
             blend_mode: self.effects.blend_mode as u32,
             filter_count: filters.len() as u32,
-            pad: [0; 3],
+            mask_mode: self.mask.as_ref().map_or(0, |mask| mask.mode.gpu()),
+            pad: [0; 2],
+            mask_region,
         }
     }
 }
 
 /// What renderers composite a group with (`GroupCompositeParams` in the Metal and
-/// WGSL shaders): 160 bytes.
+/// WGSL shaders): 176 bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1654,7 +1740,11 @@ pub struct GroupCompositeUniforms {
     /// [`BlendMode`] as `u32`.
     pub blend_mode: u32,
     pub filter_count: u32,
-    pub pad: [u32; 3],
+    /// 0 without a mask, else [`MaskMode::gpu`].
+    pub mask_mode: u32,
+    pub pad: [u32; 2],
+    /// Where the mask's image sits in the target.
+    pub mask_region: [f32; 4],
 }
 
 impl GroupCompositeUniforms {
@@ -1674,6 +1764,10 @@ impl GroupCompositeUniforms {
 struct OpenGroup {
     effects: GroupEffects,
     scene: Scene,
+    /// Its mask, once painted ([`GroupEffects::masks_parent`]).
+    mask: Option<GroupMask>,
+    /// A mask was painted and drew nothing: so does the group.
+    masked_out: bool,
     /// What was painted, in order, while the group may still be painted directly
     /// instead of offscreen.
     operations: Option<Vec<GroupOperation>>,
@@ -1689,11 +1783,15 @@ enum GroupOperation {
 
 impl OpenGroup {
     fn new(effects: GroupEffects) -> Self {
-        // A translucent group's backdrop and content fade together: offscreen.
+        // A translucent group's backdrop and content fade together: offscreen. So
+        // does a mask's image.
         let direct = !effects.has_filter()
             && effects.blend_mode == BlendMode::Normal
-            && (effects.backdrop.is_none() || effects.opacity >= 1.);
+            && (effects.backdrop.is_none() || effects.opacity >= 1.)
+            && effects.masks_parent.is_none();
         Self {
+            mask: None,
+            masked_out: false,
             effects,
             scene: Scene {
                 in_group: true,
@@ -1760,8 +1858,19 @@ impl OpenGroup {
         self.check_overlap();
     }
 
+    /// Its mask: `image` is the mask group's, `None` when it drew nothing. A masked
+    /// group draws offscreen; a later mask replaces an earlier one.
+    fn set_mask(&mut self, mode: MaskMode, image: Option<CompositedGroup>) {
+        self.operations = None;
+        self.mask = image.map(|image| GroupMask {
+            mode,
+            image: Box::new(image),
+        });
+        self.masked_out = self.mask.is_none();
+    }
+
     fn close(mut self) -> ClosedGroup {
-        if self.effects.opacity <= 0. {
+        if self.effects.opacity <= 0. || self.masked_out {
             return ClosedGroup::Nothing;
         }
         let backdrop = self
@@ -1789,11 +1898,17 @@ impl OpenGroup {
             };
         }
         self.scene.finish();
-        let bounds = round_out(
-            drawn
-                .dilate(self.effects.blur_radius * 3.)
-                .intersect(&self.effects.content_mask.bounds),
-        );
+        let mut bounds = drawn
+            .dilate(self.effects.blur_radius * 3.)
+            .intersect(&self.effects.content_mask.bounds);
+        // Outside its mask's image a masked group draws nothing.
+        if let Some(mask) = &self.mask {
+            bounds = bounds.intersect(&mask.image.bounds);
+        }
+        let bounds = round_out(bounds);
+        if self.mask.is_some() && bounds.is_empty() {
+            return ClosedGroup::Nothing;
+        }
         // The image covers `bounds`: draw the scene in its coordinates.
         self.scene.translate(-bounds.origin);
         ClosedGroup::Offscreen(CompositedGroup {
@@ -1801,6 +1916,7 @@ impl OpenGroup {
             bounds,
             effects: self.effects,
             scene: self.scene,
+            mask: self.mask,
         })
     }
 }
@@ -2902,6 +3018,114 @@ pub mod compositing_group_content_test_scene {
     }
 }
 
+/// Group masks ([`GroupMask`]), for renderer tests. Over a white page: a red square
+/// whose mask is opaque on its left half and half opaque on its right (alpha); a
+/// blue square masked by white and 50% gray (luminance), inside a multiplying group
+/// drawn offscreen, so the mask moves with that group's image; a green square
+/// masked by a smaller square; and a black square whose mask draws nothing.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod group_mask_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+            ),
+        };
+        let quad = |x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32| Quad {
+            bounds: Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(w), ScaledPixels(h)),
+            ),
+            content_mask: full,
+            background: Hsla::from(Rgba { r, g, b, a }).into(),
+            ..Default::default()
+        };
+        let group = GroupEffects {
+            content_mask: full,
+            ..GroupEffects::default()
+        };
+        let mask = |mode| GroupEffects {
+            masks_parent: Some(mode),
+            ..group.clone()
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., 64., 64., 1., 1., 1., 1.));
+        // Alpha: the mask after the content.
+        scene.push_group(group.clone());
+        scene.insert_primitive(quad(4., 4., 24., 24., 1., 0., 0., 1.));
+        scene.push_group(mask(MaskMode::Alpha));
+        scene.insert_primitive(quad(4., 4., 12., 24., 0., 0., 0., 1.));
+        scene.insert_primitive(quad(16., 4., 12., 24., 0., 0., 0., 0.5));
+        scene.pop_group();
+        scene.pop_group();
+        // Luminance, the mask before the content, inside an offscreen group.
+        scene.push_group(GroupEffects {
+            blend_mode: BlendMode::Multiply,
+            ..group.clone()
+        });
+        scene.push_group(group.clone());
+        scene.push_group(mask(MaskMode::Luminance));
+        scene.insert_primitive(quad(36., 4., 12., 24., 1., 1., 1., 1.));
+        scene.insert_primitive(quad(48., 4., 12., 24., 0.5, 0.5, 0.5, 1.));
+        scene.pop_group();
+        scene.insert_primitive(quad(36., 4., 24., 24., 0., 0., 1., 1.));
+        scene.pop_group();
+        scene.pop_group();
+        // A mask smaller than the content.
+        scene.push_group(group.clone());
+        scene.insert_primitive(quad(4., 36., 24., 24., 0., 1., 0., 1.));
+        scene.push_group(mask(MaskMode::Alpha));
+        scene.insert_primitive(quad(10., 42., 12., 12., 0., 0., 0., 1.));
+        scene.pop_group();
+        scene.pop_group();
+        // A mask that draws nothing.
+        scene.push_group(group.clone());
+        scene.insert_primitive(quad(36., 36., 24., 24., 0., 0., 0., 1.));
+        scene.push_group(mask(MaskMode::Alpha));
+        scene.pop_group();
+        scene.pop_group();
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let probes = vec![
+            probe(
+                "red under the opaque half of its mask",
+                8,
+                16,
+                [255, 0, 0, 255],
+            ),
+            probe(
+                "red under the half-opaque half",
+                22,
+                16,
+                [255, 128, 128, 255],
+            ),
+            probe("blue under white (luminance 1)", 40, 16, [0, 0, 255, 255]),
+            probe("blue under 50% gray", 54, 16, [127, 127, 255, 255]),
+            probe("green inside its smaller mask", 16, 48, [0, 255, 0, 255]),
+            probe(
+                "green outside its mask: not drawn",
+                6,
+                38,
+                [255, 255, 255, 255],
+            ),
+            probe(
+                "black under an empty mask: not drawn",
+                48,
+                48,
+                [255, 255, 255, 255],
+            ),
+        ];
+        (scene, probes)
+    }
+}
+
 /// Scenes for cost measurements of compositing groups.
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 #[doc(hidden)]
@@ -3456,13 +3680,19 @@ mod tests {
         let far = path_at(scaled_bounds(100., 100., 5., 5.), 3);
         assert_eq!(
             path_copy_bounds(&[a, far]),
-            vec![scaled_bounds(0., 0., 10., 10.), scaled_bounds(100., 100., 5., 5.)]
+            vec![
+                scaled_bounds(0., 0., 10., 10.),
+                scaled_bounds(100., 100., 5., 5.)
+            ]
         );
         // A region that grows into another merges with it too.
         let p = path_at(scaled_bounds(0., 0., 4., 4.), 1);
         let q = path_at(scaled_bounds(10., 0., 4., 4.), 2);
         let bridge = path_at(scaled_bounds(2., 0., 10., 4.), 3);
-        assert_eq!(path_copy_bounds(&[p, q, bridge]), vec![scaled_bounds(0., 0., 14., 4.)]);
+        assert_eq!(
+            path_copy_bounds(&[p, q, bridge]),
+            vec![scaled_bounds(0., 0., 14., 4.)]
+        );
     }
 
     fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
@@ -4160,8 +4390,78 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_group_masks_its_parent_offscreen_inside_its_bounds() {
+        let (scene, _) = group_mask_test_scene::scene();
+        // The red, the multiplying and the green groups; the empty mask hides the black.
+        assert_eq!(scene.groups.len(), 3);
+        let red = &scene.groups[0];
+        let mask = red.mask.as_ref().expect("masked");
+        assert_eq!(mask.mode, MaskMode::Alpha);
+        assert_eq!(red.bounds, scaled_bounds(4., 4., 24., 24.));
+        assert_eq!(mask.image.bounds, scaled_bounds(4., 4., 24., 24.));
+        // The mask's image draws in its own coordinates.
+        assert_eq!(
+            mask.image.scene.quads[0].bounds,
+            scaled_bounds(0., 0., 12., 24.)
+        );
+        let uniforms = red.composite_uniforms([0.; 4], [0.; 4], [1., 2., 3., 4.], [64., 64.]);
+        assert_eq!(
+            (uniforms.mask_mode, uniforms.mask_region),
+            (1, [1., 2., 3., 4.])
+        );
+        // Inside the multiplying group's image (origin 36, 4), the blue group and its
+        // mask moved with it.
+        let outer = &scene.groups[1];
+        assert_eq!(outer.bounds, scaled_bounds(36., 4., 24., 24.));
+        let blue = &outer.scene.groups[0];
+        assert_eq!(blue.bounds, scaled_bounds(0., 0., 24., 24.));
+        let mask = blue.mask.as_ref().expect("masked");
+        assert_eq!(
+            (mask.mode, mask.image.bounds),
+            (MaskMode::Luminance, scaled_bounds(0., 0., 24., 24.))
+        );
+        assert!(outer.mask.is_none());
+        assert_eq!(scene.group_depth(), 2);
+        // A group draws only inside its mask's image.
+        assert_eq!(scene.groups[2].bounds, scaled_bounds(10., 42., 12., 12.));
+        // Renderers without groups draw the content unmasked and the masks not at all.
+        let flat = scene.without_groups();
+        let colors: Vec<f32> = flat.quads.iter().map(|q| q.background.solid.a).collect();
+        assert_eq!(
+            colors,
+            [1., 1., 1., 1., 1.],
+            "page, red, blue, green, black"
+        );
+        // `scenes` visits masks' images.
+        assert_eq!(
+            scene.scenes().len(),
+            8,
+            "the page, three groups and their masks, the blue group"
+        );
+    }
+
+    #[test]
+    fn a_mask_outside_any_group_masks_nothing() {
+        let mut scene = Scene::default();
+        scene.push_group(GroupEffects {
+            masks_parent: Some(MaskMode::Alpha),
+            ..effects(1.)
+        });
+        scene.insert_primitive(opaque_quad(scaled_bounds(0., 0., 10., 10.)));
+        scene.pop_group();
+        scene.insert_primitive(opaque_quad(scaled_bounds(20., 0., 10., 10.)));
+        scene.finish();
+        assert!(scene.groups.is_empty());
+        assert_eq!(scene.quads.len(), 1);
+    }
+
+    #[test]
     fn group_composite_uniforms_match_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<GroupCompositeUniforms>(), 160);
+        assert_eq!(std::mem::size_of::<GroupCompositeUniforms>(), 176);
+        assert_eq!(
+            std::mem::offset_of!(GroupCompositeUniforms, mask_region),
+            160
+        );
         assert_eq!(
             std::mem::offset_of!(GroupCompositeUniforms, filter_kinds),
             64
@@ -4182,7 +4482,7 @@ mod tests {
         scene.insert_primitive(opaque_quad(scaled_bounds(0., 0., 10., 10.)));
         scene.pop_group();
         scene.finish();
-        let uniforms = scene.groups[0].composite_uniforms([0.; 4], [0.; 4], [100., 100.]);
+        let uniforms = scene.groups[0].composite_uniforms([0.; 4], [0.; 4], [0.; 4], [100., 100.]);
         assert_eq!(uniforms.filter_count, MAX_COLOR_FILTERS as u32);
         assert_eq!(uniforms.filter_kinds[1][3], 4);
         assert!((uniforms.filter_amounts[0][0] - std::f32::consts::PI).abs() < 1e-6);
