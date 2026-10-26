@@ -632,19 +632,19 @@ impl TextSystem {
                         // where it is `gpui_web`'s bundled system family) is sure to have,
                         // then any family the platform has. No family name fails while a
                         // font is loaded.
-                        std::iter::once(SharedString::from(".SystemUIFont"))
-                            .chain(
-                                self.platform_text_system
-                                    .all_font_names()
-                                    .into_iter()
-                                    .map(SharedString::from),
-                            )
-                            .find_map(|family| {
-                                lookup_font(&Font {
-                                    family,
-                                    ..font.clone()
-                                })
+                        let mut with_traits = |family: SharedString| {
+                            lookup_font(&Font {
+                                family,
+                                ..font.clone()
                             })
+                        };
+                        with_traits(".SystemUIFont".into()).or_else(|| {
+                            // Enumerated only when the UI font is missing too.
+                            self.platform_text_system
+                                .all_font_names()
+                                .into_iter()
+                                .find_map(|family| with_traits(family.into()))
+                        })
                     });
                 if let Some(font_id) = font_id {
                     font_ids.with_upgraded(|font_ids| {
@@ -1570,13 +1570,15 @@ mod font_resolution_tests {
     }
     /// A platform with one family (as the web build has only its bundled fonts): every
     /// other name is missing. Its bold face is `FontId(8)`, every other face `FontId(7)`.
-    struct OneFamily(NoopTextSystem, &'static str);
+    /// Counts how often the font catalog is enumerated.
+    struct OneFamily(NoopTextSystem, &'static str, std::sync::atomic::AtomicUsize);
 
     impl PlatformTextSystem for OneFamily {
         fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
             self.0.add_fonts(fonts)
         }
         fn all_font_names(&self) -> Vec<String> {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             vec![self.1.into()]
         }
         fn font_id(&self, descriptor: &Font) -> Result<FontId> {
@@ -1629,7 +1631,8 @@ mod font_resolution_tests {
         // The web's case (only the UI font) and a platform whose one family is not it;
         // either way the fallback keeps the requested weight.
         for only in [".SystemUIFont", "Bundled"] {
-            let text_system = TextSystem::new(Arc::new(OneFamily(NoopTextSystem::new(), only)));
+            let platform = Arc::new(OneFamily(NoopTextSystem::new(), only, Default::default()));
+            let text_system = TextSystem::new(platform.clone());
             for family in [
                 "WeldSans",
                 "",
@@ -1649,6 +1652,13 @@ mod font_resolution_tests {
                     "{only} {family:?}"
                 );
             }
+            // The catalog is only enumerated when the UI font is missing too.
+            let enumerated = platform.2.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                enumerated == 0,
+                only == ".SystemUIFont",
+                "{only}: {enumerated}"
+            );
         }
     }
 }
