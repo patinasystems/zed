@@ -634,6 +634,7 @@ impl Platform for WebPlatform {
             CursorStyle::DragLink => "alias",
             CursorStyle::DragCopy => "copy",
             CursorStyle::ContextualMenu => "context-menu",
+            CursorStyle::Image(id) => image_cursor_css(id),
         };
 
         self.last_cursor_css.set(css_cursor);
@@ -878,6 +879,58 @@ fn show_graphics_unavailable_message(browser_window: &web_sys::Window, error: &a
         "Failed to initialize browser graphics: {error}"
     )));
     body.append_child(&message).ok();
+}
+
+/// The CSS `cursor` value showing the registered image `id`: its PNG as a
+/// data URL with its hot spot in CSS px, the arrow when it cannot load
+/// (made once per image, kept for the page's life).
+fn image_cursor_css(id: gpui::CursorImageId) -> &'static str {
+    thread_local! {
+        static CSS: std::cell::RefCell<std::collections::HashMap<u32, &'static str>> = Default::default();
+    }
+    if let Some(css) = CSS.with(|c| c.borrow().get(&id.0).copied()) {
+        return css;
+    }
+    let Some(image) = gpui::cursor_image(id) else {
+        return "default";
+    };
+    let Some(png) = image.png() else {
+        return "default";
+    };
+    // CSS reads a cursor image at 1 image px per CSS px: a 2x image goes
+    // through `image-set` so it shows at its point size. A value with a
+    // function the browser does not know is dropped whole, so each form is
+    // its own candidate: the first the browser supports is used.
+    let url = format!("data:image/png;base64,{}", base64_encode(&png));
+    let (x, y) = (image.hotspot.x.round() as i32, image.hotspot.y.round() as i32);
+    let scale = image.scale;
+    let candidates = [
+        format!(r#"image-set(url("{url}") {scale}x) {x} {y}, default"#),
+        format!(r#"-webkit-image-set(url("{url}") {scale}x) {x} {y}, default"#),
+        format!(r#"url("{url}") {} {}, default"#, (image.hotspot.x * scale).round() as i32, (image.hotspot.y * scale).round() as i32),
+    ];
+    let Some(chosen) = candidates.into_iter().find(|c| web_sys::css::supports_with_value("cursor", c).unwrap_or(false)) else {
+        return "default";
+    };
+    let css: &'static str = Box::leak(chosen.into_boxed_str());
+    CSS.with(|c| c.borrow_mut().insert(id.0, css));
+    css
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(TABLE[((n >> (18 - 6 * k)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn set_body_cursor(browser_window: &web_sys::Window, css_cursor: &str) {

@@ -2543,11 +2543,87 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::Image(id) => image_cursor(id),
         };
 
         let bounds: NSRect = msg_send![this, bounds];
         let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
     }
+}
+
+/// The `NSCursor` showing the registered image `id` (made once, kept), or
+/// the arrow when no image has that id.
+fn image_cursor(id: gpui::CursorImageId) -> *mut AnyObject {
+    thread_local! {
+        static CURSORS: std::cell::RefCell<std::collections::HashMap<u32, Retained<AnyObject>>> = Default::default();
+    }
+    if let Some(cursor) = CURSORS.with(|c| c.borrow().get(&id.0).map(|c| Retained::as_ptr(c) as *mut AnyObject)) {
+        return cursor;
+    }
+    let arrow = || -> *mut AnyObject { unsafe { msg_send![class!(NSCursor), arrowCursor] } };
+    let Some(image) = gpui::cursor_image(id) else {
+        return arrow();
+    };
+    let (w, h) = (image.width as usize, image.height as usize);
+    let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(4)) else {
+        return arrow();
+    };
+    if w == 0 || h == 0 || image.rgba.len() < bytes || w > 1024 || h > 1024 {
+        return arrow();
+    }
+    // SAFETY: plain AppKit object construction on the main thread (cursor
+    // rects are reset there); the bitmap is `w` x `h` RGBA8 with rows of
+    // `w * 4` bytes, which the copy below fills from `image.rgba` (checked
+    // to hold that many bytes).
+    let cursor: Option<Retained<AnyObject>> = unsafe {
+        let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), alloc];
+        let planes: *mut *mut u8 = std::ptr::null_mut();
+        let color_space = NSString::from_str("NSDeviceRGBColorSpace");
+        let rep: *mut AnyObject = msg_send![
+            rep,
+            initWithBitmapDataPlanes: planes,
+            pixelsWide: w as NSInteger,
+            pixelsHigh: h as NSInteger,
+            bitsPerSample: 8 as NSInteger,
+            samplesPerPixel: 4 as NSInteger,
+            hasAlpha: Bool::YES,
+            isPlanar: Bool::NO,
+            colorSpaceName: &*color_space,
+            bytesPerRow: (w * 4) as NSInteger,
+            bitsPerPixel: 32 as NSInteger
+        ];
+        if rep.is_null() {
+            None
+        } else {
+            // AppKit bitmaps hold premultiplied alpha.
+            let data: *mut u8 = msg_send![rep, bitmapData];
+            let pixels = std::slice::from_raw_parts_mut(data, w * h * 4);
+            for (out, px) in pixels.chunks_exact_mut(4).zip(image.rgba.chunks_exact(4)) {
+                let a = u16::from(px[3]);
+                for k in 0..3 {
+                    out[k] = ((u16::from(px[k]) * a + 127) / 255) as u8;
+                }
+                out[3] = px[3];
+            }
+            let scale = f64::from(image.scale.max(0.01));
+            let size = NSSize::new(w as f64 / scale, h as f64 / scale);
+            let ns_image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let ns_image: *mut AnyObject = msg_send![ns_image, initWithSize: size];
+            let _: () = msg_send![ns_image, addRepresentation: rep];
+            let _: () = msg_send![rep, release];
+            let hotspot = NSPoint::new(f64::from(image.hotspot.x), f64::from(image.hotspot.y));
+            let cursor: *mut AnyObject = msg_send![class!(NSCursor), alloc];
+            let cursor: *mut AnyObject = msg_send![cursor, initWithImage: ns_image, hotSpot: hotspot];
+            let _: () = msg_send![ns_image, release];
+            Retained::from_raw(cursor)
+        }
+    };
+    let Some(cursor) = cursor else {
+        return arrow();
+    };
+    let ptr = Retained::as_ptr(&cursor) as *mut AnyObject;
+    CURSORS.with(|c| c.borrow_mut().insert(id.0, cursor));
+    ptr
 }
 
 extern "C" fn handle_key_equivalent(
@@ -4054,3 +4130,38 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod image_cursor_tests {
+    use super::*;
+
+    /// An image cursor is an `NSCursor` of the image's point size with its
+    /// hot spot, made once; an unknown id is the arrow.
+    #[test]
+    fn image_cursors_are_made_once_at_their_point_size() {
+        let id = gpui::register_cursor_image(gpui::CursorImage {
+            rgba: vec![255; 32 * 32 * 4].into(),
+            width: 32,
+            height: 32,
+            scale: 2.0,
+            hotspot: gpui::Point::new(8.0, 8.0),
+        });
+        let cursor = image_cursor(id);
+        assert_eq!(cursor, image_cursor(id), "made once");
+        let arrow: *mut AnyObject = unsafe { msg_send![class!(NSCursor), arrowCursor] };
+        assert_ne!(cursor, arrow);
+        // SAFETY: `cursor` is a live NSCursor kept by the cache.
+        unsafe {
+            let image: *mut AnyObject = msg_send![cursor, image];
+            let size: NSSize = msg_send![image, size];
+            assert_eq!((size.width, size.height), (16.0, 16.0));
+            let hot: NSPoint = msg_send![cursor, hotSpot];
+            assert_eq!((hot.x, hot.y), (8.0, 8.0));
+        }
+        assert_eq!(image_cursor(gpui::CursorImageId(u32::MAX)), arrow);
+        // Sizes that overflow, or more pixels than given: the arrow.
+        let huge = gpui::register_cursor_image(gpui::CursorImage { rgba: Vec::new().into(), width: 1 << 31, height: 1 << 31, scale: 1.0, hotspot: gpui::Point::default() });
+        assert_eq!(image_cursor(huge), arrow);
+    }
+}
+

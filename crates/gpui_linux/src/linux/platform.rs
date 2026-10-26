@@ -1343,6 +1343,8 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        // Image cursors are not supported here: the arrow.
+        CursorStyle::Image(_) => &[DEFAULT_CURSOR_ICON_NAME],
     }
 }
 
