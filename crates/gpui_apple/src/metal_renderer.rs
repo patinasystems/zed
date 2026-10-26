@@ -1696,9 +1696,9 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> Result<()> {
-        let Some(first_path) = paths.first() else {
+        if paths.is_empty() {
             return Ok(());
-        };
+        }
         let intermediate_texture = self
             .path_intermediate_texture
             .as_ref()
@@ -1722,27 +1722,12 @@ impl MetalRenderer {
         );
 
         // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites;
-        if paths.last().unwrap().order == first_path.order {
-            sprites = paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites = vec![PathSprite { bounds }];
-        }
+        // each pixel must only be copied once, in case of transparent paths:
+        // overlapping paths' bounds are copied as one region.
+        let sprites: Vec<PathSprite> = gpui::path_copy_bounds(paths)
+            .into_iter()
+            .map(|bounds| PathSprite { bounds })
+            .collect();
 
         let sprite_instance_bindings = writer.write(&sprites)?;
         command_encoder.set_vertex_buffer(
@@ -2851,6 +2836,40 @@ mod tests {
             n * mem::size_of::<ShapeInstance>(),
         );
         assert_eq!(uploaded_after_first, 0, "pan frames must upload nothing");
+    }
+
+    /// Two overlapping translucent paths in one paint layer (one draw order): each pixel
+    /// is copied from the intermediate once, so the overlap is the two composited, not
+    /// that composited twice.
+    #[test]
+    fn overlapping_paths_in_one_layer_composite_once() {
+        use gpui::{Bounds, ContentMask, Path, ScaledPixels, px};
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.update_transparency(true);
+        let all = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(64.), ScaledPixels(32.)));
+        let rect = |x: f32| {
+            let mut path = Path::new(point(px(x), px(4.)));
+            path.line_to(point(px(x + 30.), px(4.)));
+            path.line_to(point(px(x + 30.), px(28.)));
+            path.line_to(point(px(x), px(28.)));
+            path.line_to(point(px(x), px(4.)));
+            let mut path = path.scale(1.);
+            path.content_mask = ContentMask { bounds: all };
+            path.color = gpui::Hsla { h: 0., s: 0., l: 0., a: 0.5 }.into();
+            path
+        };
+        let mut scene = Scene::default();
+        scene.push_layer(all);
+        scene.insert_primitive(rect(4.));
+        scene.insert_primitive(rect(20.));
+        scene.pop_layer();
+        scene.finish();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size(DevicePixels(64), DevicePixels(32)))
+            .expect("render");
+        // One path: alpha 0.5. Both: 0.75 (composited once), not 0.9375 (twice).
+        let alpha = |x: u32| image.get_pixel(x, 16).0[3] as f32 / 255.;
+        assert!((alpha(10) - 0.5).abs() < 0.02, "one path {}", alpha(10));
+        assert!((alpha(27) - 0.75).abs() < 0.02, "the overlap {}", alpha(27));
     }
 
     #[test]

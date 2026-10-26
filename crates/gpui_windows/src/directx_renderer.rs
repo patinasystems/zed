@@ -691,31 +691,17 @@ impl DirectXRenderer {
     }
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        let Some(first_path) = paths.first() else {
+        if paths.is_empty() {
             return Ok(());
-        };
+        }
 
         // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites = if paths.last().unwrap().order == first_path.order {
-            paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
-        };
+        // each pixel must only be copied once, in case of transparent paths:
+        // overlapping paths' bounds are copied as one region.
+        let sprites: Vec<PathSprite> = gpui::path_copy_bounds(paths)
+            .into_iter()
+            .map(|bounds| PathSprite { bounds })
+            .collect();
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
