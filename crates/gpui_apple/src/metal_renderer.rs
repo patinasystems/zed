@@ -2733,6 +2733,10 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
     }
+
+    fn set_transparent(&mut self, transparent: bool) {
+        self.renderer.update_transparency(transparent);
+    }
 }
 
 #[cfg(test)]
