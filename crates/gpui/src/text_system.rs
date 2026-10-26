@@ -1607,7 +1607,11 @@ mod font_resolution_tests {
         fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
             self.0.layout_line(text, font_size, runs)
         }
-        fn recommended_rendering_mode(&self, font_id: FontId, font_size: Pixels) -> TextRenderingMode {
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
             self.0.recommended_rendering_mode(font_id, font_size)
         }
     }
@@ -1615,9 +1619,20 @@ mod font_resolution_tests {
     #[test]
     fn no_family_name_fails_while_the_platform_has_a_font() {
         let text_system = TextSystem::new(Arc::new(OneFamily(NoopTextSystem::new())));
-        for family in ["WeldSans", "", "Nope, Other", ".ZedSans", "\u{0}", "😀 emoji family"] {
+        for family in [
+            "WeldSans",
+            "",
+            "Nope, Other",
+            ".ZedSans",
+            "\u{0}",
+            "😀 emoji family",
+        ] {
             for requested in [font(family), font(family).bold().italic()] {
-                assert_eq!(text_system.resolve_font(&requested), FontId(7), "{family:?}");
+                assert_eq!(
+                    text_system.resolve_font(&requested),
+                    FontId(7),
+                    "{family:?}"
+                );
             }
         }
     }
