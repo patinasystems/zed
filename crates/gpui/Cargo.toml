@@ -36,6 +36,8 @@ inspector = ["gpui_macros/inspector"]
 # Tracks every entity handle so tests can assert nothing leaked. Also enabled
 # by setting `GPUI_LEAK_DETECTION` when building; see `build.rs`.
 leak-detection = []
+# `Window::render_to_image` outside tests: capture what a window draws (macOS).
+window-capture = []
 font-kit = []
 wayland = []
 x11 = [

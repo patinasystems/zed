@@ -7,7 +7,7 @@ use gpui::{
     Path, Point, PrimitiveBatch, RetainedShapesDraw, RetainedUpload, ScaledPixels, Scene,
     ShapeInstance, Size, point, size,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
 use std::collections::HashMap;
@@ -714,13 +714,14 @@ impl MetalRenderer {
         Ok(command_buffer)
     }
 
-    /// Renders the scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing
-    /// where we want to capture what would be rendered without displaying it.
+    /// Renders the scene at the layer's drawable size to an offscreen texture
+    /// and returns the pixel data as an RGBA image. Nothing is presented and
+    /// no drawable is taken, so the window may be hidden: useful for visual
+    /// tests and for exporting what a window draws.
     ///
-    /// Note: This requires a layer-backed renderer. For headless rendering,
-    /// use `render_scene_to_image()` instead.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Note: This requires a layer-backed renderer (for its size). For
+    /// headless rendering, use `render_scene_to_image()` instead.
+    #[cfg(any(test, feature = "test-support", feature = "window-capture"))]
     pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
         let layer = self
             .layer
@@ -731,24 +732,14 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = layer
-            .next_drawable()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
-
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size)?;
-
-        // Commit and wait for completion without presenting
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-
-        read_texture_to_image(drawable.texture())
+        self.render_scene_to_image(scene, viewport_size)
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
     ///
     /// This is the primary method for headless rendering. It creates an offscreen
     /// texture, renders the scene to it, and returns the pixel data as an RGBA image.
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
     pub fn render_scene_to_image(
         &mut self,
         scene: &Scene,
@@ -2093,7 +2084,7 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;
