@@ -208,6 +208,17 @@ impl PlatformTextSystem for CosmicTextSystem {
         Ok(candidates[ix])
     }
 
+    fn font_id_for_postscript_name(&self, postscript_name: &str) -> Option<FontId> {
+        let mut state = self.0.write();
+        let id = state
+            .font_system
+            .db()
+            .faces()
+            .find(|face| face.post_script_name == postscript_name)?
+            .id;
+        state.font_id_for_cosmic_id(id).ok()
+    }
+
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
         self.0.write().prewarm_fonts(font_ids);
     }
@@ -1231,6 +1242,42 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn font_id_for_postscript_name_finds_loaded_faces() -> Result<()> {
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        assert_eq!(text_system.font_id_for_postscript_name("IBMPlexSans"), None);
+        text_system.add_fonts(vec![
+            Cow::Borrowed(IBM_PLEX),
+            Cow::Borrowed(LILEX),
+            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+        ])?;
+        // A face family matching loaded is found as that font.
+        let matched = text_system.font_id(&Font {
+            weight: gpui::FontWeight::BOLD,
+            ..gpui::font("Lilex")
+        })?;
+        let bold = text_system
+            .font_id_for_postscript_name("Lilex-Bold")
+            .context("Lilex-Bold")?;
+        assert_eq!(bold, matched);
+        // A face no family lookup loaded yet is loaded once.
+        let plex = text_system
+            .font_id_for_postscript_name("IBMPlexSans")
+            .context("IBMPlexSans")?;
+        assert_eq!(
+            text_system.font_id_for_postscript_name("IBMPlexSans"),
+            Some(plex)
+        );
+        let regular = text_system
+            .font_id_for_postscript_name("Lilex-Regular")
+            .context("Lilex-Regular")?;
+        assert_ne!(regular, bold);
+        let m = text_system.glyph_for_char(regular, 'm').context("m")?;
+        assert_eq!(text_system.glyph_for_char(bold, 'm'), Some(m));
+        assert_eq!(text_system.font_id_for_postscript_name("Lilex"), None);
+        Ok(())
+    }
 
     #[test]
     fn all_font_names_tracks_available_families() -> Result<()> {

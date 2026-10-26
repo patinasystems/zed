@@ -278,6 +278,13 @@ impl PlatformTextSystem for WebTextSystem {
         Ok(font_id)
     }
 
+    fn font_id_for_postscript_name(&self, postscript_name: &str) -> Option<FontId> {
+        // A native face, painted with its own glyph ids: no Canvas fallback applies.
+        self.native
+            .font_id_for_postscript_name(postscript_name)
+            .filter(|font_id| font_id.0 & CANVAS_FONT_BIT == 0)
+    }
+
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
         if font_ids
             .iter()
