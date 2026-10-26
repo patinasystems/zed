@@ -3253,7 +3253,9 @@ pub mod blend_mode_test_scene {
     /// Straight backdrop and source colors (RGBA) of each column.
     pub const PAIRS: [([f32; 4], [f32; 4]); 4] = [
         ([0.8, 0.3, 0.2, 1.], [0.2, 0.6, 0.9, 1.]),
-        ([0.1, 0.7, 0.4, 1.], [0.9, 0.5, 0.1, 0.6]),
+        // Unclamped color dodge and burn amplify 8-bit rounding near their poles
+        // (a source channel near 1 or 0): these stay clear of them.
+        ([0.1, 0.7, 0.4, 1.], [0.7, 0.5, 0.15, 0.6]),
         ([0.5, 0.5, 0.5, 0.5], [0.7, 0.2, 0.6, 1.]),
         ([0.95, 0.9, 0.1, 1.], [0.3, 0.3, 0.8, 0.8]),
     ];
@@ -3332,37 +3334,25 @@ pub mod blend_mode_test_scene {
             BlendMode::Overlay => hard_light(s, b),
             BlendMode::Darken => b.min(s),
             BlendMode::Lighten => b.max(s),
+            // Unclamped (see `reference`), as the shaders: the divisor floors at 1e-6.
             BlendMode::ColorDodge => {
-                if b == 0. {
+                if b <= 0. {
                     0.
-                } else if s >= 1. {
-                    1.
                 } else {
-                    (b / (1. - s)).min(1.)
+                    b / (1. - s).max(1e-6)
                 }
             }
             BlendMode::ColorBurn => {
                 if b >= 1. {
                     1.
-                } else if s <= 0. {
-                    0.
                 } else {
-                    1. - ((1. - b) / s).min(1.)
+                    1. - (1. - b) / s.max(1e-6)
                 }
             }
             BlendMode::HardLight => hard_light(b, s),
-            BlendMode::SoftLight => {
-                if s <= 0.5 {
-                    b - (1. - 2. * s) * b * (1. - b)
-                } else {
-                    let d = if b <= 0.25 {
-                        ((16. * b - 12.) * b + 4.) * b
-                    } else {
-                        b.sqrt()
-                    };
-                    b + (2. * s - 1.) * (d - b)
-                }
-            }
+            // WebKit's (Core Graphics') soft light: one curve for every source. CSS
+            // Compositing 1 switches to a square root above 0.5.
+            BlendMode::SoftLight => b + (2. * s - 1.) * b * (1. - b),
             BlendMode::Difference => (b - s).abs(),
             BlendMode::Exclusion => b + s - 2. * b * s,
             _ => s,
@@ -3396,9 +3386,17 @@ pub mod blend_mode_test_scene {
             _ => std::array::from_fn(|i| separable(mode, b[i], s[i])),
         };
         let a = a_s + ab * (1. - a_s);
+        // WebKit (Core Graphics) mixes color dodge and burn unclamped and clamps the
+        // result: a translucent source that dodges past 1 still lands at 1.
+        let unclamped = matches!(mode, BlendMode::ColorDodge | BlendMode::ColorBurn);
         let c: [f32; 3] = std::array::from_fn(|i| {
-            let mixed = (1. - ab) * s[i] + ab * blended[i].clamp(0., 1.);
-            a_s * mixed + ab * b[i] * (1. - a_s)
+            let blended = if unclamped {
+                blended[i]
+            } else {
+                blended[i].clamp(0., 1.)
+            };
+            let mixed = (1. - ab) * s[i] + ab * blended;
+            (a_s * mixed + ab * b[i] * (1. - a_s)).clamp(0., a)
         });
         [c[0], c[1], c[2], a]
     }
@@ -4453,6 +4451,42 @@ mod tests {
         scene.finish();
         assert!(scene.groups.is_empty());
         assert_eq!(scene.quads.len(), 1);
+    }
+
+    #[test]
+    fn blend_reference_matches_webkit() {
+        use blend_mode_test_scene::reference;
+        // Measured in Playwright WebKit (macOS): a source over the opaque backdrop
+        // #4f7cff, then 8-bit channels.
+        let backdrop = [79. / 255., 124. / 255., 1., 1.];
+        let px = |c: [f32; 4]| [c[0], c[1], c[2]].map(|v| (v * 255.).round() as i32);
+        let near =
+            |got: [i32; 3], want: [i32; 3]| got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 2);
+        let purple = [192. / 255., 75. / 255., 216. / 255., 0.6];
+        let slate = [117. / 255., 128. / 255., 165. / 255., 0.8];
+        // Color dodge and burn mix unclamped, then clamp.
+        assert!(near(
+            px(reference(BlendMode::ColorDodge, backdrop, purple)),
+            [222, 155, 255]
+        ));
+        assert!(near(
+            px(reference(BlendMode::ColorBurn, backdrop, purple)),
+            [44, 0, 255]
+        ));
+        assert!(near(
+            px(reference(BlendMode::ColorBurn, backdrop, slate)),
+            [0, 19, 255]
+        ));
+        // Soft light keeps one curve above 0.5 (opaque grays: backdrop 32, source 255 → 60).
+        let gray = |v: f32| [v / 255., v / 255., v / 255., 1.];
+        assert!(near(
+            px(reference(BlendMode::SoftLight, gray(32.), gray(255.))),
+            [60; 3]
+        ));
+        assert!(near(
+            px(reference(BlendMode::SoftLight, gray(192.), gray(160.))),
+            [204; 3]
+        ));
     }
 
     #[test]

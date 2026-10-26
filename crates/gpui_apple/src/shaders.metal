@@ -2132,20 +2132,17 @@ float3 group_blend(float3 b, float3 s, uint mode) {
     return min(b, s);
   case 5:
     return max(b, s);
-  case 6: {
-    float3 dodge = min(float3(1.), b / max(1. - s, float3(1e-6)));
-    return select(select(dodge, float3(1.), s >= float3(1.)), float3(0.), b <= float3(0.));
-  }
-  case 7: {
-    float3 burn = 1. - min(float3(1.), (1. - b) / max(s, float3(1e-6)));
-    return select(select(burn, float3(0.), s <= float3(0.)), float3(1.), b >= float3(1.));
-  }
+  // Color dodge and burn are not clamped here: WebKit (Core Graphics) mixes the
+  // unclamped result with the backdrop and clamps after (`group_composite_fragment`).
+  case 6:
+    return select(b / max(1. - s, float3(1e-6)), float3(0.), b <= float3(0.));
+  case 7:
+    return select(1. - (1. - b) / max(s, float3(1e-6)), float3(1.), b >= float3(1.));
   case 8:
     return group_hard_light(b, s);
-  case 9: {
-    float3 d = select(sqrt(b), ((16. * b - 12.) * b + 4.) * b, b <= float3(0.25));
-    return select(b + (2. * s - 1.) * (d - b), b - (1. - 2. * s) * b * (1. - b), s <= float3(0.5));
-  }
+  // Soft light as WebKit (Core Graphics) draws it: one curve for every source.
+  case 9:
+    return b + (2. * s - 1.) * b * (1. - b);
   case 10:
     return abs(b - s);
   case 11:
@@ -2204,6 +2201,12 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
   }
   float3 s = color.rgb / max(color.a, 1e-6);
   float3 b = behind.rgb / max(behind.a, 1e-6);
+  if (mode == 6 || mode == 7) {
+    // The whole result, clamped once (drawn with the replacing pipeline).
+    float3 mixed = (1. - behind.a) * s + behind.a * group_blend(b, s, mode);
+    float alpha = color.a + behind.a * (1. - color.a);
+    return float4(clamp(mixed * color.a + behind.rgb * (1. - color.a), float3(0.), float3(alpha)), alpha);
+  }
   float3 mixed = (1. - behind.a) * s + behind.a * saturate(group_blend(b, s, mode));
   return float4(mixed * color.a, color.a);
 }

@@ -162,7 +162,9 @@ impl BackdropPipelines {
     fn group_composite(&self, blend_mode: gpui::BlendMode) -> &wgpu::RenderPipeline {
         match blend_mode {
             gpui::BlendMode::PlusLighter => &self.group_add,
-            gpui::BlendMode::PlusDarker => &self.group_replace,
+            gpui::BlendMode::PlusDarker
+            | gpui::BlendMode::ColorDodge
+            | gpui::BlendMode::ColorBurn => &self.group_replace,
             _ => &self.group_over,
         }
     }
