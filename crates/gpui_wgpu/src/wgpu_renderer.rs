@@ -2837,22 +2837,12 @@ impl WgpuRendererCore {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
-        let first_path = &paths[0];
-        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
-        {
-            paths
-                .iter()
-                .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
-                })
-                .collect()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
-        };
+        // Each pixel is copied at most once (paths can be translucent): overlapping paths'
+        // bounds are copied as one region.
+        let sprites: Vec<PathSprite> = gpui::path_copy_bounds(paths)
+            .into_iter()
+            .map(|bounds| PathSprite { bounds })
+            .collect();
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
             return Ok(());

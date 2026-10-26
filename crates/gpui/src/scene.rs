@@ -2355,6 +2355,38 @@ where
     }
 }
 
+/// The regions to copy a batch of paths from the path intermediate texture to the target,
+/// each pixel at most once (paths can be translucent): the paths' clipped bounds, merged
+/// where they overlap. Paths of one draw order overlap when they are painted in one
+/// [`Window::paint_layer`](crate::Window::paint_layer), so the order alone does not make
+/// them disjoint. Batches of more than 256 paths copy their union.
+pub fn path_copy_bounds(paths: &[Path<ScaledPixels>]) -> Vec<Bounds<ScaledPixels>> {
+    let mut regions: Vec<Bounds<ScaledPixels>> = Vec::new();
+    if paths.len() > 256 {
+        let mut union = paths[0].clipped_bounds();
+        for path in &paths[1..] {
+            union = union.union(&path.clipped_bounds());
+        }
+        regions.push(union);
+        return regions;
+    }
+    for path in paths {
+        let mut bounds = path.clipped_bounds();
+        if bounds.is_empty() {
+            continue;
+        }
+        // Merge every region the new one overlaps, again until none overlaps it.
+        loop {
+            let Some(i) = regions.iter().position(|r| r.intersects(&bounds)) else {
+                break;
+            };
+            bounds = bounds.union(&regions.swap_remove(i));
+        }
+        regions.push(bounds);
+    }
+    regions
+}
+
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)
@@ -3399,6 +3431,39 @@ pub mod blend_mode_test_scene {
 mod tests {
     use super::*;
     use crate::{AtlasTextureId, AtlasTextureKind, DevicePixels, TileId, radians, size};
+
+    fn path_at(bounds: Bounds<ScaledPixels>, order: DrawOrder) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(crate::px(0.), crate::px(0.))).scale(1.);
+        path.bounds = bounds;
+        path.order = order;
+        path.content_mask = ContentMask {
+            bounds: scaled_bounds(-1000., -1000., 4000., 4000.),
+        };
+        path
+    }
+
+    #[test]
+    fn path_copy_bounds_merge_overlapping_paths_of_one_order() {
+        // One order (a paint layer), overlapping: one region, so each pixel is copied once.
+        let a = path_at(scaled_bounds(0., 0., 10., 10.), 3);
+        let b = path_at(scaled_bounds(8., 0., 10., 10.), 3);
+        let c = path_at(scaled_bounds(16., 0., 10., 10.), 3);
+        assert_eq!(
+            path_copy_bounds(&[a.clone(), b, c]),
+            vec![scaled_bounds(0., 0., 26., 10.)]
+        );
+        // Disjoint paths keep their own regions (no copy of the space between them).
+        let far = path_at(scaled_bounds(100., 100., 5., 5.), 3);
+        assert_eq!(
+            path_copy_bounds(&[a, far]),
+            vec![scaled_bounds(0., 0., 10., 10.), scaled_bounds(100., 100., 5., 5.)]
+        );
+        // A region that grows into another merges with it too.
+        let p = path_at(scaled_bounds(0., 0., 4., 4.), 1);
+        let q = path_at(scaled_bounds(10., 0., 4., 4.), 2);
+        let bridge = path_at(scaled_bounds(2., 0., 10., 4.), 3);
+        assert_eq!(path_copy_bounds(&[p, q, bridge]), vec![scaled_bounds(0., 0., 14., 4.)]);
+    }
 
     fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds::new(
