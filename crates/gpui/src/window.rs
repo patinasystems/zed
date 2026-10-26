@@ -12,19 +12,19 @@ use crate::{
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
     GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
     InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, RetainedShapes, RetainedShapesDraw,
-    RetainedShapesPaint, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
-    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
-    prelude::*, px, rems, size, transparent_black,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, RetainedShapes,
+    RetainedShapesDraw, RetainedShapesPaint, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4805,8 +4805,31 @@ impl Window {
             color_filters: group.filter.color_filters.iter().copied().collect(),
             blend_mode: group.blend_mode,
             content_mask: self.snapped_content_mask(),
+            masks_parent: None,
         };
         self.next_frame.scene.push_group(effects);
+        let previous_opacity = std::mem::replace(&mut self.element_opacity, 1.);
+        let result = f(self);
+        self.element_opacity = previous_opacity;
+        self.next_frame.scene.pop_group();
+        result
+    }
+
+    /// Paints the mask of the compositing group this is called in
+    /// ([`Window::with_compositing_group`]): what `f` paints is not drawn; its alpha,
+    /// or its luminance, multiplies the group's image, after the group's filter and
+    /// before its opacity (CSS `mask-image`, SVG `<mask>`). The group draws nothing
+    /// outside what `f` paints, and nothing at all when `f` paints nothing. A later
+    /// mask in the same group replaces an earlier one; called outside a group, it
+    /// masks nothing. Renderers that do not draw groups offscreen (DirectX) draw the
+    /// group unmasked.
+    pub fn paint_group_mask<R>(&mut self, mode: MaskMode, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.push_group(GroupEffects {
+            content_mask: self.snapped_content_mask(),
+            masks_parent: Some(mode),
+            ..GroupEffects::default()
+        });
         let previous_opacity = std::mem::replace(&mut self.element_opacity, 1.);
         let result = f(self);
         self.element_opacity = previous_opacity;

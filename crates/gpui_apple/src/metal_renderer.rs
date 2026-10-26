@@ -1111,7 +1111,47 @@ impl MetalRenderer {
             Some((texture, region)) => (texture.as_ref(), *region),
             None => (source.as_ref(), source_region),
         };
-        let uniforms = group.composite_uniforms(source_region, backdrop_region, viewport);
+        // The mask's image, drawn like a group's (it is never composited itself).
+        let mask = match &group.mask {
+            Some(mask) => {
+                let image_size = mask.image.image_size(viewport_size);
+                if image_size.width.0 <= 0 || image_size.height.0 <= 0 {
+                    // An empty mask draws nothing of the group.
+                    self.texture_pool.release(&image);
+                    for (texture, _) in blurred.iter().chain(backdrop.iter()) {
+                        self.texture_pool.release(texture);
+                    }
+                    return Ok(());
+                }
+                let texture = self.texture_pool.acquire(
+                    &self.device,
+                    bucket(image_size.width.0 as u64),
+                    bucket(image_size.height.0 as u64),
+                );
+                let bindings = write_instances(gradients, &mask.image.scene, writer)?;
+                self.draw_scene(
+                    root,
+                    &mask.image.scene,
+                    &bindings,
+                    writer,
+                    &texture,
+                    image_size,
+                    Some(transparent),
+                    command_buffer,
+                )?;
+                let region = [
+                    mask.image.bounds.origin.x.0,
+                    mask.image.bounds.origin.y.0,
+                    texture.width() as f32,
+                    texture.height() as f32,
+                ];
+                Some((texture, region))
+            }
+            None => None,
+        };
+        let mask_region = mask.as_ref().map_or([0.; 4], |(_, region)| *region);
+        let uniforms =
+            group.composite_uniforms(source_region, backdrop_region, mask_region, viewport);
         let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
         encoder.set_render_pipeline_state(
             self.group_composite_pipeline_states
@@ -1124,6 +1164,10 @@ impl MetalRenderer {
         encoder.set_fragment_bytes(1, uniforms_size, pointer);
         encoder.set_fragment_texture(0, Some(&source));
         encoder.set_fragment_texture(1, Some(backdrop_texture));
+        let mask_texture = mask
+            .as_ref()
+            .map_or(source.as_ref(), |(texture, _)| texture.as_ref());
+        encoder.set_fragment_texture(2, Some(mask_texture));
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
         encoder.end_encoding();
         // Later passes reuse these; Metal orders them after this composite.
@@ -1132,6 +1176,9 @@ impl MetalRenderer {
             self.texture_pool.release(texture);
         }
         if let Some((texture, _)) = &backdrop {
+            self.texture_pool.release(texture);
+        }
+        if let Some((texture, _)) = &mask {
             self.texture_pool.release(texture);
         }
         Ok(())
@@ -2846,7 +2893,10 @@ mod tests {
         use gpui::{Bounds, ContentMask, Path, ScaledPixels, px};
         let mut renderer = MetalHeadlessRenderer::new();
         renderer.renderer.update_transparency(true);
-        let all = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(64.), ScaledPixels(32.)));
+        let all = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(64.), ScaledPixels(32.)),
+        );
         let rect = |x: f32| {
             let mut path = Path::new(point(px(x), px(4.)));
             path.line_to(point(px(x + 30.), px(4.)));
@@ -2855,7 +2905,13 @@ mod tests {
             path.line_to(point(px(x), px(4.)));
             let mut path = path.scale(1.);
             path.content_mask = ContentMask { bounds: all };
-            path.color = gpui::Hsla { h: 0., s: 0., l: 0., a: 0.5 }.into();
+            path.color = gpui::Hsla {
+                h: 0.,
+                s: 0.,
+                l: 0.,
+                a: 0.5,
+            }
+            .into();
             path
         };
         let mut scene = Scene::default();
@@ -2864,8 +2920,12 @@ mod tests {
         scene.insert_primitive(rect(20.));
         scene.pop_layer();
         scene.finish();
-        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size(DevicePixels(64), DevicePixels(32)))
-            .expect("render");
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(64), DevicePixels(32)),
+        )
+        .expect("render");
         // One path: alpha 0.5. Both: 0.75 (composited once), not 0.9375 (twice).
         let alpha = |x: u32| image.get_pixel(x, 16).0[3] as f32 / 255.;
         assert!((alpha(10) - 0.5).abs() < 0.02, "one path {}", alpha(10));
@@ -3155,6 +3215,25 @@ mod tests {
         if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
             image
                 .save(std::path::Path::new(&dir).join("group_content_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    #[test]
+    fn group_masks_render() {
+        use gpui::group_mask_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("group_masks_metal.png"))
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);

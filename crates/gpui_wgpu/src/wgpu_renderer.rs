@@ -1257,8 +1257,9 @@ impl WgpuRendererCore {
             if with_uniforms {
                 layouts.push(Some(&uniform_layout));
             }
-            // Group composites also sample what is behind the group.
+            // Group composites also sample what is behind the group, and its mask.
             if vs == "vs_group_composite" {
+                layouts.push(Some(texture_layout));
                 layouts.push(Some(texture_layout));
             }
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1922,6 +1923,14 @@ impl WgpuRendererCore {
                     [size.width.0 as f32, size.height.0 as f32],
                     out,
                 );
+                if let Some(mask) = &group.mask {
+                    let size = mask.image.image_size(target);
+                    visit(
+                        &mask.image.scene,
+                        [size.width.0 as f32, size.height.0 as f32],
+                        out,
+                    );
+                }
             }
         }
         let mut viewports = SmallVec::new();
@@ -2314,10 +2323,64 @@ impl WgpuRendererCore {
             Some((scratch, region)) => (&scratch.view, *region),
             None => (source, source_region),
         };
-        let uniforms = group.composite_uniforms(source_region, backdrop_region, viewport);
+        // The mask's image, drawn like a group's (it is never composited itself).
+        let mask = match &group.mask {
+            Some(mask) => {
+                let image_size = mask.image.image_size(target.size);
+                if image_size.width.0 <= 0 || image_size.height.0 <= 0 {
+                    // An empty mask draws nothing of the group.
+                    let pool = &self.resources.texture_pool;
+                    pool.release(&image.texture);
+                    for (scratch, _) in blurred.iter().chain(backdrop.iter()) {
+                        pool.release(&scratch.texture);
+                    }
+                    return Ok(());
+                }
+                let texture = self.resources.texture_pool.acquire(
+                    &self.resources.device,
+                    self.target_format,
+                    bucket(image_size.width.0 as u32),
+                    bucket(image_size.height.0 as u32),
+                );
+                let mask_target = DrawTarget {
+                    view: &texture.view,
+                    texture: Some(&texture.texture),
+                    size: image_size,
+                };
+                let globals = self.group_globals(image_size);
+                let frame_globals = (
+                    std::mem::replace(&mut self.resources.globals_bind_group, globals.0),
+                    std::mem::replace(&mut self.resources.path_globals_bind_group, globals.1),
+                );
+                let result = self.draw_scene(
+                    encoder,
+                    frame,
+                    &mask.image.scene,
+                    mask_target,
+                    Some(wgpu::Color::TRANSPARENT),
+                    instance_offset,
+                );
+                self.resources.globals_bind_group = frame_globals.0;
+                self.resources.path_globals_bind_group = frame_globals.1;
+                result?;
+                let region = [
+                    mask.image.bounds.origin.x.0,
+                    mask.image.bounds.origin.y.0,
+                    texture.texture.width() as f32,
+                    texture.texture.height() as f32,
+                ];
+                Some((texture, region))
+            }
+            None => None,
+        };
+        let mask_region = mask.as_ref().map_or([0.; 4], |(_, region)| *region);
+        let uniforms =
+            group.composite_uniforms(source_region, backdrop_region, mask_region, viewport);
         let uniforms = self.backdrop_uniforms(uniforms.as_bytes());
         let source_group = self.create_texture_bind_group("group_image", source);
         let backdrop_group = self.create_texture_bind_group("group_backdrop", backdrop_view);
+        let mask_view = mask.as_ref().map_or(source, |(texture, _)| &texture.view);
+        let mask_group = self.create_texture_bind_group("group_mask", mask_view);
         let mut pass = target_pass(encoder, target, None, "group_composite");
         pass.set_pipeline(
             self.resources()
@@ -2328,6 +2391,7 @@ impl WgpuRendererCore {
         pass.set_bind_group(0, &source_group, &[]);
         pass.set_bind_group(1, &uniforms, &[]);
         pass.set_bind_group(2, &backdrop_group, &[]);
+        pass.set_bind_group(3, &mask_group, &[]);
         pass.draw(0..4, 0..1);
         drop(pass);
         // Later passes reuse these; wgpu orders them after this composite.
@@ -2335,6 +2399,9 @@ impl WgpuRendererCore {
         pool.release(&image.texture);
         for (scratch, _) in blurred.iter().chain(backdrop.iter()) {
             pool.release(&scratch.texture);
+        }
+        if let Some((texture, _)) = &mask {
+            pool.release(&texture.texture);
         }
         Ok(())
     }
@@ -4042,6 +4109,35 @@ mod tests {
         empty.finish();
         renderer.render_scene_to_image(&empty, size)?;
         assert_eq!(renderer.core.group_texture_bytes(), 0);
+        Ok(())
+    }
+
+    /// The shared group mask scene (alpha and luminance masks, a mask moving with an
+    /// offscreen group, a smaller mask, an empty one) on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn group_masks_render() -> anyhow::Result<()> {
+        use gpui::group_mask_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("group_masks_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
         Ok(())
     }
 
