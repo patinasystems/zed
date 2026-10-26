@@ -46,3 +46,10 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
 fn load_retained_shape(instance_id: u32) -> RetainedShape {
     return b_retained_shapes[instance_id];
 }
+
+// The frame's gradient records (`gpui::GradientRecord`), for quads.
+@group(2) @binding(0) var<storage, read> b_gradients: array<vec4<f32>>;
+
+fn load_gradient_texel(index: u32) -> vec4<f32> {
+    return b_gradients[index];
+}

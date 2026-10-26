@@ -135,6 +135,7 @@ struct Background {
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is a painted gpui::Gradient (`gradient` is its record)
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -142,7 +143,8 @@ struct Background {
     solid: Hsla,
     gradient_angle_or_pattern_height: f32,
     colors: array<LinearColorStop, 2>,
-    pad: u32,
+    // A painted gradient's first texel in the frame's gradient records.
+    gradient: u32,
 }
 
 struct AtlasTextureId {
@@ -548,6 +550,131 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
     return background_color;
 }
 
+// --- gradients (`gpui::Gradient`; records from `load_gradient_texel`) --- //
+
+// The eased position between two stops for a transition hint at `hint` (a fraction
+// of the segment): CSS `<linear-color-hint>`.
+fn gradient_hint(t: f32, hint: f32) -> f32 {
+    if (hint == 0.5) {
+        return t;
+    }
+    if (hint <= 0.0) {
+        return 1.0;
+    }
+    if (hint >= 1.0) {
+        return 0.0;
+    }
+    return pow(t, log(0.5) / log(hint));
+}
+
+fn gradient_linear_to_srgb(linear: vec3<f32>) -> vec3<f32> {
+    let higher = vec3<f32>(1.055) * pow(max(linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    let lower = linear * 12.92;
+    return select(higher, lower, linear < vec3<f32>(0.0031308));
+}
+
+fn gradient_oklab_to_srgb(lab: vec3<f32>) -> vec3<f32> {
+    let l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    let m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    let s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+    return gradient_linear_to_srgb(vec3<f32>(
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    ));
+}
+
+struct GradientVertex {
+    point: vec2<f32>,
+    stops: vec4<f32>,
+    header: vec4<f32>,
+    first: vec4<f32>,
+    last: vec4<f32>,
+}
+
+// A gradient's per-vertex values. The record (see `gpui::GradientRecord`): a header
+// (kind, stop count, repeating, color space), the geometry in fractions of the
+// bounds, then per stop its premultiplied color and (position, hint).
+// - point: where `position` falls, affine in it so it interpolates exactly: a linear
+//   gradient's position along its line (x), a radial gradient's offset from the center
+//   in radii, a conic gradient's offset from the center in pixels;
+// - stops: the first and last stop positions, the hint before the last, and a conic
+//   gradient's start angle;
+// - header, first and last: the header and the first and last stop colors.
+fn gradient_vertex(start: u32, position: vec2<f32>, bounds: Bounds) -> GradientVertex {
+    let header = load_gradient_texel(start);
+    let geometry = load_gradient_texel(start + 1u);
+    let last = start + 2u * u32(header.y);
+    let point = position - bounds.origin;
+
+    var out = GradientVertex();
+    if (header.x == 0.0) {
+        let line_start = geometry.xy * bounds.size;
+        let line = (geometry.zw - geometry.xy) * bounds.size;
+        out.point = vec2<f32>(dot(point - line_start, line) / max(dot(line, line), 1e-12), 0.0);
+    } else if (header.x == 1.0) {
+        out.point = (point - geometry.xy * bounds.size) / (geometry.zw * bounds.size);
+    } else {
+        out.point = point - geometry.xy * bounds.size;
+    }
+    let last_stop = load_gradient_texel(last + 1u);
+    out.stops = vec4<f32>(load_gradient_texel(start + 3u).x, last_stop.x, last_stop.y, geometry.z);
+    out.header = header;
+    out.first = load_gradient_texel(start + 2u);
+    out.last = load_gradient_texel(last);
+    return out;
+}
+
+// The gradient's straight-alpha sRGB color from its interpolated `point` and the flat
+// values `gradient_vertex` computed. Gradients of more than two stops read the inner
+// stops from the record.
+fn gradient_fill(start: u32, point: vec2<f32>, stops: vec4<f32>, header: vec4<f32>,
+    first: vec4<f32>, last: vec4<f32>, opacity: f32) -> vec4<f32> {
+    var t: f32;
+    if (header.x == 0.0) {
+        t = point.x;
+    } else if (header.x == 1.0) {
+        t = length(point);
+    } else {
+        t = fract((atan2(point.x, -point.y) - stops.w) / (2.0 * M_PI_F));
+    }
+    if (header.z != 0.0) {
+        let period = stops.y - stops.x;
+        t = stops.x + period * fract((t - stops.x) / period);
+    }
+
+    var color: vec4<f32>;
+    if (t <= stops.x) {
+        color = first;
+    } else if (t >= stops.y) {
+        color = last;
+    } else if (header.y <= 2.0) {
+        color = mix(first, last, gradient_hint((t - stops.x) / (stops.y - stops.x), stops.z));
+    } else {
+        let count = u32(header.y);
+        color = last;
+        for (var i = 1u; i < count; i++) {
+            let stop = load_gradient_texel(start + 3u + 2u * i);
+            if (t < stop.x) {
+                let before = load_gradient_texel(start + 1u + 2u * i).x;
+                let weight = gradient_hint((t - before) / (stop.x - before), stop.y);
+                color = mix(load_gradient_texel(start + 2u * i), load_gradient_texel(start + 2u + 2u * i), weight);
+                break;
+            }
+        }
+    }
+
+    let alpha = color.a;
+    var rgb = select(vec3<f32>(0.0), color.rgb / alpha, alpha > 0.0);
+    if (header.w == 1.0) {
+        rgb = gradient_oklab_to_srgb(rgb);
+    }
+    return vec4<f32>(rgb, alpha * opacity);
+}
+
 // --- quads --- //
 
 struct Quad {
@@ -574,6 +701,9 @@ struct QuadVarying {
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
     // The position in the quad's own (untransformed) frame.
     @location(6) local_position: vec2<f32>,
+    // A gradient's position (`gradient_vertex`) and stop range.
+    @location(7) gradient_point: vec2<f32>,
+    @location(8) @interpolate(flat) gradient_stops: vec4<f32>,
 }
 
 @vertex
@@ -603,6 +733,15 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_solid = gradient.solid;
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
+    if (quad.background.tag == 4u) {
+        // A gradient passes its header and end colors in the background varyings.
+        let vertex_gradient = gradient_vertex(quad.background.gradient, out.local_position, quad.bounds);
+        out.background_solid = vertex_gradient.header;
+        out.background_color0 = vertex_gradient.first;
+        out.background_color1 = vertex_gradient.last;
+        out.gradient_point = vertex_gradient.point;
+        out.gradient_stops = vertex_gradient.stops;
+    }
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
     return out;
@@ -618,6 +757,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     var quad = load_quad(input.quad_id);
     var position = input.position.xy;
     let transformed = is_transformed(quad.transformation);
+    var background_color = vec4<f32>(0.0);
+    if (quad.background.tag == 4u) {
+        background_color = gradient_fill(quad.background.gradient, input.gradient_point,
+            input.gradient_stops, input.background_solid, input.background_color0,
+            input.background_color1, quad.background.colors[0].color.a);
+    }
     if (transformed) {
         // Shade in the quad's own frame, scaled to device pixels so that edges
         // antialias over about one pixel.
@@ -632,8 +777,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         quad.border_widths.left *= scale.x;
     }
 
-    let background_color = gradient_color(quad.background, position, quad.bounds,
-        input.background_solid, input.background_color0, input.background_color1);
+    if (quad.background.tag != 4u) {
+        background_color = gradient_color(quad.background, position, quad.bounds,
+            input.background_solid, input.background_color0, input.background_color1);
+    }
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&

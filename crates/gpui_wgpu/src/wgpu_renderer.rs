@@ -227,6 +227,9 @@ struct FrameScenes<'a> {
     scenes: SmallVec<[FrameScene<'a>; 4]>,
     /// The retained shape uniform slot stride.
     retained_stride: u64,
+    /// The window scene's gradient records, which quads in every scene refer to
+    /// (`@group(2)` of the quad pipeline).
+    gradients: InstanceBinding,
 }
 
 struct FrameScene<'a> {
@@ -1045,13 +1048,14 @@ impl WgpuRendererCore {
             })
         };
 
+        // `@group(2)` holds the frame's gradient records, bound like instance data.
         let quads = create_pipeline(
             "quads",
             "vs_quad",
             "fs_quad",
             &layouts.globals,
             &layouts.instances,
-            None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1931,9 +1935,20 @@ impl WgpuRendererCore {
             .prepare_retained_shapes(&viewports)
             .context("retained shapes")?;
         let mut instance_offset = 0;
+        // First, at offset 0: the WebGL texture transport indexes its texture
+        // absolutely and quads index gradient records from 0.
+        let gradients = self
+            .write_instance_binding(
+                "gradients_bind_group",
+                &mut instance_offset,
+                &scene.gradients,
+            )
+            .context("gradients")?;
+        debug_assert_eq!(gradients.first_instance, 0);
         let mut frame = FrameScenes {
             scenes: SmallVec::new(),
             retained_stride,
+            gradients,
         };
         let mut retained_base = 0;
         for drawn in &scenes {
@@ -2045,12 +2060,17 @@ impl WgpuRendererCore {
 
         for batch in scene.batches() {
             match batch {
-                PrimitiveBatch::Quads(range) => self.draw_instances(
-                    &instance_bindings.quads,
-                    &self.resources().pipelines.quads,
-                    instance_range(range),
-                    open_pass(&mut pass, encoder, target),
-                ),
+                PrimitiveBatch::Quads(range) => {
+                    let pass = open_pass(&mut pass, encoder, target);
+                    // Quads read gradient records at `@group(2)`.
+                    pass.set_bind_group(2, &frame.gradients.bind_group, &[]);
+                    self.draw_instances(
+                        &instance_bindings.quads,
+                        &self.resources().pipelines.quads,
+                        instance_range(range),
+                        pass,
+                    )
+                }
                 PrimitiveBatch::Shadows(range) => self.draw_instances(
                     &instance_bindings.shadows,
                     &self.resources().pipelines.shadows,
@@ -3901,6 +3921,34 @@ mod tests {
             image.save(std::path::Path::new(&dir).join("backdrop_wgpu.png"))?;
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+        Ok(())
+    }
+
+    /// The shared gradient scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn gradients_render() -> anyhow::Result<()> {
+        use gpui::gradient_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("gradients_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 2);
         Ok(())
     }
 

@@ -10,18 +10,18 @@ use crate::{
     BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, Corners, CursorHideMode,
     CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
-    GlobalElementId, GlyphId, GpuSpecs, GroupEffects, Hsla, InputHandler, InputPreference, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, RetainedShapes, RetainedShapesDraw, RetainedShapesPaint,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
+    InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, RetainedShapes, RetainedShapesDraw,
+    RetainedShapesPaint, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
     prelude::*, px, rems, size, transparent_black,
@@ -4922,6 +4922,43 @@ impl Window {
         }
     }
 
+    /// Paints a CSS [`Gradient`] into `bounds`, inside `corner_radii`, as an element's
+    /// background image: clipped to the content mask, faded by the element opacity and
+    /// moved by the element transformation, like [`Window::paint_quad`]'s background.
+    ///
+    /// The gradient resolves against the bounds now (stop positions, the gradient line,
+    /// the radial ending shape) and its quad's fragment shader interpolates the stops.
+    /// Renderers that do not draw gradients (DirectX) fill the bounds with its first color.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_gradient(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        gradient: &Gradient,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if gradient.is_transparent() {
+            return;
+        }
+        let snapped = self.snap_bounds(bounds);
+        let Some(record) = gradient.resolve(
+            size(snapped.size.width.0, snapped.size.height.0),
+            self.scale_factor(),
+        ) else {
+            return;
+        };
+        let start = self.next_frame.scene.add_gradient(&record.texels);
+        self.paint_quad(PaintQuad {
+            bounds,
+            corner_radii,
+            background: Background::painted_gradient(start, gradient.first_color()),
+            border_widths: Edges::default(),
+            border_color: transparent_black(),
+            border_style: BorderStyle::default(),
+        });
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -8506,6 +8543,62 @@ mod tests {
             assert_eq!(filter.shader.scale_factor, scale);
             assert_eq!(filter.shader.uniforms(scene), &1f32.to_le_bytes());
             assert!(filter.shader.shader(scene).is_some());
+        })
+        .unwrap();
+    }
+
+    /// A half-faded, rounded div whose background is a gradient.
+    struct GradientBox;
+
+    impl Render for GradientBox {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .p(px(10.))
+                .child(div().size(px(40.)).opacity(0.5).rounded(px(6.)).bg(
+                    crate::Gradient::linear(
+                        crate::LinearDirection::Angle(90.),
+                        vec![
+                            crate::gradient_stop(
+                                hsla(0., 1., 0.5, 1.),
+                                crate::GradientLength::fraction(0.),
+                            ),
+                            crate::GradientStop::Hint(crate::GradientLength::px(10.)),
+                            crate::gradient_stop(
+                                hsla(0.6, 1., 0.5, 1.),
+                                crate::GradientLength::fraction(1.),
+                            ),
+                        ],
+                    ),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_style_gradient_paints_a_gradient_quad(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| GradientBox);
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            let scene = &window.rendered_frame.scene;
+            let quad = scene
+                .quads
+                .iter()
+                .find(|quad| quad.background.tag == crate::BackgroundTag::Gradient)
+                .expect("a gradient quad");
+            assert_eq!(
+                quad.background.colors[0].color.a, 0.5,
+                "fades with the element"
+            );
+            assert_eq!(quad.bounds.origin.x, ScaledPixels(10. * scale));
+            assert_eq!(quad.corner_radii.top_left, ScaledPixels(6. * scale));
+            let start = quad.background.gradient as usize;
+            let header = scene.gradients[start];
+            assert_eq!(header, [0., 2., 0., 0.], "linear, two stops");
+            // The hint sits 10 px into a 40 px line: a quarter of the segment.
+            assert_eq!(scene.gradients[start + 5][1], 0.25);
         })
         .unwrap();
     }

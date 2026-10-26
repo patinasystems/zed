@@ -49,6 +49,15 @@ struct GradientColor {
   float4 color1;
 };
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla color0, Hsla color1);
+struct GradientVertex {
+  float2 point;
+  float4 stops;
+  GradientColor colors;
+};
+GradientVertex gradient_vertex(constant float4 *gradients, uint start, float2 position,
+                               Bounds_ScaledPixels bounds);
+float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float4 stops,
+                     float4 header, float4 first, float4 last, float opacity);
 
 struct QuadVertexOutput {
   uint quad_id [[flat]];
@@ -59,6 +68,9 @@ struct QuadVertexOutput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  // A gradient's position (`gradient_vertex`) and stop range.
+  float2 gradient_point;
+  float4 gradient_stops [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -70,6 +82,9 @@ struct QuadFragmentInput {
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
+  // A gradient's position (`gradient_vertex`) and stop range.
+  float2 gradient_point;
+  float4 gradient_stops [[flat]];
 };
 
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
@@ -79,7 +94,9 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     constant Quad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
                                     constant Size_DevicePixels *viewport_size
-                                    [[buffer(QuadInputIndex_ViewportSize)]]) {
+                                    [[buffer(QuadInputIndex_ViewportSize)]],
+                                    constant float4 *gradients
+                                    [[buffer(QuadInputIndex_Gradients)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
   Bounds_ScaledPixels geometry = quad.bounds;
@@ -107,6 +124,16 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
     quad.background.colors[0].color,
     quad.background.colors[1].color
   );
+  float2 gradient_point = float2(0.);
+  float4 gradient_stops = float4(0.);
+  if (quad.background.tag == 4) {
+    // A gradient passes its header and end colors in the background varyings.
+    GradientVertex vertex_gradient = gradient_vertex(gradients, quad.background.gradient,
+                                                     local_position, quad.bounds);
+    gradient = vertex_gradient.colors;
+    gradient_point = vertex_gradient.point;
+    gradient_stops = vertex_gradient.stops;
+  }
 
   return QuadVertexOutput{
       quad_id,
@@ -116,15 +143,24 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.solid,
       gradient.color0,
       gradient.color1,
+      gradient_point,
+      gradient_stops,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+                              [[buffer(QuadInputIndex_Quads)]],
+                              constant float4 *gradients
+                              [[buffer(QuadInputIndex_Gradients)]]) {
   Quad quad = quads[input.quad_id];
   float2 position = input.position.xy;
   bool transformed = is_transformed(quad.transformation);
+  float4 background_color = quad.background.tag == 4
+    ? gradient_fill(gradients, quad.background.gradient, input.gradient_point,
+        input.gradient_stops, input.background_solid, input.background_color0,
+        input.background_color1, quad.background.colors[0].color.a)
+    : float4(0.);
   if (transformed) {
     // Shade in the quad's own frame, scaled to device pixels so that edges
     // antialias over about one pixel.
@@ -138,8 +174,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     quad.border_widths.bottom *= scale.y;
     quad.border_widths.left *= scale.x;
   }
-  float4 background_color = fill_color(quad.background, position, quad.bounds,
-    input.background_solid, input.background_color0, input.background_color1);
+  if (quad.background.tag != 4) {
+    background_color = fill_color(quad.background, position, quad.bounds,
+      input.background_solid, input.background_color0, input.background_color1);
+  }
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -1413,6 +1451,124 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+// ---- Gradients (`gpui::Gradient`, records in `Scene::gradients`) ----
+
+// The eased position between two stops for a transition hint at `hint` (a fraction
+// of the segment): CSS `<linear-color-hint>`.
+float gradient_hint(float t, float hint) {
+  if (hint == 0.5) {
+    return t;
+  }
+  if (hint <= 0.0) {
+    return 1.0;
+  }
+  if (hint >= 1.0) {
+    return 0.0;
+  }
+  return pow(t, log(0.5) / log(hint));
+}
+
+float3 gradient_linear_to_srgb(float3 linear) {
+  float3 higher = 1.055 * pow(max(linear, 0.0), float3(1.0 / 2.4)) - 0.055;
+  float3 lower = linear * 12.92;
+  return select(higher, lower, linear < 0.0031308);
+}
+
+float3 gradient_oklab_to_srgb(float3 lab) {
+  float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+  float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+  float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+  float l = l_ * l_ * l_;
+  float m = m_ * m_ * m_;
+  float s = s_ * s_ * s_;
+  return gradient_linear_to_srgb(float3(
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s));
+}
+
+// A gradient's per-vertex values. The record (see `gpui::GradientRecord`): a header
+// (kind, stop count, repeating, color space), the geometry in fractions of the
+// bounds, then per stop its premultiplied color and (position, hint).
+// - point: where `position` falls, affine in it so it interpolates exactly: a linear
+//   gradient's position along its line (x), a radial gradient's offset from the center
+//   in radii, a conic gradient's offset from the center in pixels;
+// - stops: the first and last stop positions, the hint before the last, and a conic
+//   gradient's start angle;
+// - colors: the header (`solid`) and the first and last stop colors.
+GradientVertex gradient_vertex(constant float4 *gradients, uint start, float2 position,
+                               Bounds_ScaledPixels bounds) {
+  float4 header = gradients[start];
+  float4 geometry = gradients[start + 1];
+  uint last = start + 2 * uint(header.y);
+  float2 size = float2(bounds.size.width, bounds.size.height);
+  float2 point = position - float2(bounds.origin.x, bounds.origin.y);
+
+  GradientVertex out;
+  if (header.x == 0.0) {
+    float2 from = geometry.xy * size;
+    float2 line = (geometry.zw - geometry.xy) * size;
+    out.point = float2(dot(point - from, line) / max(dot(line, line), 1e-12), 0.0);
+  } else if (header.x == 1.0) {
+    out.point = (point - geometry.xy * size) / (geometry.zw * size);
+  } else {
+    out.point = point - geometry.xy * size;
+  }
+  out.stops = float4(gradients[start + 3].x, gradients[last + 1].x, gradients[last + 1].y,
+                     geometry.z);
+  out.colors.solid = header;
+  out.colors.color0 = gradients[start + 2];
+  out.colors.color1 = gradients[last];
+  return out;
+}
+
+// The gradient's straight-alpha sRGB color from its interpolated `point` and the flat
+// values `gradient_vertex` computed. Gradients of more than two stops read the inner
+// stops from the record.
+float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float4 stops,
+                     float4 header, float4 first, float4 last, float opacity) {
+  float t;
+  if (header.x == 0.0) {
+    t = point.x;
+  } else if (header.x == 1.0) {
+    t = length(point);
+  } else {
+    t = fract((atan2(point.x, -point.y) - stops.w) / (2.0 * M_PI_F));
+  }
+  if (header.z != 0.0) {
+    float period = stops.y - stops.x;
+    t = stops.x + period * fract((t - stops.x) / period);
+  }
+
+  float4 color;
+  if (t <= stops.x) {
+    color = first;
+  } else if (t >= stops.y) {
+    color = last;
+  } else if (header.y <= 2.0) {
+    color = mix(first, last, gradient_hint((t - stops.x) / (stops.y - stops.x), stops.z));
+  } else {
+    uint count = uint(header.y);
+    color = last;
+    for (uint i = 1; i < count; i++) {
+      float4 stop = gradients[start + 3 + 2 * i];
+      if (t < stop.x) {
+        float before = gradients[start + 1 + 2 * i].x;
+        float weight = gradient_hint((t - before) / (stop.x - before), stop.y);
+        color = mix(gradients[start + 2 * i], gradients[start + 2 + 2 * i], weight);
+        break;
+      }
+    }
+  }
+
+  float alpha = color.a;
+  float3 rgb = alpha > 0.0 ? color.rgb / alpha : float3(0.0);
+  if (header.w == 1.0) {
+    rgb = gradient_oklab_to_srgb(rgb);
+  }
+  return float4(rgb, alpha * opacity);
 }
 
 // ---- Retained shapes (instanced SDF shapes from a retained buffer) ----

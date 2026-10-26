@@ -806,6 +806,7 @@ impl Style {
                         .first()
                         .map(|stop| stop.color)
                         .unwrap_or_default(),
+                    BackgroundTag::Gradient => color.solid,
                 },
                 None => Hsla::default(),
             };
@@ -818,6 +819,10 @@ impl Style {
                 border_color,
                 self.border_style,
             ));
+        }
+
+        if let Some(Fill::Gradient(gradient)) = &self.background {
+            window.paint_gradient(bounds, corner_radii, gradient);
         }
 
         // Over the background color, as CSS paints a background image.
@@ -945,6 +950,8 @@ pub struct StrikethroughStyle {
 pub enum Fill {
     /// A solid color fill.
     Color(Background),
+    /// A CSS gradient ([`crate::Gradient`]).
+    Gradient(crate::Gradient),
 }
 
 impl Fill {
@@ -954,6 +961,7 @@ impl Fill {
     pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
+            Fill::Gradient(_) => None,
         }
     }
 }
