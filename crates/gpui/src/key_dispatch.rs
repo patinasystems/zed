@@ -68,6 +68,13 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
+impl DispatchNodeId {
+    /// The node at `index` of a dispatch tree.
+    pub(crate) fn at(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
     pub(crate) context_stack: Vec<KeyContext>,
@@ -75,6 +82,8 @@ pub(crate) struct DispatchTree {
     nodes: Vec<DispatchNode>,
     focusable_node_ids: FxHashMap<FocusId, DispatchNodeId>,
     view_node_ids: FxHashMap<EntityId, DispatchNodeId>,
+    /// Views drawn at more than one place this frame.
+    multi_mounted: collections::FxHashSet<EntityId>,
     keymap: Rc<RefCell<Keymap>>,
     action_registry: Rc<ActionRegistry>,
 }
@@ -90,21 +99,27 @@ pub(crate) struct DispatchNode {
     parent: Option<DispatchNodeId>,
 }
 
-pub(crate) struct ReusedSubtree {
-    old_range: Range<usize>,
-    new_range: Range<usize>,
+/// A reuse of the previous frame's dispatch nodes in segments, around holes
+/// that are drawn again in between (an isolated view; see
+/// [`crate::ViewElement::isolated`]). The ancestors of a hole stay open, so
+/// the nodes drawn in it join them.
+#[derive(Default)]
+pub(crate) struct ReuseCursor {
+    source_stack: Vec<DispatchNodeId>,
+    /// `(old range, new start)` of each segment reused so far.
+    segments: Vec<(Range<usize>, usize)>,
     contains_focus: bool,
 }
 
-impl ReusedSubtree {
+impl ReuseCursor {
+    /// Where a reused node is in the new frame.
     pub fn refresh_node_id(&self, node_id: DispatchNodeId) -> DispatchNodeId {
-        debug_assert!(
-            self.old_range.contains(&node_id.0),
-            "node {} was not part of the reused subtree {:?}",
-            node_id.0,
-            self.old_range
-        );
-        DispatchNodeId((node_id.0 - self.old_range.start) + self.new_range.start)
+        let (old, new_start) = self
+            .segments
+            .iter()
+            .find(|(old, _)| old.contains(&node_id.0))
+            .unwrap_or_else(|| panic!("node {} was not part of the reused segments", node_id.0));
+        DispatchNodeId(node_id.0 - old.start + new_start)
     }
 
     pub fn contains_focus(&self) -> bool {
@@ -145,6 +160,7 @@ impl DispatchTree {
             nodes: Vec::new(),
             focusable_node_ids: FxHashMap::default(),
             view_node_ids: FxHashMap::default(),
+            multi_mounted: Default::default(),
             keymap,
             action_registry,
         }
@@ -157,6 +173,7 @@ impl DispatchTree {
         self.nodes.clear();
         self.focusable_node_ids.clear();
         self.view_node_ids.clear();
+        self.multi_mounted.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -227,7 +244,9 @@ impl DispatchTree {
         if self.view_stack.last().copied() != Some(view_id) {
             let node_id = *self.node_stack.last().unwrap();
             self.nodes[node_id.0].view_id = Some(view_id);
-            self.view_node_ids.insert(view_id, node_id);
+            if self.view_node_ids.insert(view_id, node_id).is_some() {
+                self.multi_mounted.insert(view_id);
+            }
             self.view_stack.push(view_id);
         }
     }
@@ -261,16 +280,16 @@ impl DispatchTree {
         target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
     }
 
-    pub fn reuse_subtree(
+    /// Reuse `old_range` of `source` as the next segment of `cursor`. The
+    /// nodes stay open at the end (see [`DispatchTree::finish_reuse`]).
+    pub(crate) fn reuse_segment(
         &mut self,
+        cursor: &mut ReuseCursor,
         old_range: Range<usize>,
         source: &mut Self,
         focus: Option<FocusId>,
-    ) -> ReusedSubtree {
-        let new_range = self.nodes.len()..self.nodes.len() + old_range.len();
-
-        let mut contains_focus = false;
-        let mut source_stack = vec![];
+    ) {
+        cursor.segments.push((old_range.clone(), self.nodes.len()));
         for (source_node_id, source_node) in source
             .nodes
             .iter_mut()
@@ -279,32 +298,38 @@ impl DispatchTree {
             .take(old_range.len())
         {
             let source_node_id = DispatchNodeId(source_node_id);
-            while let Some(source_ancestor) = source_stack.last() {
+            while let Some(source_ancestor) = cursor.source_stack.last() {
                 if source_node.parent == Some(*source_ancestor) {
                     break;
                 } else {
-                    source_stack.pop();
+                    cursor.source_stack.pop();
                     self.pop_node();
                 }
             }
 
-            source_stack.push(source_node_id);
+            cursor.source_stack.push(source_node_id);
             if source_node.focus_id.is_some() && source_node.focus_id == focus {
-                contains_focus = true;
+                cursor.contains_focus = true;
             }
             self.move_node(source_node);
         }
+    }
 
-        while !source_stack.is_empty() {
-            source_stack.pop();
+    /// Close the nodes a segmented reuse left open, down to `parent` (a node of
+    /// the reused frame; `None`: all of them).
+    pub(crate) fn close_until(&mut self, cursor: &mut ReuseCursor, parent: Option<DispatchNodeId>) {
+        while let Some(top) = cursor.source_stack.last() {
+            if Some(*top) == parent {
+                break;
+            }
+            cursor.source_stack.pop();
             self.pop_node();
         }
+    }
 
-        ReusedSubtree {
-            old_range,
-            new_range,
-            contains_focus,
-        }
+    /// Close the nodes a segmented reuse left open.
+    pub(crate) fn finish_reuse(&mut self, cursor: &mut ReuseCursor) {
+        self.close_until(cursor, None);
     }
 
     pub fn truncate(&mut self, index: usize) {
@@ -583,6 +608,11 @@ impl DispatchTree {
         }
         focus_path.reverse(); // Reverse the path so it goes from the root to the focused node.
         focus_path
+    }
+
+    /// Was `view_id` drawn at more than one place?
+    pub(crate) fn is_multi_mounted(&self, view_id: EntityId) -> bool {
+        self.multi_mounted.contains(&view_id)
     }
 
     pub fn view_path_reversed(&self, view_id: EntityId) -> impl Iterator<Item = EntityId> {

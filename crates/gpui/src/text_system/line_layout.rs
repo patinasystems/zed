@@ -503,6 +503,23 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+impl LineLayoutIndex {
+    /// `self`, an index inside a range of the previous frame that started at `from`,
+    /// in the copy of that range that starts at `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            font_generation: to.font_generation,
+            lines_index: to.lines_index + (self.lines_index - from.lines_index),
+            wrapped_lines_index: to.wrapped_lines_index
+                + (self.wrapped_lines_index - from.wrapped_lines_index),
+            lines_by_hash_index: to.lines_by_hash_index
+                + (self.lines_by_hash_index - from.lines_by_hash_index),
+            wrapped_lines_by_hash_index: to.wrapped_lines_by_hash_index
+                + (self.wrapped_lines_by_hash_index - from.wrapped_lines_by_hash_index),
+        }
+    }
+}
+
 impl LineLayoutCache {
     pub fn new(
         platform_text_system: Arc<dyn PlatformTextSystem>,

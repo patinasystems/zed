@@ -29,6 +29,7 @@ use crate::{
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
+use crate::key_dispatch::ReuseCursor;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1107,8 +1108,68 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+/// A view drawn with [`crate::ViewElement::isolated`] in a frame, with what
+/// its cached ancestors need to draw it again alone: where it was drawn and
+/// the drawing state there, and the ranges of the frame it filled.
+#[derive(Clone)]
+pub(crate) struct Island {
+    pub(crate) view_id: EntityId,
+    pub(crate) render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+    pub(crate) global_id: GlobalElementId,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) element_id_stack: ElementIdStack,
+    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) content_mask: Option<ContentMask<Pixels>>,
+    pub(crate) element_transformation: TransformationMatrix,
+    pub(crate) rem_size: Pixels,
+    pub(crate) element_opacity: f32,
+    /// Drawn in a deferred draw, whose reuse cannot draw it again alone.
+    pub(crate) deferred: bool,
+    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
+    pub(crate) paint_range: Range<PaintIndex>,
+    /// The paint range is the previous frame's until this frame paints it.
+    pub(crate) painted: bool,
+}
+
+impl Island {
+    /// Is its prepaint inside `range` of the same frame (every list)?
+    fn within(&self, range: &Range<PrepaintStateIndex>) -> bool {
+        let (a, b) = (&self.prepaint_range, range);
+        let inside = |s: usize, e: usize, rs: usize, re: usize| s >= rs && e <= re;
+        inside(a.start.dispatch_tree_index, a.end.dispatch_tree_index, b.start.dispatch_tree_index, b.end.dispatch_tree_index)
+            && inside(a.start.hitboxes_index, a.end.hitboxes_index, b.start.hitboxes_index, b.end.hitboxes_index)
+            && inside(a.start.tooltips_index, a.end.tooltips_index, b.start.tooltips_index, b.end.tooltips_index)
+            && inside(a.start.deferred_draws_index, a.end.deferred_draws_index, b.start.deferred_draws_index, b.end.deferred_draws_index)
+            && inside(
+                a.start.accessed_element_states_index,
+                a.end.accessed_element_states_index,
+                b.start.accessed_element_states_index,
+                b.end.accessed_element_states_index,
+            )
+    }
+
+    /// Is its paint inside `range` of the same frame (every list)?
+    fn painted_within(&self, range: &Range<PaintIndex>) -> bool {
+        let (a, b) = (&self.paint_range, range);
+        let inside = |s: usize, e: usize, rs: usize, re: usize| s >= rs && e <= re;
+        inside(a.start.scene_index, a.end.scene_index, b.start.scene_index, b.end.scene_index)
+            && inside(a.start.mouse_listeners_index, a.end.mouse_listeners_index, b.start.mouse_listeners_index, b.end.mouse_listeners_index)
+            && inside(a.start.input_handlers_index, a.end.input_handlers_index, b.start.input_handlers_index, b.end.input_handlers_index)
+            && inside(a.start.cursor_styles_index, a.end.cursor_styles_index, b.start.cursor_styles_index, b.end.cursor_styles_index)
+            && inside(
+                a.start.accessed_element_states_index,
+                a.end.accessed_element_states_index,
+                b.start.accessed_element_states_index,
+                b.end.accessed_element_states_index,
+            )
+            && inside(a.start.tab_handle_index, a.end.tab_handle_index, b.start.tab_handle_index, b.end.tab_handle_index)
+    }
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
+    /// Isolated views drawn this frame (see [`Island`]).
+    pub(crate) islands: Vec<Island>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
@@ -1155,6 +1216,50 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+impl PrepaintStateIndex {
+    /// `self`, an index inside a range of the previous frame that started at
+    /// `from`, in the copy of that range that starts at `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            hitboxes_index: to.hitboxes_index + (self.hitboxes_index - from.hitboxes_index),
+            tooltips_index: to.tooltips_index + (self.tooltips_index - from.tooltips_index),
+            deferred_draws_index: to.deferred_draws_index
+                + (self.deferred_draws_index - from.deferred_draws_index),
+            dispatch_tree_index: to.dispatch_tree_index
+                + (self.dispatch_tree_index - from.dispatch_tree_index),
+            accessed_element_states_index: to.accessed_element_states_index
+                + (self.accessed_element_states_index - from.accessed_element_states_index),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// As [`PrepaintStateIndex::shifted`].
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            scene_index: to.scene_index + (self.scene_index - from.scene_index),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: to.debug_bounds_index
+                + (self.debug_bounds_index - from.debug_bounds_index),
+            mouse_listeners_index: to.mouse_listeners_index
+                + (self.mouse_listeners_index - from.mouse_listeners_index),
+            input_handlers_index: to.input_handlers_index
+                + (self.input_handlers_index - from.input_handlers_index),
+            cursor_styles_index: to.cursor_styles_index
+                + (self.cursor_styles_index - from.cursor_styles_index),
+            accessed_element_states_index: to.accessed_element_states_index
+                + (self.accessed_element_states_index - from.accessed_element_states_index),
+            tab_handle_index: to.tab_handle_index + (self.tab_handle_index - from.tab_handle_index),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
 impl Frame {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
@@ -1165,6 +1270,7 @@ impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
             focus: None,
+            islands: Vec::new(),
             window_active: false,
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
@@ -1193,6 +1299,7 @@ impl Frame {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.islands.clear();
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
@@ -1365,6 +1472,11 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// The root view is drawn cached (see [`Window::set_root_cached`]).
+    root_cached: bool,
+    /// Deferred draws are being prepainted: an isolated view drawn now is not
+    /// drawn again alone (see [`Island::deferred`]).
+    prepainting_deferred: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2271,6 +2383,8 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            root_cached: false,
+            prepainting_deferred: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2336,6 +2450,22 @@ impl ContentMask<Pixels> {
 
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
+        // An isolated view is drawn again alone: its ancestors keep their frames.
+        // Not while accessibility is on: a reused frame does not replay its
+        // accessibility nodes, which each frame rebuilds.
+        // Nor for a view drawn at several places: its other mounts may not be
+        // isolated, and their ancestors must draw them again.
+        if !self.a11y.is_active()
+            && !self.rendered_frame.dispatch_tree.is_multi_mounted(view_id)
+            && self
+            .rendered_frame
+            .islands
+            .iter()
+            .any(|island| island.view_id == view_id && !island.deferred)
+        {
+            self.dirty_views.insert(view_id);
+            return;
+        }
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
         for view_id in self
@@ -2346,6 +2476,16 @@ impl Window {
             if !self.dirty_views.insert(view_id) {
                 break;
             }
+        }
+    }
+
+    /// Draw the root view cached: a frame where only isolated views changed
+    /// (see [`crate::ViewElement::isolated`]) reuses the root's and draws them
+    /// again alone. Off by default: the root renders every frame.
+    pub fn set_root_cached(&mut self, cached: bool) {
+        if self.root_cached != cached {
+            self.root_cached = cached;
+            self.refresh();
         }
     }
 
@@ -3803,7 +3943,17 @@ impl Window {
         let scale_factor = self.scale_factor();
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
-        let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
+        // Accessibility rebuilds its tree from every element each frame.
+        let mut root_element = if self.root_cached && !self.a11y.is_active() {
+            self.root
+                .as_ref()
+                .unwrap()
+                .clone()
+                .cached(crate::StyleRefinement::default())
+                .into_any_element()
+        } else {
+            self.root.as_ref().unwrap().clone().into_any_element()
+        };
         let root_layout_id = root_element.request_layout(self, cx);
         #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
@@ -3972,6 +4122,7 @@ impl Window {
 
     fn prepaint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
+        self.prepainting_deferred = true;
 
         // Process deferred draws in multiple rounds to support nesting.
         // Each round processes all current deferred draws, which may push new ones.
@@ -4050,6 +4201,7 @@ impl Window {
             self.text_style_stack.clear();
             round_start = round_end;
         }
+        self.prepainting_deferred = false;
     }
 
     fn paint_deferred_draws(&mut self, cx: &mut App) {
@@ -4117,6 +4269,37 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let mut cursor = ReuseCursor::default();
+        self.reuse_prepaint_segment(&mut cursor, range);
+        self.finish_reuse_prepaint(cursor);
+    }
+
+    /// Reuse `range` of the previous frame's prepaint as the next segment of
+    /// `cursor`: the dispatch nodes open at its end stay open, so a view drawn
+    /// before the next segment joins them (see [`crate::ViewElement::isolated`]).
+    pub(crate) fn reuse_prepaint_segment(
+        &mut self,
+        cursor: &mut ReuseCursor,
+        range: Range<PrepaintStateIndex>,
+    ) {
+        let new_start = self.prepaint_index();
+        // Isolated views inside: their records follow to this frame.
+        let carried: Vec<Island> = self
+            .rendered_frame
+            .islands
+            .iter()
+            .filter(|island| island.within(&range))
+            .map(|island| Island {
+                prepaint_range: island
+                    .prepaint_range
+                    .start
+                    .shifted(&range.start, &new_start)
+                    ..island.prepaint_range.end.shifted(&range.start, &new_start),
+                painted: false,
+                ..island.clone()
+            })
+            .collect();
+        self.next_frame.islands.extend(carried);
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -4137,15 +4320,12 @@ impl Window {
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
-        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
+        self.next_frame.dispatch_tree.reuse_segment(
+            cursor,
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,
             &mut self.rendered_frame.dispatch_tree,
             self.focus,
         );
-
-        if reused_subtree.contains_focus() {
-            self.next_frame.focus = self.focus;
-        }
 
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
@@ -4153,7 +4333,7 @@ impl Window {
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
-                    parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    parent_node: cursor.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4166,6 +4346,153 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+    }
+
+    /// Close a segmented prepaint reuse.
+    pub(crate) fn finish_reuse_prepaint(&mut self, mut cursor: ReuseCursor) {
+        self.next_frame.dispatch_tree.finish_reuse(&mut cursor);
+        if cursor.contains_focus() {
+            self.next_frame.focus = self.focus;
+        }
+    }
+
+    /// The isolated views of the previous frame inside `range` that are to be
+    /// drawn again (notified since), outermost only, in frame order.
+    pub(crate) fn dirty_islands_within(&self, range: &Range<PrepaintStateIndex>) -> Vec<Island> {
+        let mut found: Vec<Island> = self
+            .rendered_frame
+            .islands
+            .iter()
+            .filter(|island| {
+                !island.deferred
+                    && island.within(range)
+                    && self.dirty_views.contains(&island.view_id)
+            })
+            .cloned()
+            .collect();
+        found.sort_by_key(|island| island.prepaint_range.start.dispatch_tree_index);
+        let mut out: Vec<Island> = Vec::with_capacity(found.len());
+        for island in found {
+            if out
+                .last()
+                .is_some_and(|outer| island.within(&outer.prepaint_range))
+            {
+                continue;
+            }
+            out.push(island);
+        }
+        out
+    }
+
+    /// The isolated view's own dispatch node in the previous frame, which its
+    /// nodes join: the node its element pushed just before the view drew.
+    pub(crate) fn island_parent_node(&self, island: &Island) -> Option<DispatchNodeId> {
+        island
+            .prepaint_range
+            .start
+            .dispatch_tree_index
+            .checked_sub(1)
+            .map(DispatchNodeId::at)
+    }
+
+    /// Run `f` in the drawing state where `island` was drawn: its element ids,
+    /// text styles, content mask, element transformation, opacity and rem size
+    /// (its cached ancestors, whose frames are reused, do not set them).
+    pub(crate) fn with_island_state<R>(
+        &mut self,
+        island: &Island,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let element_ids = mem::replace(&mut self.element_id_stack, island.element_id_stack.clone());
+        let text_styles = mem::replace(&mut self.text_style_stack, island.text_style_stack.clone());
+        let masks = mem::replace(
+            &mut self.content_mask_stack,
+            island.content_mask.iter().cloned().collect(),
+        );
+        let transformations = mem::replace(
+            &mut self.element_transformation_stack,
+            if island.element_transformation.is_unit() {
+                Vec::new()
+            } else {
+                vec![island.element_transformation]
+            },
+        );
+        let opacity = mem::replace(&mut self.element_opacity, island.element_opacity);
+        let result = self.with_rem_size(Some(island.rem_size), f);
+        self.element_id_stack = element_ids;
+        self.text_style_stack = text_styles;
+        self.content_mask_stack = masks;
+        self.element_transformation_stack = transformations;
+        self.element_opacity = opacity;
+        result
+    }
+
+    /// The drawing state for an isolated view drawn now (see [`Island`]).
+    pub(crate) fn island_here(
+        &self,
+        view_id: EntityId,
+        render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+        global_id: GlobalElementId,
+        bounds: Bounds<Pixels>,
+        prepaint_range: Range<PrepaintStateIndex>,
+    ) -> Island {
+        Island {
+            view_id,
+            render,
+            global_id,
+            bounds,
+            element_id_stack: self.element_id_stack.clone(),
+            text_style_stack: self.text_style_stack.clone(),
+            content_mask: self.content_mask_stack.last().cloned(),
+            element_transformation: self.element_transformation(),
+            rem_size: self.rem_size(),
+            element_opacity: self.element_opacity,
+            deferred: false,
+            prepaint_range,
+            paint_range: PaintIndex::default()..PaintIndex::default(),
+            painted: false,
+        }
+    }
+
+    /// Close the reused dispatch nodes down to `parent` (a node of the
+    /// previous frame), where an isolated view's nodes join next.
+    pub(crate) fn reuse_close_until(
+        &mut self,
+        cursor: &mut ReuseCursor,
+        parent: Option<DispatchNodeId>,
+    ) {
+        self.next_frame.dispatch_tree.close_until(cursor, parent);
+    }
+
+    /// Has this frame recorded the isolated view mounted at `global_id`?
+    pub(crate) fn has_island(&self, global_id: &GlobalElementId) -> bool {
+        self.next_frame.islands.iter().any(|i| &i.global_id == global_id)
+    }
+
+    /// Record an isolated view drawn this frame.
+    pub(crate) fn push_island(&mut self, mut island: Island) {
+        island.deferred = self.prepainting_deferred;
+        self.next_frame.islands.push(island);
+    }
+
+    /// Note where this frame painted the isolated view mounted at `global_id`.
+    pub(crate) fn note_island_paint(
+        &mut self,
+        global_id: &GlobalElementId,
+        range: Range<PaintIndex>,
+        opacity: f32,
+    ) {
+        if let Some(island) = self
+            .next_frame
+            .islands
+            .iter_mut()
+            .rev()
+            .find(|i| &i.global_id == global_id)
+        {
+            island.paint_range = range;
+            island.element_opacity = opacity;
+            island.painted = true;
+        }
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -4183,6 +4510,20 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        // Isolated views painted inside: their paint ranges follow to this frame.
+        let new_start = self.paint_index();
+        for old in self.rendered_frame.islands.iter().filter(|i| i.painted_within(&range)) {
+            if let Some(island) = self
+                .next_frame
+                .islands
+                .iter_mut()
+                .find(|i| i.global_id == old.global_id && !i.painted)
+            {
+                island.paint_range = old.paint_range.start.shifted(&range.start, &new_start)
+                    ..old.paint_range.end.shifted(&range.start, &new_start);
+                island.painted = true;
+            }
+        }
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
