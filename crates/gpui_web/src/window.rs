@@ -86,6 +86,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
+    /// Whether the last `draw` rendered its scene.
+    rendered: Cell<bool>,
     raf_id: Cell<Option<i32>>,
     raf_function: RefCell<Option<js_sys::Function>>,
 }
@@ -233,6 +235,7 @@ impl WebWindow {
             touch_tap_candidate: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
+            rendered: Cell::new(false),
             raf_id: Cell::new(None),
             raf_function: RefCell::new(None),
         });
@@ -1013,7 +1016,12 @@ impl PlatformWindow for WebWindow {
             drop(state);
         }
 
-        self.inner.state.borrow_mut().renderer.draw(scene);
+        let rendered = self.inner.state.borrow_mut().renderer.draw(scene);
+        self.inner.rendered.set(rendered);
+    }
+
+    fn frame_rendered(&self) -> bool {
+        self.inner.rendered.get()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
