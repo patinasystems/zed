@@ -1167,18 +1167,37 @@ mod isolation_tests {
             canvas: Entity<Canvas>,
         }
         impl Render for Twice {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 self.renders.set(self.renders.get() + 1);
                 div()
                     .size_full()
-                    .child(div().size(px(50.)).child(self.canvas.clone().isolated(StyleRefinement::default().size_full())))
-                    .child(div().size(px(50.)).child(self.canvas.clone().cached(StyleRefinement::default().size_full())))
+                    .child(
+                        div().size(px(50.)).child(
+                            self.canvas
+                                .clone()
+                                .isolated(StyleRefinement::default().size_full()),
+                        ),
+                    )
+                    .child(
+                        div().size(px(50.)).child(
+                            self.canvas
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
+                    )
             }
         }
         let renders = Rc::new(Cell::new(0));
         let (root, cx) = cx.add_window_view(|_, cx| Twice {
             renders: renders.clone(),
-            canvas: cx.new(|_| Canvas { renders: Rc::default(), color: rgb(0x0000ff).into() }),
+            canvas: cx.new(|_| Canvas {
+                renders: Rc::default(),
+                color: rgb(0x0000ff).into(),
+            }),
         });
         cx.update(|window, _| window.set_root_cached(true));
         cx.run_until_parked();
@@ -1191,7 +1210,11 @@ mod isolation_tests {
         cx.run_until_parked();
         assert_eq!(renders.get(), r0 + 1, "the root renders");
         let red: Hsla = rgb(0xff0000).into();
-        assert_eq!(quad_colors(cx).iter().filter(|c| **c == red).count(), 2, "both mounts show the change");
+        assert_eq!(
+            quad_colors(cx).iter().filter(|c| **c == red).count(),
+            2,
+            "both mounts show the change"
+        );
     }
 
     /// A text field in the chrome: its input handler is painted each frame.
@@ -1206,7 +1229,13 @@ mod isolation_tests {
             div().track_focus(&self.focus).size(px(80.)).child(
                 crate::canvas(
                     |_, _, _| {},
-                    move |bounds, _, window, cx| window.handle_input(&focus, crate::ElementInputHandler::new(bounds, view), cx),
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &focus,
+                            crate::ElementInputHandler::new(bounds, view),
+                            cx,
+                        )
+                    },
                 )
                 .size_full(),
             )
@@ -1214,25 +1243,68 @@ mod isolation_tests {
     }
 
     impl crate::EntityInputHandler for Field {
-        fn text_for_range(&mut self, _: std::ops::Range<usize>, _: &mut Option<std::ops::Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
+        fn text_for_range(
+            &mut self,
+            _: std::ops::Range<usize>,
+            _: &mut Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<String> {
             Some(self.text.clone())
         }
-        fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<crate::UTF16Selection> {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<crate::UTF16Selection> {
             let n = self.text.encode_utf16().count();
-            Some(crate::UTF16Selection { range: n..n, reversed: false })
+            Some(crate::UTF16Selection {
+                range: n..n,
+                reversed: false,
+            })
         }
-        fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        fn marked_text_range(
+            &self,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<std::ops::Range<usize>> {
             None
         }
         fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
-        fn replace_text_in_range(&mut self, _: Option<std::ops::Range<usize>>, text: &str, _: &mut Window, _: &mut Context<Self>) {
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) {
             self.text.push_str(text);
         }
-        fn replace_and_mark_text_in_range(&mut self, _: Option<std::ops::Range<usize>>, _: &str, _: Option<std::ops::Range<usize>>, _: &mut Window, _: &mut Context<Self>) {}
-        fn bounds_for_range(&mut self, _: std::ops::Range<usize>, bounds: crate::Bounds<crate::Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<crate::Bounds<crate::Pixels>> {
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            _: &str,
+            _: Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) {
+        }
+        fn bounds_for_range(
+            &mut self,
+            _: std::ops::Range<usize>,
+            bounds: crate::Bounds<crate::Pixels>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<crate::Bounds<crate::Pixels>> {
             Some(bounds)
         }
-        fn character_index_for_point(&mut self, _: crate::Point<crate::Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        fn character_index_for_point(
+            &mut self,
+            _: crate::Point<crate::Pixels>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<usize> {
             None
         }
     }
@@ -1253,11 +1325,16 @@ mod isolation_tests {
     impl Render for MenuCanvas {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             self.renders.set(self.renders.get() + 1);
-            div().id("menu-canvas").debug_selector(|| "CANVAS_AREA".into()).size_full().cursor(crate::CursorStyle::Crosshair).child(crate::deferred(
-                crate::anchored()
-                    .position(point(px(5.), px(5.)))
-                    .child(div().debug_selector(|| "CANVAS_MENU".into()).size(px(15.))),
-            ))
+            div()
+                .id("menu-canvas")
+                .debug_selector(|| "CANVAS_AREA".into())
+                .size_full()
+                .cursor(crate::CursorStyle::Crosshair)
+                .child(crate::deferred(
+                    crate::anchored()
+                        .position(point(px(5.), px(5.)))
+                        .child(div().debug_selector(|| "CANVAS_MENU".into()).size(px(15.))),
+                ))
         }
     }
 
@@ -1274,7 +1351,13 @@ mod isolation_tests {
                 .size_full()
                 .flex()
                 .child(self.field.clone())
-                .child(div().id("link").size(px(40.)).cursor_pointer().debug_selector(|| "LINK".into()))
+                .child(
+                    div()
+                        .id("link")
+                        .size(px(40.))
+                        .cursor_pointer()
+                        .debug_selector(|| "LINK".into()),
+                )
                 .child(
                     div()
                         .id("tip-target")
@@ -1282,7 +1365,13 @@ mod isolation_tests {
                         .debug_selector(|| "TIP_TARGET".into())
                         .tooltip(|_, cx| cx.new(|_| Tip).into()),
                 )
-                .child(div().size(px(200.)).child(self.canvas.clone().isolated(StyleRefinement::default().size_full())))
+                .child(
+                    div().size(px(200.)).child(
+                        self.canvas
+                            .clone()
+                            .isolated(StyleRefinement::default().size_full()),
+                    ),
+                )
         }
     }
 
@@ -1290,12 +1379,19 @@ mod isolation_tests {
     /// input handler, its hitboxes their cursors, a shown tooltip stays, and
     /// the canvas's own deferred menu draws.
     #[gpui::test]
-    fn input_cursors_tooltips_and_deferred_children_survive_isolated_redraws(cx: &mut TestAppContext) {
+    fn input_cursors_tooltips_and_deferred_children_survive_isolated_redraws(
+        cx: &mut TestAppContext,
+    ) {
         let (chrome_renders, canvas_renders) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
         let (chrome, cx) = cx.add_window_view(|_, cx| RichChrome {
             renders: chrome_renders.clone(),
-            field: cx.new(|cx| Field { focus: cx.focus_handle(), text: String::new() }),
-            canvas: cx.new(|_| MenuCanvas { renders: canvas_renders.clone() }),
+            field: cx.new(|cx| Field {
+                focus: cx.focus_handle(),
+                text: String::new(),
+            }),
+            canvas: cx.new(|_| MenuCanvas {
+                renders: canvas_renders.clone(),
+            }),
         });
         cx.simulate_resize(size(px(600.), px(400.)));
         cx.update(|window, _| window.set_root_cached(true));
@@ -1305,7 +1401,8 @@ mod isolation_tests {
         // Show the tooltip.
         let tip_target = bounds(cx, "TIP_TARGET").unwrap();
         cx.simulate_mouse_move(tip_target.center(), None, Modifiers::default());
-        cx.executor().advance_clock(std::time::Duration::from_millis(800));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(800));
         cx.run_until_parked();
         assert!(bounds(cx, "TIP").is_some(), "the tooltip shows");
         let r0 = chrome_renders.get();
@@ -1313,10 +1410,17 @@ mod isolation_tests {
             let c0 = canvas_renders.get();
             canvas.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
-            assert_eq!(canvas_renders.get(), c0 + 1, "round {k}: the canvas redraws");
+            assert_eq!(
+                canvas_renders.get(),
+                c0 + 1,
+                "round {k}: the canvas redraws"
+            );
             assert_eq!(chrome_renders.get(), r0, "round {k}: the chrome is reused");
             assert!(bounds(cx, "TIP").is_some(), "round {k}: the tooltip stays");
-            assert!(bounds(cx, "CANVAS_MENU").is_some(), "round {k}: the canvas's deferred menu draws");
+            assert!(
+                bounds(cx, "CANVAS_MENU").is_some(),
+                "round {k}: the canvas's deferred menu draws"
+            );
         }
         // The field's input handler (painted in the reused chrome frame).
         cx.simulate_input("hi");
@@ -1324,13 +1428,26 @@ mod isolation_tests {
         // Cursors: the chrome's link (reused hitbox) and the redrawn canvas.
         let link = bounds(cx, "LINK").unwrap();
         cx.simulate_mouse_move(link.center(), None, Modifiers::default());
-        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::PointingHand));
+        assert_eq!(
+            cx.update(|window, _| window.rendered_frame.cursor_style(window)),
+            Some(crate::CursorStyle::PointingHand)
+        );
         let area = bounds(cx, "CANVAS_AREA").unwrap();
-        cx.simulate_mouse_move(point(area.center().x, area.origin.y + area.size.height - px(10.)), None, Modifiers::default());
-        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::Crosshair));
+        cx.simulate_mouse_move(
+            point(area.center().x, area.origin.y + area.size.height - px(10.)),
+            None,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            cx.update(|window, _| window.rendered_frame.cursor_style(window)),
+            Some(crate::CursorStyle::Crosshair)
+        );
         canvas.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
-        assert_eq!(cx.update(|window, _| window.rendered_frame.cursor_style(window)), Some(crate::CursorStyle::Crosshair));
+        assert_eq!(
+            cx.update(|window, _| window.rendered_frame.cursor_style(window)),
+            Some(crate::CursorStyle::Crosshair)
+        );
     }
 
     /// Without isolation (and by default), a notify re-renders the ancestors.

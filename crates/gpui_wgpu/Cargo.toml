@@ -51,7 +51,7 @@ wgpu = { workspace = true, features = ["std", "metal", "gles", "vulkan", "wgsl",
 wgpu = { workspace = true, default-features = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
+web-sys = { workspace = true, features = ["HtmlCanvasElement", "ImageBitmap", "OffscreenCanvas"] }
 wgpu = { workspace = true, features = ["webgl"] }
 
 [dev-dependencies]

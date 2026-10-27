@@ -26,6 +26,7 @@ use crate::{
     WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
+use crate::{ExternalTextureId, TextureSampling};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -1136,33 +1137,69 @@ impl Island {
     fn within(&self, range: &Range<PrepaintStateIndex>) -> bool {
         let (a, b) = (&self.prepaint_range, range);
         let inside = |s: usize, e: usize, rs: usize, re: usize| s >= rs && e <= re;
-        inside(a.start.dispatch_tree_index, a.end.dispatch_tree_index, b.start.dispatch_tree_index, b.end.dispatch_tree_index)
-            && inside(a.start.hitboxes_index, a.end.hitboxes_index, b.start.hitboxes_index, b.end.hitboxes_index)
-            && inside(a.start.tooltips_index, a.end.tooltips_index, b.start.tooltips_index, b.end.tooltips_index)
-            && inside(a.start.deferred_draws_index, a.end.deferred_draws_index, b.start.deferred_draws_index, b.end.deferred_draws_index)
-            && inside(
-                a.start.accessed_element_states_index,
-                a.end.accessed_element_states_index,
-                b.start.accessed_element_states_index,
-                b.end.accessed_element_states_index,
-            )
+        inside(
+            a.start.dispatch_tree_index,
+            a.end.dispatch_tree_index,
+            b.start.dispatch_tree_index,
+            b.end.dispatch_tree_index,
+        ) && inside(
+            a.start.hitboxes_index,
+            a.end.hitboxes_index,
+            b.start.hitboxes_index,
+            b.end.hitboxes_index,
+        ) && inside(
+            a.start.tooltips_index,
+            a.end.tooltips_index,
+            b.start.tooltips_index,
+            b.end.tooltips_index,
+        ) && inside(
+            a.start.deferred_draws_index,
+            a.end.deferred_draws_index,
+            b.start.deferred_draws_index,
+            b.end.deferred_draws_index,
+        ) && inside(
+            a.start.accessed_element_states_index,
+            a.end.accessed_element_states_index,
+            b.start.accessed_element_states_index,
+            b.end.accessed_element_states_index,
+        )
     }
 
     /// Is its paint inside `range` of the same frame (every list)?
     fn painted_within(&self, range: &Range<PaintIndex>) -> bool {
         let (a, b) = (&self.paint_range, range);
         let inside = |s: usize, e: usize, rs: usize, re: usize| s >= rs && e <= re;
-        inside(a.start.scene_index, a.end.scene_index, b.start.scene_index, b.end.scene_index)
-            && inside(a.start.mouse_listeners_index, a.end.mouse_listeners_index, b.start.mouse_listeners_index, b.end.mouse_listeners_index)
-            && inside(a.start.input_handlers_index, a.end.input_handlers_index, b.start.input_handlers_index, b.end.input_handlers_index)
-            && inside(a.start.cursor_styles_index, a.end.cursor_styles_index, b.start.cursor_styles_index, b.end.cursor_styles_index)
-            && inside(
-                a.start.accessed_element_states_index,
-                a.end.accessed_element_states_index,
-                b.start.accessed_element_states_index,
-                b.end.accessed_element_states_index,
-            )
-            && inside(a.start.tab_handle_index, a.end.tab_handle_index, b.start.tab_handle_index, b.end.tab_handle_index)
+        inside(
+            a.start.scene_index,
+            a.end.scene_index,
+            b.start.scene_index,
+            b.end.scene_index,
+        ) && inside(
+            a.start.mouse_listeners_index,
+            a.end.mouse_listeners_index,
+            b.start.mouse_listeners_index,
+            b.end.mouse_listeners_index,
+        ) && inside(
+            a.start.input_handlers_index,
+            a.end.input_handlers_index,
+            b.start.input_handlers_index,
+            b.end.input_handlers_index,
+        ) && inside(
+            a.start.cursor_styles_index,
+            a.end.cursor_styles_index,
+            b.start.cursor_styles_index,
+            b.end.cursor_styles_index,
+        ) && inside(
+            a.start.accessed_element_states_index,
+            a.end.accessed_element_states_index,
+            b.start.accessed_element_states_index,
+            b.end.accessed_element_states_index,
+        ) && inside(
+            a.start.tab_handle_index,
+            a.end.tab_handle_index,
+            b.start.tab_handle_index,
+            b.end.tab_handle_index,
+        )
     }
 }
 
@@ -2458,10 +2495,10 @@ impl Window {
         if !self.a11y.is_active()
             && !self.rendered_frame.dispatch_tree.is_multi_mounted(view_id)
             && self
-            .rendered_frame
-            .islands
-            .iter()
-            .any(|island| island.view_id == view_id && !island.deferred)
+                .rendered_frame
+                .islands
+                .iter()
+                .any(|island| island.view_id == view_id && !island.deferred)
         {
             self.dirty_views.insert(view_id);
             return;
@@ -4473,7 +4510,10 @@ impl Window {
 
     /// Has this frame recorded the isolated view mounted at `global_id`?
     pub(crate) fn has_island(&self, global_id: &GlobalElementId) -> bool {
-        self.next_frame.islands.iter().any(|i| &i.global_id == global_id)
+        self.next_frame
+            .islands
+            .iter()
+            .any(|i| &i.global_id == global_id)
     }
 
     /// Record an isolated view drawn this frame.
@@ -4519,7 +4559,12 @@ impl Window {
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
         // Isolated views painted inside: their paint ranges follow to this frame.
         let new_start = self.paint_index();
-        for old in self.rendered_frame.islands.iter().filter(|i| i.painted_within(&range)) {
+        for old in self
+            .rendered_frame
+            .islands
+            .iter()
+            .filter(|i| i.painted_within(&range))
+        {
             if let Some(island) = self
                 .next_frame
                 .islands
@@ -6012,6 +6057,96 @@ impl Window {
             })?
             .expect("Callback above only returns Some");
 
+        self.paint_tile(
+            visible_bounds,
+            image_bounds,
+            corner_radii,
+            tile,
+            grayscale,
+            transformation,
+        );
+        Ok(())
+    }
+
+    /// Paints external texture `id` (see [`ExternalTextureId`]) stretched over
+    /// `image_bounds` and clipped to `bounds`, with `corner_radii`, sampled as
+    /// it was set with [`Window::set_external_texture`]. Paints nothing when the
+    /// texture does not exist (yet, or since the GPU device was lost).
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_external_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        id: ExternalTextureId,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let visible_bounds = bounds.intersect(&image_bounds);
+        if visible_bounds.size.width <= Pixels::ZERO
+            || visible_bounds.size.height <= Pixels::ZERO
+            || image_bounds.size.width <= Pixels::ZERO
+            || image_bounds.size.height <= Pixels::ZERO
+        {
+            return;
+        }
+        let Some(tile) = self.sprite_atlas.external_texture_tile(id) else {
+            return;
+        };
+        self.paint_tile(
+            visible_bounds,
+            image_bounds,
+            corner_radii,
+            tile,
+            false,
+            TransformationMatrix::unit(),
+        );
+    }
+
+    /// Makes external texture `id` `size` pixels with `sampling` (see
+    /// [`PlatformAtlas::set_external_texture`]); returns whether it is new or
+    /// was resized, and so transparent.
+    pub fn set_external_texture(
+        &self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) -> Result<bool> {
+        self.sprite_atlas.set_external_texture(id, size, sampling)
+    }
+
+    /// Copies `source` into external texture `id` on the GPU (see
+    /// [`PlatformAtlas::copy_to_external_texture`]). Call [`Window::refresh`]
+    /// or notify a view to draw it.
+    pub fn copy_to_external_texture(
+        &self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.sprite_atlas.copy_to_external_texture(id, source)
+    }
+
+    /// Frees external texture `id`.
+    pub fn remove_external_texture(&self, id: ExternalTextureId) {
+        self.sprite_atlas.remove_external_texture(id);
+    }
+
+    /// GPU memory this window's external textures hold, in bytes.
+    pub fn external_texture_bytes(&self) -> u64 {
+        self.sprite_atlas.external_texture_bytes()
+    }
+
+    /// The sprite for `tile` (an image's) drawn over `image_bounds`, clipped
+    /// to `visible_bounds`, which lies inside it.
+    fn paint_tile(
+        &mut self,
+        visible_bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        tile: AtlasTile,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) {
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
@@ -6071,7 +6206,6 @@ impl Window {
             opacity,
             transformation: self.device_element_transformation().compose(transformation),
         });
-        Ok(())
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
