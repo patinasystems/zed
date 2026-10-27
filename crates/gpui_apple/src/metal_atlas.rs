@@ -264,6 +264,10 @@ impl MetalAtlasTextures {
             .downcast_ref::<metal::Texture>()
             .context("a Metal external texture copies from a metal::Texture")?;
         anyhow::ensure!(
+            source.device().registry_id() == self.device.registry_id(),
+            "an external texture copies from a texture on its own Metal device (`preferred_device`)"
+        );
+        anyhow::ensure!(
             source.pixel_format() == target.pixel_format(),
             "an external texture copies from a {:?} texture, not {:?}",
             target.pixel_format(),
