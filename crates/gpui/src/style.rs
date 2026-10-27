@@ -723,7 +723,37 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                // Clipping both axes follows the rounded border's inner curve (CSS clips to
+                // the padding box's curve): each radius less the wider of its two borders.
+                let corner_radii = if self.overflow.x != Overflow::Visible
+                    && self.overflow.y != Overflow::Visible
+                {
+                    let outer = self.corner_radii.to_pixels(rem_size);
+                    let inset = |r: Pixels, a: Pixels, b: Pixels| (r - a.max(b)).max(Pixels::ZERO);
+                    let edges = self.border_widths.to_pixels(rem_size);
+                    let bordered = self
+                        .border_color
+                        .is_some_and(|color| !color.is_transparent());
+                    let (top, right, bottom, left) = if bordered {
+                        (edges.top, edges.right, edges.bottom, edges.left)
+                    } else {
+                        (Pixels::ZERO, Pixels::ZERO, Pixels::ZERO, Pixels::ZERO)
+                    };
+                    Corners {
+                        top_left: inset(outer.top_left, top, left),
+                        top_right: inset(outer.top_right, top, right),
+                        bottom_right: inset(outer.bottom_right, bottom, right),
+                        bottom_left: inset(outer.bottom_left, bottom, left),
+                    }
+                    .clamp_radii_for_quad_size(bounds.size)
+                } else {
+                    Corners::default()
+                };
+
+                Some(ContentMask {
+                    bounds,
+                    corner_radii,
+                })
             }
         }
     }
@@ -1652,5 +1682,50 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+}
+
+#[cfg(test)]
+mod overflow_mask_tests {
+    use super::*;
+    use crate::{px, rems, size};
+
+    #[test]
+    fn a_clip_on_both_axes_follows_the_rounded_border() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(60.)));
+        let mut style = Style::default();
+        style.overflow = point(Overflow::Hidden, Overflow::Hidden);
+        style.corner_radii = Corners {
+            top_left: px(16.).into(),
+            top_right: px(16.).into(),
+            bottom_right: px(16.).into(),
+            bottom_left: px(16.).into(),
+        };
+        let mask = style
+            .overflow_mask(bounds, rems(1.).to_pixels(px(16.)))
+            .unwrap();
+        assert_eq!(mask.bounds, bounds);
+        assert_eq!(mask.corner_radii, Corners::all(px(16.)));
+
+        // A painted border insets the clip and its radii (the padding box's curve).
+        style.border_widths = Edges::all(px(4.).into());
+        style.border_color = Some(crate::red());
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(12.)));
+
+        // Radii clamp to half the clip's shorter side.
+        style.border_widths = Edges::default();
+        style.corner_radii = Corners {
+            top_left: px(50.).into(),
+            top_right: px(50.).into(),
+            bottom_right: px(50.).into(),
+            bottom_left: px(50.).into(),
+        };
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(30.)));
+
+        // One clipped axis clips square.
+        style.overflow = point(Overflow::Visible, Overflow::Hidden);
+        assert!(!style.overflow_mask(bounds, px(16.)).unwrap().is_rounded());
     }
 }
