@@ -35,6 +35,9 @@ struct WgpuAtlasTextures {
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
     color_texture_format: wgpu::TextureFormat,
+    /// External textures' format: the renderer's target format, so texture targets
+    /// draw into them with its pipelines ([`WgpuAtlas::set_external_format`]).
+    external_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
@@ -62,6 +65,7 @@ impl WgpuAtlas {
             queue,
             max_texture_size,
             color_texture_format,
+            external_format: color_texture_format,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
@@ -94,6 +98,22 @@ impl WgpuAtlas {
             generation: texture.generation,
             sampling: texture.external.unwrap_or_default(),
         })
+    }
+
+    /// The texture behind external texture `id`, if it exists (texture targets draw into
+    /// it: `Window::paint_to_texture`).
+    pub fn external_texture(&self, id: ExternalTextureId) -> Option<wgpu::Texture> {
+        let lock = self.0.lock();
+        let textures = &lock.backend;
+        let texture = textures.storage.get(*textures.externals.get(&id)?)?;
+        Some(texture.texture.clone())
+    }
+
+    /// The format external textures are made in, and that shared ones must have: the
+    /// format of the renderer that draws into them. Existing external textures keep
+    /// theirs until they are set again.
+    pub fn set_external_format(&self, format: wgpu::TextureFormat) {
+        self.0.lock().backend.external_format = format;
     }
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
@@ -259,7 +279,7 @@ impl WgpuAtlasTextures {
             }
         }
         self.remove_external(id);
-        let format = self.color_texture_format;
+        let format = self.external_format;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("external_texture"),
             size: wgpu::Extent3d {
@@ -271,9 +291,11 @@ impl WgpuAtlasTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            // Copies from external images render into the texture.
+            // Copies from external images and texture targets render into the texture;
+            // readback and export copy out of it.
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -292,9 +314,9 @@ impl WgpuAtlasTextures {
             .downcast_ref::<wgpu::Texture>()
             .context("a wgpu external texture shares a wgpu::Texture")?;
         anyhow::ensure!(
-            source.format() == self.color_texture_format,
+            source.format() == self.external_format,
             "an external texture shares a {:?} texture, not {:?}",
-            self.color_texture_format,
+            self.external_format,
             source.format()
         );
         anyhow::ensure!(

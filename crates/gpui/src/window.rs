@@ -284,6 +284,10 @@ impl WindowInvalidator {
         self.inner.borrow().draw_phase == DrawPhase::None
     }
 
+    pub fn painting(&self) -> bool {
+        self.inner.borrow().draw_phase == DrawPhase::Paint
+    }
+
     #[track_caller]
     pub fn debug_assert_paint(&self) {
         debug_assert!(
@@ -1429,6 +1433,9 @@ pub struct Window {
     /// Composed element transformations in window logical pixels; see
     /// [`Window::with_element_transformation`].
     pub(crate) element_transformation_stack: Vec<TransformationMatrix>,
+    /// How many [`Window::paint_to_texture`] calls are open: hitboxes inserted inside
+    /// one are in its texture's coordinates, so window positions do not hit them.
+    texture_target_depth: usize,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2342,6 +2349,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_transformation_stack: Vec::new(),
+            texture_target_depth: 0,
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -5011,6 +5019,67 @@ impl Window {
         result
     }
 
+    /// Paints `f` into external texture `id` instead of the window: an element as a
+    /// texture (a 3D plane's material, a Canvas 2D `drawElement` source, a shader's
+    /// input). Call it around the subtree in both prepaint and paint.
+    ///
+    /// - `transformation` maps the subtree's window logical pixels to the texture's
+    ///   logical pixels (the texture's device pixels over the window's scale factor):
+    ///   a translation to the subtree's origin, times a scale for the texel density.
+    ///   It replaces the element transformation around the call.
+    /// - The texture must exist in this window's atlas, `size` device pixels, usable as
+    ///   a render target ([`PlatformAtlas::set_external_texture`], or a shared texture
+    ///   made with render-target usage). Each frame that paints it clears it to
+    ///   transparent and draws what `f` painted; a frame that does not call this
+    ///   leaves its pixels as they are, so a caller re-renders only when the subtree
+    ///   changed.
+    /// - Renderers draw texture targets before the window's scene, in the order they
+    ///   end, so the window (and later targets) sample this frame's pixels.
+    /// - What `f` paints is clipped to the texture and not drawn in the window.
+    ///   Hitboxes it inserts are not hit by window positions.
+    /// - Renderers that cannot draw it (DirectX) leave the texture as it was.
+    pub fn paint_to_texture<R>(
+        &mut self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        transformation: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let painting = self.invalidator.painting();
+        let scale = self.scale_factor();
+        let texture_mask = ContentMask::from(Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: px(size.width.0 as f32 / scale),
+                height: px(size.height.0 as f32 / scale),
+            },
+        });
+        let masks = mem::replace(&mut self.content_mask_stack, vec![texture_mask]);
+        let transformations = mem::replace(
+            &mut self.element_transformation_stack,
+            if transformation.is_unit() {
+                Vec::new()
+            } else {
+                vec![transformation]
+            },
+        );
+        let opacity = mem::replace(&mut self.element_opacity, 1.);
+        self.texture_target_depth += 1;
+        if painting {
+            self.next_frame.scene.push_texture_target(id, size);
+        }
+        let result = f(self);
+        if painting {
+            self.next_frame.scene.pop_group();
+        }
+        self.texture_target_depth -= 1;
+        self.element_opacity = opacity;
+        self.element_transformation_stack = transformations;
+        self.content_mask_stack = masks;
+        result
+    }
+
     /// Paints the mask of the compositing group this is called in
     /// ([`Window::with_compositing_group`]): what `f` paints is not drawn; its alpha,
     /// or its luminance, multiplies the group's image, after the group's filter and
@@ -6515,12 +6584,18 @@ impl Window {
         let content_mask = self.content_mask();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
+        let transformation = if self.texture_target_depth > 0 {
+            // Painted into a texture: window positions say nothing about where it is.
+            HitboxTransformation::Singular
+        } else {
+            HitboxTransformation::for_element(self.element_transformation())
+        };
         let hitbox = Hitbox {
             id,
             bounds,
             content_mask,
             behavior,
-            transformation: HitboxTransformation::for_element(self.element_transformation()),
+            transformation,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -9657,6 +9732,119 @@ mod tests {
         ) {
             window.with_element_transformation(self.1, |window| self.0.paint(window, cx));
         }
+    }
+
+    /// Its child painted into external texture 5 (100x100 device px), not the window.
+    struct TexturedChild(crate::AnyElement);
+
+    impl IntoElement for TexturedChild {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl crate::Element for TexturedChild {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) -> (crate::LayoutId, ()) {
+            (self.0.request_layout(window, cx), ())
+        }
+        fn prepaint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            let size = size(crate::DevicePixels(100), crate::DevicePixels(100));
+            window.paint_to_texture(
+                crate::ExternalTextureId(5),
+                size,
+                super::TransformationMatrix::unit(),
+                |window| self.0.prepaint(window, cx),
+            );
+        }
+        fn paint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            let size = size(crate::DevicePixels(100), crate::DevicePixels(100));
+            window.paint_to_texture(
+                crate::ExternalTextureId(5),
+                size,
+                super::TransformationMatrix::unit(),
+                |window| self.0.paint(window, cx),
+            );
+        }
+    }
+
+    struct TexturedClickable {
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for TexturedClickable {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div().size_full().child(TexturedChild(
+                div()
+                    .id("textured")
+                    .w(px(50.))
+                    .h(px(50.))
+                    .bg(crate::red())
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                    .into_any_element(),
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_paint_to_texture_draws_into_a_target_not_the_window(cx: &mut TestAppContext) {
+        let clicks = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicks = clicks.clone();
+            move |_, _| TexturedClickable { clicks }
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| {
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.texture_targets.len(), 1);
+            let target = &scene.texture_targets[0];
+            assert_eq!(target.id, crate::ExternalTextureId(5));
+            assert_eq!(
+                target.size,
+                size(crate::DevicePixels(100), crate::DevicePixels(100))
+            );
+            assert_eq!(
+                target.scene.quads.len(),
+                1,
+                "the box is painted into the target"
+            );
+            assert!(scene.quads.is_empty(), "and not into the window");
+        });
+        // Its hitbox is in the texture's coordinates: window positions do not hit it.
+        cx.simulate_click(point(px(25.), px(25.)), crate::Modifiers::default());
+        assert_eq!(clicks.get(), 0);
     }
 
     /// A 100x100 box at the origin, drawn moved 200 px right and doubled: x 200..400.
