@@ -51,7 +51,12 @@ use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support", feature = "bench-support", feature = "window-capture"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "bench-support",
+    feature = "window-capture"
+))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
@@ -1776,6 +1781,44 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// Makes external texture `id` `size` pixels with `sampling`, or keeps it
+    /// when it already is that size (a new sampling keeps its pixels). A new
+    /// or resized texture starts transparent; returns whether it did.
+    /// Platforms without external textures return an error.
+    fn set_external_texture(
+        &self,
+        _id: ExternalTextureId,
+        _size: Size<DevicePixels>,
+        _sampling: TextureSampling,
+    ) -> Result<bool> {
+        anyhow::bail!("this platform has no external textures")
+    }
+
+    /// The tile covering all of external texture `id`, if it exists. It
+    /// disappears when the GPU device is lost: set it again and refill it.
+    fn external_texture_tile(&self, _id: ExternalTextureId) -> Option<AtlasTile> {
+        None
+    }
+
+    /// Copies `source` into external texture `id` on the GPU, from its
+    /// top-left corner. Which sources a platform takes is its own: the web
+    /// takes `web_sys::{OffscreenCanvas, HtmlCanvasElement, ImageBitmap}`.
+    fn copy_to_external_texture(
+        &self,
+        _id: ExternalTextureId,
+        _source: &dyn std::any::Any,
+    ) -> Result<()> {
+        anyhow::bail!("this platform has no external textures")
+    }
+
+    /// Frees external texture `id`.
+    fn remove_external_texture(&self, _id: ExternalTextureId) {}
+
+    /// GPU memory the external textures hold, in bytes.
+    fn external_texture_bytes(&self) -> u64 {
+        0
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -1946,6 +1989,22 @@ impl<T> AtlasTextureList<T> {
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T> {
         self.textures.iter_mut().flatten()
     }
+}
+
+/// A texture an app owns and fills itself (from a GPU source: a browser
+/// canvas, a texture it renders), drawn like an image with
+/// [`crate::Window::paint_external_texture`]. Ids are the app's to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExternalTextureId(pub u64);
+
+/// How a texture is sampled when drawn at another size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextureSampling {
+    /// Bilinear filtering.
+    #[default]
+    Linear,
+    /// The nearest texel: pixels stay square when scaled up.
+    Nearest,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3091,7 +3150,8 @@ impl CursorImage {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct CursorImageId(pub u32);
 
-static CURSOR_IMAGES: parking_lot::RwLock<Vec<Arc<CursorImage>>> = parking_lot::RwLock::new(Vec::new());
+static CURSOR_IMAGES: parking_lot::RwLock<Vec<Arc<CursorImage>>> =
+    parking_lot::RwLock::new(Vec::new());
 
 /// Registers a pointer image for the process: [`CursorStyle::Image`] with
 /// the returned id shows it. Images stay registered; register each once.
@@ -3982,9 +4042,20 @@ mod cursor_image_tests {
     #[test]
     fn a_registered_cursor_image_comes_back_and_encodes_as_png() {
         let rgba: Vec<u8> = (0..4 * 3 * 2).map(|i| (i * 7 % 256) as u8).collect();
-        let image = CursorImage { rgba: rgba.clone().into(), width: 3, height: 2, scale: 2.0, hotspot: Point::new(0.5, 1.0) };
+        let image = CursorImage {
+            rgba: rgba.clone().into(),
+            width: 3,
+            height: 2,
+            scale: 2.0,
+            hotspot: Point::new(0.5, 1.0),
+        };
         let id = register_cursor_image(image.clone());
-        let other = register_cursor_image(CursorImage { width: 1, height: 1, rgba: vec![0; 4].into(), ..image.clone() });
+        let other = register_cursor_image(CursorImage {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4].into(),
+            ..image.clone()
+        });
         assert_ne!(id, other);
         assert_eq!(*cursor_image(id).unwrap(), image);
         assert!(cursor_image(CursorImageId(u32::MAX)).is_none());
@@ -3996,6 +4067,9 @@ mod cursor_image_tests {
         assert!(CursorImage { width: 9, ..image }.png().is_none());
         // The style round-trips.
         let style = CursorStyle::Image(id);
-        assert_eq!(serde_json::from_str::<CursorStyle>(&serde_json::to_string(&style).unwrap()).unwrap(), style);
+        assert_eq!(
+            serde_json::from_str::<CursorStyle>(&serde_json::to_string(&style).unwrap()).unwrap(),
+            style
+        );
     }
 }
