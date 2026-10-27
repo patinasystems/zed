@@ -4,8 +4,8 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
-    Path, Point, PrimitiveBatch, RetainedShapesDraw, RetainedUpload, ScaledPixels, Scene,
-    ShapeInstance, Size, point, size,
+    Path, PlatformAtlas as _, Point, PrimitiveBatch, RetainedShapesDraw, RetainedUpload,
+    ScaledPixels, Scene, ShapeInstance, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
@@ -874,6 +874,20 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         self.sync_retained_shapes(scene, writer, command_buffer)?;
 
+        // Texture targets first, in order: the window and later targets sample them.
+        for target in &scene.texture_targets {
+            if let Err(error) = self.draw_texture_target(
+                scene,
+                target,
+                &instance_bindings.gradients,
+                writer,
+                command_buffer,
+            ) {
+                self.texture_pool.end_frame();
+                return Err(error);
+            }
+        }
+
         let result = self.draw_scene(
             scene,
             scene,
@@ -1021,6 +1035,54 @@ impl MetalRenderer {
 
         close_encoder(&mut encoder);
         Ok(())
+    }
+
+    /// Draws a texture target's scene ([`gpui::Window::paint_to_texture`]) into its
+    /// external texture, cleared to transparent. A texture that is missing, another
+    /// size, or not a render target is skipped (its pixels stay).
+    fn draw_texture_target(
+        &mut self,
+        root: &Scene,
+        target: &gpui::TextureTargetScene,
+        gradients: &InstanceBinding,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<()> {
+        let Some(texture) = self
+            .sprite_atlas
+            .external_texture_tile(target.id)
+            .and_then(|tile| self.sprite_atlas.metal_texture(tile.texture_id))
+        else {
+            log::warn!("texture target {:?}: no such external texture", target.id);
+            return Ok(());
+        };
+        if texture.width() != target.size.width.0 as u64
+            || texture.height() != target.size.height.0 as u64
+            || !texture
+                .usage()
+                .contains(metal::MTLTextureUsage::RenderTarget)
+        {
+            log::warn!(
+                "texture target {:?}: the texture is {}x{} ({:?}), not a {:?} render target",
+                target.id,
+                texture.width(),
+                texture.height(),
+                texture.usage(),
+                target.size
+            );
+            return Ok(());
+        }
+        let bindings = write_instances(gradients, &target.scene, writer)?;
+        self.draw_scene(
+            root,
+            &target.scene,
+            &bindings,
+            writer,
+            &texture,
+            target.size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+            command_buffer,
+        )
     }
 
     /// Draws a group's scene into an image the size of its bounds, starting with its
@@ -3170,6 +3232,73 @@ mod tests {
                 "{label}: {:.3} ms per frame, {} group image bytes",
                 median(frames),
                 renderer.renderer.group_texture_bytes()
+            );
+        }
+    }
+
+    /// External texture `id`'s pixels as RGBA, read on the shared queue.
+    fn external_rgba(atlas: &MetalAtlas, id: gpui::ExternalTextureId) -> (u32, Vec<u8>) {
+        use gpui::PlatformAtlas as _;
+        let tile = atlas.external_texture_tile(id).expect("the texture exists");
+        let texture = atlas.metal_texture(tile.texture_id).unwrap();
+        let (w, h) = (texture.width(), texture.height());
+        let device = texture.device().to_owned();
+        let buffer = device.new_buffer(w * h * 4, metal::MTLResourceOptions::StorageModeShared);
+        let cb = shared_command_queue(&device)
+            .new_command_buffer()
+            .to_owned();
+        let blit = cb.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            &texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize::new(w, h, 1),
+            &buffer,
+            0,
+            w * 4,
+            0,
+            metal::MTLBlitOption::empty(),
+        );
+        blit.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let bgra = unsafe {
+            std::slice::from_raw_parts(buffer.contents() as *const u8, (w * h * 4) as usize)
+        };
+        let rgba = bgra
+            .chunks(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+        (w as u32, rgba)
+    }
+
+    #[test]
+    fn texture_targets_draw_into_their_textures_not_the_window() {
+        use gpui::PlatformAtlas as _;
+        use gpui::texture_target_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let atlas = renderer.renderer.sprite_atlas().clone();
+        for (id, size) in t::targets() {
+            atlas
+                .set_external_texture(id, size, gpui::TextureSampling::Linear)
+                .unwrap();
+        }
+        let (scene, window, textures) = t::scene();
+        let size = size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1));
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
+                .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &window, 3);
+        for (id, probes) in textures {
+            let (width, rgba) = external_rgba(&atlas, id);
+            t::check(
+                |x, y| {
+                    let i = ((y * width + x) * 4) as usize;
+                    [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+                },
+                &probes,
+                3,
             );
         }
     }

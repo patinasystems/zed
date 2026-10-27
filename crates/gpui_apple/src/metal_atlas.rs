@@ -203,7 +203,9 @@ impl MetalAtlasTextures {
         descriptor.set_width(size.width.0 as u64);
         descriptor.set_height(size.height.0 as u64);
         descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        // Drawn into by texture targets (`Window::paint_to_texture`).
+        descriptor
+            .set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
         descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         let metal_texture = self.device.new_texture(&descriptor);
         // A new texture starts transparent.

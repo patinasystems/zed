@@ -1641,6 +1641,9 @@ impl WgpuRendererCore {
     ) -> Self {
         let device = Arc::clone(&context.device);
         let queue = Arc::clone(&context.queue);
+        // External textures are drawn into with this renderer's pipelines (texture
+        // targets), so they take its format.
+        atlas.set_external_format(target_format);
         let rendering_params = RenderingParameters::new(&context.adapter, target_format);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
@@ -1952,6 +1955,15 @@ impl WgpuRendererCore {
             [size.width.0 as f32, size.height.0 as f32],
             &mut viewports,
         );
+        // Texture targets (`Window::paint_to_texture`), after the window's scene, which
+        // stays first.
+        for target in &scene.texture_targets {
+            visit(
+                &target.scene,
+                [target.size.width.0 as f32, target.size.height.0 as f32],
+                &mut viewports,
+            );
+        }
         let scenes: SmallVec<[&Scene; 4]> = viewports.iter().map(|(scene, _)| *scene).collect();
         let retained_stride = self
             .prepare_retained_shapes(&viewports)
@@ -2018,19 +2030,29 @@ impl WgpuRendererCore {
                 "backdrop_frame",
             )
         });
+        // Texture targets first, in order: the window and later targets sample them.
+        let mut result = Ok(());
+        for target in &scene.texture_targets {
+            result = self.draw_texture_target(&mut encoder, &frame, target, &mut instance_offset);
+            if result.is_err() {
+                break;
+            }
+        }
         let target = DrawTarget {
             view: offscreen.as_ref().map_or(frame_view, |(_, view)| view),
             texture: offscreen.as_ref().map(|(texture, _)| texture),
             size,
         };
-        let result = self.draw_scene(
-            &mut encoder,
-            &frame,
-            scene,
-            target,
-            Some(clear_color),
-            &mut instance_offset,
-        );
+        let result = result.and_then(|()| {
+            self.draw_scene(
+                &mut encoder,
+                &frame,
+                scene,
+                target,
+                Some(clear_color),
+                &mut instance_offset,
+            )
+        });
         // Keep the images, copies and globals this frame used; free the rest.
         self.resources.texture_pool.end_frame();
         // Group globals live 60 frames unused (sizes that animate come back), at most 64.
@@ -2222,6 +2244,64 @@ impl WgpuRendererCore {
     /// Draws a group's scene into an image the size of its bounds, starting with its
     /// filtered backdrop, then blurs it, reads what is behind it when its blend mode
     /// needs that, and composites it onto `target`.
+    /// Draws a texture target's scene (`Window::paint_to_texture`) into its external
+    /// texture, cleared to transparent, with the texture's viewport. A texture that is
+    /// missing, another size or format, or not a render attachment is skipped (its
+    /// pixels stay).
+    fn draw_texture_target(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameScenes<'_>,
+        target: &gpui::TextureTargetScene,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let Some(texture) = self.atlas.external_texture(target.id) else {
+            log::warn!("texture target {:?}: no such external texture", target.id);
+            return Ok(());
+        };
+        if texture.width() != target.size.width.0 as u32
+            || texture.height() != target.size.height.0 as u32
+            || texture.format() != self.target_format
+            || !texture
+                .usage()
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            log::warn!(
+                "texture target {:?}: the texture is {}x{} {:?} ({:?}), not a {:?} {:?} render attachment",
+                target.id,
+                texture.width(),
+                texture.height(),
+                texture.format(),
+                texture.usage(),
+                target.size,
+                self.target_format
+            );
+            return Ok(());
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let draw_target = DrawTarget {
+            view: &view,
+            texture: Some(&texture),
+            size: target.size,
+        };
+        let globals = self.group_globals(target.size);
+        let frame_globals = (
+            std::mem::replace(&mut self.resources.globals_bind_group, globals.0),
+            std::mem::replace(&mut self.resources.path_globals_bind_group, globals.1),
+        );
+        let result = self.draw_scene(
+            encoder,
+            frame,
+            &target.scene,
+            draw_target,
+            Some(wgpu::Color::TRANSPARENT),
+            instance_offset,
+        );
+        self.resources.globals_bind_group = frame_globals.0;
+        self.resources.path_globals_bind_group = frame_globals.1;
+        result
+    }
+
     fn draw_group(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -3559,12 +3639,19 @@ impl WgpuHeadlessRenderer {
     /// Copies the current render target back to the CPU. Dimensions come from the
     /// target texture itself, so the copy can never disagree with what was rendered.
     fn read_image(&mut self) -> anyhow::Result<image::RgbaImage> {
-        let target = self
+        let texture = self
             .render_target
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
-        let width = target.texture.width();
-        let height = target.texture.height();
+            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
+            .texture
+            .clone();
+        self.read_texture(&texture)
+    }
+
+    /// `texture`'s pixels (the render target's format), as RGBA, after the work submitted so far.
+    fn read_texture(&mut self, texture: &wgpu::Texture) -> anyhow::Result<image::RgbaImage> {
+        let width = texture.width();
+        let height = texture.height();
         let bytes_per_row = width
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("Headless render target row size overflowed"))?;
@@ -3598,7 +3685,7 @@ impl WgpuHeadlessRenderer {
                 });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target.texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -4105,6 +4192,39 @@ mod tests {
                 median(frames),
                 renderer.core.group_texture_bytes()
             );
+        }
+        Ok(())
+    }
+
+    /// The shared texture target scene on the wgpu backend: targets draw into their
+    /// external textures, not the window.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn texture_targets_draw_into_their_textures_not_the_window() -> anyhow::Result<()> {
+        use gpui::texture_target_test_scene as t;
+        use gpui::{DevicePixels, PlatformAtlas as _, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let atlas = renderer.core.atlas.clone();
+        for (id, size) in t::targets() {
+            atlas.set_external_texture(id, size, gpui::TextureSampling::Linear)?;
+        }
+        let size = Size {
+            width: DevicePixels(t::SIZE.0),
+            height: DevicePixels(t::SIZE.1),
+        };
+        let (scene, window, textures) = t::scene();
+        let image = renderer.render_scene_to_image(&scene, size)?;
+        t::check(|x, y| image.get_pixel(x, y).0, &window, 3);
+        for (id, probes) in textures {
+            let texture = atlas.external_texture(id).expect("the texture exists");
+            let pixels = renderer.read_texture(&texture)?;
+            t::check(|x, y| pixels.get_pixel(x, y).0, &probes, 3);
         }
         Ok(())
     }
