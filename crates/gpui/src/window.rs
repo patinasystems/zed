@@ -1347,7 +1347,7 @@ impl Frame {
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             // Content masks are in window coordinates; transformed bounds are local.
-            let hit = hitbox.content_mask.bounds.contains(&position)
+            let hit = hitbox.content_mask.contains(&position)
                 && hitbox
                     .transformation
                     .local(position)
@@ -2440,10 +2440,11 @@ macro_rules! content_mask_intersect {
         impl ContentMask<$unit> {
             /// Intersect the content mask with the given content mask.
             ///
-            /// The result is one rounded rectangle: each of its corners keeps the larger
-            /// radius of the masks whose own corner it is (a corner both masks share keeps
-            /// the larger, which clips more). A rounded corner that the other mask cuts
-            /// through without sharing it is not represented: that corner clips square.
+            /// The result is one rounded rectangle. Each of its corners takes the largest
+            /// radius a mask's rounded corner gives it: a mask's own corner keeps its
+            /// radius; a corner inset by `dx`, `dy` inside a mask's rounded corner takes
+            /// `radius - max(dx, dy)`, as CSS derives an inner curve from an outer one
+            /// (the padding box's curve from the border box's).
             pub fn intersect(&self, other: &Self) -> Self {
                 let bounds = self.bounds.intersect(&other.bounds);
                 if self.corner_radii == Corners::default()
@@ -2451,18 +2452,18 @@ macro_rules! content_mask_intersect {
                 {
                     return ContentMask::from(bounds);
                 }
-                let same = |a: Point<$unit>, b: Point<$unit>| {
-                    (a.x.0 - b.x.0).abs() < 0.01 && (a.y.0 - b.y.0).abs() < 0.01
-                };
                 let corner = |at: fn(&Bounds<$unit>) -> Point<$unit>,
                               radius: fn(&Corners<$unit>) -> $unit| {
-                    let mut r = <$unit>::default();
+                    let here = at(&bounds);
+                    let mut r = 0f32;
                     for mask in [self, other] {
-                        if same(at(&mask.bounds), at(&bounds)) && radius(&mask.corner_radii) > r {
-                            r = radius(&mask.corner_radii);
-                        }
+                        let there = at(&mask.bounds);
+                        let inset = (here.x.0 - there.x.0)
+                            .abs()
+                            .max((here.y.0 - there.y.0).abs());
+                        r = r.max(radius(&mask.corner_radii).0 - inset);
                     }
-                    r
+                    <$unit>::from(r.max(0.))
                 };
                 let corner_radii = Corners {
                     top_left: corner(|b| b.origin, |c| c.top_left),
@@ -2474,6 +2475,39 @@ macro_rules! content_mask_intersect {
                     bounds,
                     corner_radii,
                 }
+            }
+
+            /// Whether `point` is inside the mask, rounded corners included.
+            pub fn contains(&self, point: &Point<$unit>) -> bool {
+                if !self.bounds.contains(point) {
+                    return false;
+                }
+                let b = &self.bounds;
+                let (x, y) = (point.x.0, point.y.0);
+                let (left, top) = (b.origin.x.0, b.origin.y.0);
+                let (right, bottom) = (left + b.size.width.0, top + b.size.height.0);
+                let r = &self.corner_radii;
+                // The corner whose quarter the point is in, and its radius.
+                let (cx, rx) = if x < (left + right) / 2. {
+                    (left, 1.)
+                } else {
+                    (right, -1.)
+                };
+                let (cy, ry) = if y < (top + bottom) / 2. {
+                    (top, 1.)
+                } else {
+                    (bottom, -1.)
+                };
+                let radius = match (rx > 0., ry > 0.) {
+                    (true, true) => r.top_left.0,
+                    (false, true) => r.top_right.0,
+                    (false, false) => r.bottom_right.0,
+                    (true, false) => r.bottom_left.0,
+                };
+                // The corner's circle center; outside its box the straight edges hold.
+                let (ox, oy) = (cx + rx * radius, cy + ry * radius);
+                let (dx, dy) = ((x - ox) * rx, (y - oy) * ry);
+                !(dx < 0. && dy < 0. && dx * dx + dy * dy > radius * radius)
             }
 
             /// Whether any corner is rounded.
@@ -2536,10 +2570,22 @@ mod content_mask_tests {
                 bottom_left: px(12.)
             }
         );
-        // An inset child: none of its corners are the card's.
+        // A child inset by 4 px takes the card's inner curve (12 - 4); one inset past the
+        // radius clips square; inset unevenly, the larger inset wins (12 - max(2, 6)).
+        assert_eq!(
+            mask(4., 4., 92., 92., 0.).intersect(&card).corner_radii,
+            Corners::all(px(8.))
+        );
         assert_eq!(
             mask(20., 20., 60., 60., 0.).intersect(&card).corner_radii,
             Corners::default()
+        );
+        assert_eq!(
+            mask(2., 6., 50., 50., 0.)
+                .intersect(&card)
+                .corner_radii
+                .top_left,
+            px(6.)
         );
         // Square masks stay square.
         assert!(
@@ -2547,6 +2593,21 @@ mod content_mask_tests {
                 .intersect(&mask(5., 5., 10., 10., 0.))
                 .is_rounded()
         );
+    }
+
+    #[test]
+    fn contains_excludes_the_rounded_corners() {
+        let card = mask(0., 0., 100., 50., 12.);
+        assert!(card.contains(&point(px(50.), px(25.))));
+        assert!(card.contains(&point(px(12.), px(0.5))), "straight top edge");
+        assert!(!card.contains(&point(px(1.), px(1.))), "top left cutout");
+        assert!(
+            !card.contains(&point(px(99.), px(49.))),
+            "bottom right cutout"
+        );
+        assert!(card.contains(&point(px(4.), px(4.))), "inside the curve");
+        assert!(!card.contains(&point(px(101.), px(25.))));
+        assert!(mask(0., 0., 10., 10., 0.).contains(&point(px(0.), px(0.))));
     }
 
     #[test]
@@ -5052,10 +5113,12 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ContentMask::from(Bounds { origin: Point::default(), size: self.viewport_size, }))
+        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
+            ContentMask::from(Bounds {
+                origin: Point::default(),
+                size: self.viewport_size,
+            })
+        })
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -9838,7 +9901,10 @@ mod tests {
                         let origin = window.element_transformation().apply(point(px(0.), px(0.)));
                         assert_eq!(origin, point(px(20.), px(0.)));
                     });
-                    let mask = ContentMask::from(Bounds::new(point(px(5.), px(5.)), size(px(10.), px(10.))));
+                    let mask = ContentMask::from(Bounds::new(
+                        point(px(5.), px(5.)),
+                        size(px(10.), px(10.)),
+                    ));
                     window.with_content_mask(Some(mask), |window| {
                         assert_eq!(
                             window.content_mask().bounds,
@@ -11582,7 +11648,10 @@ mod tests {
             let scale = window.scale_factor();
             let original_mask = window.content_mask();
             let original_opacity = window.element_opacity();
-            let mask = ContentMask::from(Bounds::from_corners(point(px(4.), px(10.)), point(px(16.), px(12.))));
+            let mask = ContentMask::from(Bounds::from_corners(
+                point(px(4.), px(10.)),
+                point(px(16.), px(12.)),
+            ));
             let style = UnderlineStyle {
                 thickness: px(2.),
                 color: Some(hsla(0.25, 0.5, 0.75, 0.5)),
@@ -11725,7 +11794,12 @@ mod tests {
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
-                    window.content_mask_stack.push(ContentMask::from(Bounds::from_corners( point(px(-1000.), px(-1000.)), point(px(1000.), px(1000.)), )));
+                    window
+                        .content_mask_stack
+                        .push(ContentMask::from(Bounds::from_corners(
+                            point(px(-1000.), px(-1000.)),
+                            point(px(1000.), px(1000.)),
+                        )));
                     paint(window);
                     window.content_mask_stack.pop();
                 },
