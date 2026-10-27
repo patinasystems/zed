@@ -305,6 +305,7 @@ impl WgpuAtlasTextures {
                 && source.sample_count() == 1,
             "an external texture shares a single-sampled 2D texture with TEXTURE_BINDING usage"
         );
+        self.ensure_own_device(source)?;
         if let Some(texture_id) = self.externals.get(&id).copied() {
             let generation = self.next_texture_generation;
             if let Some(texture) = self.storage[texture_id.kind]
@@ -329,6 +330,52 @@ impl WgpuAtlasTextures {
         };
         self.remove_external(id);
         self.insert_external(id, source.clone(), size, sampling);
+        Ok(())
+    }
+
+    /// Refuses a texture from another device (as Metal's atlas does): binding it would
+    /// fail validation in a later frame. wgpu has no device getter, so this binds a
+    /// view in a validation error scope. On the web, where an error scope resolves
+    /// asynchronously, WebGPU reports a foreign texture when a frame binds it.
+    #[cfg(not(target_family = "wasm"))]
+    fn ensure_own_device(&self, texture: &wgpu::Texture) -> Result<()> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("share_external_device_check"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        drop(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("share_external_device_check"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        }));
+        // On native backends the scope's result is ready when it is popped.
+        let error = poll_ready(scope.pop()).flatten();
+        anyhow::ensure!(
+            error.is_none(),
+            "an external texture shares a texture on its own wgpu device: {}",
+            error.map(|e| e.to_string()).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn ensure_own_device(&self, _texture: &wgpu::Texture) -> Result<()> {
         Ok(())
     }
 
@@ -680,6 +727,20 @@ fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
             data
         }
         _ => bytes.to_vec(),
+    }
+}
+
+/// Polls `future` once: `None` if it is not ready.
+#[cfg(not(target_family = "wasm"))]
+fn poll_ready<F: std::future::Future>(future: F) -> Option<F::Output> {
+    use std::task::{Context, Poll, Waker};
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(output) => Some(output),
+        Poll::Pending => None,
     }
 }
 
@@ -1067,6 +1128,16 @@ mod tests {
                 .generation,
             info.generation
         );
+
+        // A texture from another device is refused.
+        let (other_device, _) = test_device_and_queue()?;
+        let foreign = producer_texture(&other_device, 4, 4, format);
+        assert!(
+            atlas
+                .share_external_texture(ExternalTextureId(5), &foreign, TextureSampling::Linear)
+                .is_err()
+        );
+        assert!(atlas.external_texture_tile(ExternalTextureId(5)).is_none());
 
         // Only textures in the atlas's format with TEXTURE_BINDING, and only wgpu textures.
         let rgba = producer_texture(&device, 2, 2, wgpu::TextureFormat::Rgba8Unorm);
