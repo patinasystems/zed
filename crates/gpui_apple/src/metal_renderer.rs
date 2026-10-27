@@ -143,10 +143,18 @@ pub fn shared_command_queue(device: &metal::DeviceRef) -> metal::CommandQueue {
     if let Some((_, q)) = queues.iter().find(|(d, _)| *d == id) {
         return q.0.clone();
     }
-    let queue = device.new_command_queue();
+    // Room for as many uncompleted command buffers as wgpu allows: wgpu on this queue opens
+    // one command buffer per pass, and `newCommandQueue`'s limit of 64 would block a large
+    // submission in `commandBuffer` until earlier ones complete (a deadlock when they wait
+    // on work committed later).
+    let queue = device.new_command_queue_with_max_command_buffer_count(MAX_COMMAND_BUFFERS);
     queues.push((id, SendQueue(queue.clone())));
     queue
 }
+
+/// Uncompleted command buffers [`shared_command_queue`] allows: wgpu-hal's Metal
+/// `MAX_COMMAND_BUFFERS`.
+pub const MAX_COMMAND_BUFFERS: u64 = 4096;
 
 /// Metal command queues are thread-safe (`MTLCommandQueue` may be used from any thread).
 struct SendQueue(metal::CommandQueue);
@@ -3301,6 +3309,42 @@ mod tests {
                 3,
             );
         }
+    }
+
+    /// More than 64 uncompleted command buffers (`newCommandQueue`'s limit) on the shared
+    /// queue: the first waits on an event no one has signaled, so none completes while the
+    /// rest are made. With the old limit the 65th blocks forever.
+    #[test]
+    fn the_shared_queue_holds_more_than_64_uncompleted_command_buffers() {
+        struct Send<T>(T);
+        unsafe impl<T> std::marker::Send for Send<T> {}
+        let device = preferred_device();
+        let queue = Send(shared_command_queue(&device));
+        let event = device.new_shared_event();
+        let first = queue.0.new_command_buffer().to_owned();
+        first.encode_wait_for_event(&event, 1);
+        first.commit();
+        let (done, made) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let queue = queue;
+            let mut buffers = Vec::new();
+            for _ in 0..200 {
+                let buffer = queue.0.new_command_buffer().to_owned();
+                buffer.commit();
+                buffers.push(buffer);
+            }
+            done.send(Send(buffers)).ok();
+        });
+        // With room, they are made at once. With `newCommandQueue`'s 64, the 65th waits until
+        // Metal's watchdog fails the first (about 5 s on macOS 27), so 2 s tells them apart.
+        let result = made.recv_timeout(std::time::Duration::from_secs(2));
+        // Let them all complete either way.
+        event.set_signaled_value(1);
+        let buffers = result.expect("200 uncompleted command buffers were made without blocking");
+        for buffer in &buffers.0 {
+            buffer.wait_until_completed();
+        }
+        first.wait_until_completed();
     }
 
     #[test]
