@@ -1436,6 +1436,10 @@ pub struct Window {
     /// How many [`Window::paint_to_texture`] calls are open: hitboxes inserted inside
     /// one are in its texture's coordinates, so window positions do not hit them.
     texture_target_depth: usize,
+    /// Whether the platform rendered the last drawn frame (presented it, or rendered it
+    /// to an image). A frame drawn over one it did not render carries that frame's
+    /// texture targets forward ([`Window::paint_to_texture`]).
+    frame_rendered: Cell<bool>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2350,6 +2354,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_transformation_stack: Vec::new(),
             texture_target_depth: 0,
+            frame_rendered: Cell::new(true),
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -3296,8 +3301,11 @@ impl Window {
     /// support return an error).
     #[cfg(any(test, feature = "test-support", feature = "window-capture"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
-        self.platform_window
-            .render_to_image(&self.rendered_frame.scene)
+        let image = self
+            .platform_window
+            .render_to_image(&self.rendered_frame.scene);
+        self.frame_rendered.set(true);
+        image
     }
 
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
@@ -3948,6 +3956,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        self.carry_texture_targets();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -4043,6 +4052,44 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// A texture target is drawn into its texture only when its frame is rendered, and its
+    /// painter may not paint it again (`Window::paint_to_texture` callers re-render only
+    /// what changed). So when the last frame was never rendered, the targets this frame
+    /// did not paint are replayed into it from that frame.
+    fn carry_texture_targets(&mut self) {
+        let rendered = self.frame_rendered.replace(false);
+        if rendered || self.rendered_frame.scene.texture_targets.is_empty() {
+            return;
+        }
+        let painted: FxHashSet<ExternalTextureId> = self
+            .next_frame
+            .scene
+            .texture_targets
+            .iter()
+            .map(|target| target.id)
+            .collect();
+        let mut carried: Vec<Range<usize>> = self
+            .rendered_frame
+            .scene
+            .texture_targets
+            .iter()
+            .filter(|target| !painted.contains(&target.id))
+            .map(|target| target.operations.clone())
+            .collect();
+        // Outermost first: a target replays the targets painted inside it.
+        carried.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+        let mut end = 0;
+        for range in carried {
+            if range.start < end {
+                continue;
+            }
+            end = range.end;
+            self.next_frame
+                .scene
+                .replay(range, &self.rendered_frame.scene);
+        }
+    }
+
     #[profiling::function]
     fn present(&mut self) {
         #[cfg(feature = "profiler")]
@@ -4050,6 +4097,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.frame_rendered.set(true);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -9797,6 +9845,121 @@ mod tests {
                 |window| self.0.paint(window, cx),
             );
         }
+    }
+
+    /// [`TexturedChild`] that paints into its texture only while `paint` is set, as a caller
+    /// that re-renders only changed subtrees does.
+    struct GatedTexture(TexturedChild, Rc<Cell<bool>>);
+
+    impl IntoElement for GatedTexture {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl crate::Element for GatedTexture {
+        type RequestLayoutState = ();
+        type PrepaintState = bool;
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            id: Option<&crate::GlobalElementId>,
+            inspector: Option<&crate::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) -> (crate::LayoutId, ()) {
+            self.0.request_layout(id, inspector, window, cx)
+        }
+        fn prepaint(
+            &mut self,
+            id: Option<&crate::GlobalElementId>,
+            inspector: Option<&crate::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            state: &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) -> bool {
+            let paint = self.1.get();
+            if paint {
+                self.0.prepaint(id, inspector, bounds, state, window, cx);
+            }
+            paint
+        }
+        fn paint(
+            &mut self,
+            id: Option<&crate::GlobalElementId>,
+            inspector: Option<&crate::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            state: &mut (),
+            paint: &mut bool,
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            if *paint {
+                self.0
+                    .paint(id, inspector, bounds, state, &mut (), window, cx);
+            }
+        }
+    }
+
+    struct GatedTextured {
+        paint: Rc<Cell<bool>>,
+    }
+
+    impl Render for GatedTextured {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(GatedTexture(
+                TexturedChild(
+                    div()
+                        .w(px(50.))
+                        .h(px(50.))
+                        .bg(crate::red())
+                        .into_any_element(),
+                ),
+                self.paint.clone(),
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn test_texture_targets_carry_over_frames_that_were_not_rendered(cx: &mut TestAppContext) {
+        let paint = Rc::new(Cell::new(false));
+        let (_, cx) = cx.add_window_view({
+            let paint = paint.clone();
+            move |_, _| GatedTextured { paint }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let targets = |window: &Window| window.rendered_frame.scene.texture_targets.len();
+            // Frame A paints the target and is not rendered.
+            paint.set(true);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(targets(window), 1);
+            // Frame B does not paint it: it is carried from A, which was never drawn.
+            paint.set(false);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(targets(window), 1, "carried over the unrendered frame");
+            assert_eq!(
+                window.rendered_frame.scene.texture_targets[0]
+                    .scene
+                    .quads
+                    .len(),
+                1
+            );
+            // Once B is rendered, a frame that does not paint it has none.
+            window.frame_rendered.set(true);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(targets(window), 0);
+        });
     }
 
     struct TexturedClickable {

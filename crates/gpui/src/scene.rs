@@ -224,9 +224,12 @@ impl Scene {
     /// in the texture's device pixels, and is not drawn in the scene. Groups inside it
     /// composite into it; texture targets inside it are drawn before it.
     pub fn push_texture_target(&mut self, id: ExternalTextureId, size: Size<DevicePixels>) {
+        let start = self.paint_operations.len();
         self.paint_operations
             .push(PaintOperation::StartTextureTarget(id, size));
-        self.open_groups.push(OpenGroup::texture_target(id, size));
+        let mut group = OpenGroup::texture_target(id, size);
+        group.operations_start = start;
+        self.open_groups.push(group);
     }
 
     /// Ends the innermost group or texture target ([`Scene::push_group`],
@@ -243,6 +246,7 @@ impl Scene {
                 id,
                 size,
                 scene: group.scene,
+                operations: group.operations_start..self.paint_operations.len(),
             });
             // Inner targets first: a target may sample one painted inside it.
             self.texture_targets.extend(targets);
@@ -1885,6 +1889,9 @@ pub struct TextureTargetScene {
     pub size: Size<DevicePixels>,
     /// What is drawn into it, finished.
     pub scene: Scene,
+    /// Its paint operations in the window's scene (from its start to its end), to replay
+    /// it into a later frame ([`Scene::replay`]).
+    pub operations: Range<usize>,
 }
 
 /// A group being painted ([`Scene::push_group`]).
@@ -1892,6 +1899,8 @@ struct OpenGroup {
     /// Set on a texture target ([`Scene::push_texture_target`]): its scene is drawn
     /// into the texture, not composited.
     texture_target: Option<(ExternalTextureId, Size<DevicePixels>)>,
+    /// A texture target's first paint operation in the window's scene.
+    operations_start: usize,
     effects: GroupEffects,
     scene: Scene,
     /// Its mask, once painted ([`GroupEffects::masks_parent`]).
@@ -1921,6 +1930,7 @@ impl OpenGroup {
             && effects.masks_parent.is_none();
         Self {
             texture_target: None,
+            operations_start: 0,
             mask: None,
             masked_out: false,
             effects,
@@ -1943,6 +1953,7 @@ impl OpenGroup {
         };
         Self {
             texture_target: Some((id, size)),
+            operations_start: 0,
             mask: None,
             masked_out: false,
             effects: GroupEffects {
