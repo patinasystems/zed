@@ -48,6 +48,10 @@ pub struct WebPlatform {
     graphics_unavailable: Rc<LaunchFailure<anyhow::Error>>,
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
+    /// The element the CSS cursor is set on: the window's canvas once it is open, so the
+    /// cursor shows over the canvas only (and two mounts on one page do not set each
+    /// other's), else the document body.
+    cursor_target: CursorTarget,
     gestures: Rc<WebGestures>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
 }
@@ -225,10 +229,12 @@ impl WebPlatform {
 
         let cursor_visible = Rc::new(Cell::new(true));
         let last_cursor_css = Rc::new(Cell::new("default"));
+        let cursor_target = CursorTarget::default();
         let cursor_restore_listeners = cursor_restore_listeners(
             &browser_window,
             cursor_visible.clone(),
             last_cursor_css.clone(),
+            cursor_target.clone(),
         );
         let gestures = Rc::new(WebGestures::from_user_agent(
             &browser_window.navigator().user_agent().unwrap_or_default(),
@@ -252,6 +258,7 @@ impl WebPlatform {
             graphics_unavailable: Rc::default(),
             cursor_visible,
             last_cursor_css,
+            cursor_target,
             gestures,
             _cursor_restore_listeners: cursor_restore_listeners,
         }
@@ -494,6 +501,10 @@ impl Platform for WebPlatform {
         );
         match window {
             Ok(window) => {
+                self.cursor_target.set(Some(canvas_for_cleanup.clone().into()));
+                if self.cursor_visible.get() {
+                    self.cursor_target.apply(&self.browser_window, self.last_cursor_css.get());
+                }
                 self.window_lifecycle.set(WebWindowLifecycle::Open);
                 *self.active_window.borrow_mut() = Some(handle);
                 Ok(Box::new(window))
@@ -655,7 +666,7 @@ impl Platform for WebPlatform {
 
         self.last_cursor_css.set(css_cursor);
         if self.cursor_visible.get() {
-            set_body_cursor(&self.browser_window, css_cursor);
+            self.cursor_target.apply(&self.browser_window, css_cursor);
         }
     }
 
@@ -663,7 +674,7 @@ impl Platform for WebPlatform {
         if !self.cursor_visible.replace(false) {
             return;
         }
-        set_body_cursor(&self.browser_window, "none");
+        self.cursor_target.apply(&self.browser_window, "none");
     }
 
     fn is_cursor_visible(&self) -> bool {
@@ -740,12 +751,23 @@ impl Platform for WebPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text()
-            && let Some(window) = web_sys::window()
-        {
-            // Fire-and-forget; called synchronously inside the user's input
-            // event, which satisfies the browser's user-activation requirement.
-            drop(window.navigator().clipboard().write_text(&text));
+        let Some(text) = item.text() else {
+            return;
+        };
+        // Called synchronously inside the user's input event (the keydown of a
+        // copy shortcut): a `copy` command run now fires a `copy` event whose
+        // `clipboardData` takes the text at once, with no permission prompt
+        // (Safari included), and page `copy` listeners see what was copied.
+        if copy_through_event(&self.browser_window, &text) {
+            return;
+        }
+        // Outside a user gesture the command does nothing: the async Clipboard
+        // API, fire-and-forget. It is undefined outside secure contexts.
+        let navigator = self.browser_window.navigator();
+        let clipboard_available = js_sys::Reflect::get(navigator.as_ref(), &"clipboard".into())
+            .is_ok_and(|clipboard| !clipboard.is_undefined() && !clipboard.is_null());
+        if clipboard_available {
+            drop(navigator.clipboard().write_text(&text));
         }
     }
 
@@ -849,6 +871,7 @@ fn cursor_restore_listeners(
     browser_window: &web_sys::Window,
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
+    cursor_target: CursorTarget,
 ) -> Vec<EventListenerHandle> {
     let mut handles = Vec::new();
     let Some(document) = browser_window.document() else {
@@ -859,12 +882,13 @@ fn cursor_restore_listeners(
         let browser_window = browser_window.clone();
         let cursor_visible = cursor_visible.clone();
         let last_cursor_css = last_cursor_css.clone();
+        let cursor_target = cursor_target.clone();
         handles.push(EventListenerHandle::add(
             target,
             event_name,
             move |_event: JsValue| {
                 if !cursor_visible.replace(true) {
-                    set_body_cursor(&browser_window, last_cursor_css.get());
+                    cursor_target.apply(&browser_window, last_cursor_css.get());
                 }
             },
         ));
@@ -949,11 +973,61 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn set_body_cursor(browser_window: &web_sys::Window, css_cursor: &str) {
-    if let Some(document) = browser_window.document()
-        && let Some(body) = document.body()
-        && let Err(error) = body.style().set_property("cursor", css_cursor)
-    {
-        log::warn!("Failed to set cursor style: {error:?}");
+/// Where the platform's CSS cursor goes ([`WebPlatform::cursor_target`]).
+#[derive(Clone, Default)]
+struct CursorTarget(Rc<RefCell<Option<web_sys::HtmlElement>>>);
+
+impl CursorTarget {
+    fn set(&self, element: Option<web_sys::HtmlElement>) {
+        *self.0.borrow_mut() = element;
     }
+
+    /// Sets `css_cursor` on the canvas, or on the body before a window opens.
+    fn apply(&self, browser_window: &web_sys::Window, css_cursor: &str) {
+        let element = self.0.borrow().clone().or_else(|| browser_window.document().and_then(|d| d.body()));
+        if let Some(element) = element
+            && let Err(error) = element.style().set_property("cursor", css_cursor)
+        {
+            log::warn!("Failed to set cursor style: {error:?}");
+        }
+    }
+}
+
+/// Copies `text` with a synchronous `copy` command (`document.execCommand("copy")`), filling
+/// the `copy` event's `clipboardData` from a one-shot listener. Returns whether the browser ran
+/// the command and the text was set: browsers run it only inside a user gesture.
+fn copy_through_event(browser_window: &web_sys::Window, text: &str) -> bool {
+    let Some(document) = browser_window.document() else {
+        return false;
+    };
+    let Ok(exec) = js_sys::Reflect::get(document.as_ref(), &"execCommand".into()) else {
+        return false;
+    };
+    let Some(exec) = exec.dyn_ref::<js_sys::Function>() else {
+        return false;
+    };
+    let wrote = Rc::new(Cell::new(false));
+    let listener = {
+        let (wrote, text) = (wrote.clone(), text.to_owned());
+        Closure::<dyn FnMut(web_sys::ClipboardEvent)>::new(move |event: web_sys::ClipboardEvent| {
+            if let Some(data) = event.clipboard_data()
+                && data.set_data("text/plain", &text).is_ok()
+            {
+                event.prevent_default();
+                wrote.set(true);
+            }
+        })
+    };
+    let target: &web_sys::EventTarget = document.as_ref();
+    if target
+        .add_event_listener_with_callback_and_bool("copy", listener.as_ref().unchecked_ref(), true)
+        .is_err()
+    {
+        return false;
+    }
+    let ran = exec.call1(document.as_ref(), &"copy".into()).is_ok_and(|ran| ran.as_bool() == Some(true));
+    target
+        .remove_event_listener_with_callback_and_bool("copy", listener.as_ref().unchecked_ref(), true)
+        .ok();
+    ran && wrote.get()
 }
