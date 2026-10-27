@@ -406,6 +406,7 @@ impl TestPlatform {
         *self.active_cursor.lock()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
     }
