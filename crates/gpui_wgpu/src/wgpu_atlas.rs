@@ -1,8 +1,10 @@
 use anyhow::{Context as _, Result};
+use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    AtlasTile, Bounds, DevicePixels, ExternalTextureId, PlatformAtlas, Point, Size,
+    TextureSampling,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -36,12 +38,16 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    /// External textures: each a whole polychrome texture of its own.
+    externals: FxHashMap<ExternalTextureId, AtlasTextureId>,
 }
 
 pub struct WgpuTextureInfo {
     pub view: wgpu::TextureView,
     /// Distinguishes new textures that reuse an [`AtlasTextureId`].
     pub generation: u64,
+    /// How the texture is sampled (external textures choose; the rest are linear).
+    pub sampling: TextureSampling,
 }
 
 impl WgpuAtlas {
@@ -59,6 +65,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            externals: FxHashMap::default(),
         })))
     }
 
@@ -85,6 +92,7 @@ impl WgpuAtlas {
         Some(WgpuTextureInfo {
             view: texture.view.clone(),
             generation: texture.generation,
+            sampling: texture.external.unwrap_or_default(),
         })
     }
 
@@ -94,6 +102,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.externals.clear();
         });
     }
 
@@ -106,6 +115,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.externals.clear();
         });
     }
 }
@@ -121,6 +131,48 @@ impl PlatformAtlas for WgpuAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn set_external_texture(
+        &self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) -> Result<bool> {
+        self.0.lock().backend.set_external(id, size, sampling)
+    }
+
+    fn external_texture_tile(&self, id: ExternalTextureId) -> Option<AtlasTile> {
+        let lock = self.0.lock();
+        let textures = &lock.backend;
+        let texture = textures.storage.get(*textures.externals.get(&id)?)?;
+        Some(texture.whole_tile())
+    }
+
+    fn copy_to_external_texture(
+        &self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.0.lock().backend.copy_external(id, source)
+    }
+
+    fn remove_external_texture(&self, id: ExternalTextureId) {
+        self.0.lock().backend.remove_external(id);
+    }
+
+    fn external_texture_bytes(&self) -> u64 {
+        let lock = self.0.lock();
+        let textures = &lock.backend;
+        textures
+            .externals
+            .values()
+            .filter_map(|id| textures.storage.get(*id))
+            .map(|t| {
+                let s = t.texture.size();
+                u64::from(s.width) * u64::from(s.height) * u64::from(t.bytes_per_pixel())
+            })
+            .sum()
     }
 }
 
@@ -159,6 +211,147 @@ impl AtlasBackend for WgpuAtlasTextures {
 }
 
 impl WgpuAtlasTextures {
+    /// See [`PlatformAtlas::set_external_texture`].
+    fn set_external(
+        &mut self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) -> Result<bool> {
+        let max = self.max_texture_size as i32;
+        anyhow::ensure!(
+            size.width.0 > 0 && size.height.0 > 0 && size.width.0 <= max && size.height.0 <= max,
+            "external texture {}x{} is outside 1..={max} pixels a side",
+            size.width.0,
+            size.height.0
+        );
+        if let Some(texture_id) = self.externals.get(&id).copied() {
+            let generation = self.next_texture_generation;
+            let list = &mut self.storage[texture_id.kind];
+            if let Some(texture) = list
+                .textures
+                .get_mut(texture_id.index as usize)
+                .and_then(|t| t.as_mut())
+            {
+                let current = texture.texture.size();
+                if current.width == size.width.0 as u32 && current.height == size.height.0 as u32 {
+                    // Same size: keep the pixels; a new sampling only rebinds.
+                    if texture.external != Some(sampling) {
+                        texture.external = Some(sampling);
+                        texture.generation = generation;
+                        self.next_texture_generation = generation.wrapping_add(1);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+        self.remove_external(id);
+        let format = self.color_texture_format;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("external_texture"),
+            size: wgpu::Extent3d {
+                width: size.width.0 as u32,
+                height: size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // Copies from external images render into the texture.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let kind = AtlasTextureKind::Polychrome;
+        let list = &mut self.storage[kind];
+        let index = list.free_list.pop();
+        let generation = self.next_texture_generation;
+        self.next_texture_generation = self.next_texture_generation.wrapping_add(1);
+        let texture_id = AtlasTextureId {
+            index: index.unwrap_or(list.textures.len()) as u32,
+            kind,
+        };
+        let entry = WgpuAtlasTexture {
+            id: texture_id,
+            generation,
+            allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
+            format,
+            texture,
+            view,
+            live_atlas_keys: 0,
+            external: Some(sampling),
+        };
+        match index {
+            Some(ix) => list.textures[ix] = Some(entry),
+            None => list.textures.push(Some(entry)),
+        }
+        self.externals.insert(id, texture_id);
+        Ok(true)
+    }
+
+    fn remove_external(&mut self, id: ExternalTextureId) {
+        let Some(texture_id) = self.externals.remove(&id) else {
+            return;
+        };
+        let list = &mut self.storage[texture_id.kind];
+        if let Some(slot) = list.textures.get_mut(texture_id.index as usize)
+            && slot.take().is_some()
+        {
+            list.free_list.push(texture_id.index as usize);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn copy_external(&mut self, id: ExternalTextureId, source: &dyn std::any::Any) -> Result<()> {
+        use wgpu::ExternalImageSource as Source;
+        let texture_id = *self
+            .externals
+            .get(&id)
+            .context("no such external texture")?;
+        let texture = self
+            .storage
+            .get(texture_id)
+            .context("the external texture was lost")?;
+        let source = if let Some(c) = source.downcast_ref::<web_sys::OffscreenCanvas>() {
+            Source::OffscreenCanvas(c.clone())
+        } else if let Some(c) = source.downcast_ref::<web_sys::HtmlCanvasElement>() {
+            Source::HTMLCanvasElement(c.clone())
+        } else if let Some(b) = source.downcast_ref::<web_sys::ImageBitmap>() {
+            Source::ImageBitmap(b.clone())
+        } else {
+            anyhow::bail!(
+                "an external texture copies from an OffscreenCanvas, HtmlCanvasElement or ImageBitmap"
+            );
+        };
+        let size = texture.texture.size();
+        self.queue.copy_external_image_to_texture(
+            &wgpu::CopyExternalImageSourceInfo {
+                source,
+                origin: wgpu::Origin2d::ZERO,
+                flip_y: false,
+            },
+            wgpu::CopyExternalImageDestInfo {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+                color_space: wgpu::PredefinedColorSpace::Srgb,
+                // Sprites take straight alpha, as the atlas stores images.
+                premultiplied_alpha: false,
+            },
+            size,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn copy_external(&mut self, _id: ExternalTextureId, _source: &dyn std::any::Any) -> Result<()> {
+        anyhow::bail!("external image copies are a web feature")
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -234,6 +427,7 @@ impl WgpuAtlasTextures {
             texture,
             view,
             live_atlas_keys: 0,
+            external: None,
         };
 
         if let Some(ix) = index {
@@ -343,10 +537,32 @@ struct WgpuAtlasTexture {
     view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
+    /// An external texture (and its sampling): one whole tile, never shared.
+    external: Option<TextureSampling>,
 }
 
 impl WgpuAtlasTexture {
+    /// The tile covering all of the texture (an external texture's).
+    fn whole_tile(&self) -> AtlasTile {
+        let size = self.texture.size();
+        AtlasTile {
+            texture_id: self.id,
+            tile_id: gpui::TileId(0),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: DevicePixels(size.width as i32),
+                    height: DevicePixels(size.height as i32),
+                },
+            },
+        }
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
+        if self.external.is_some() {
+            return None;
+        }
         let allocation = self.allocator.allocate(device_size_to_etagere(size))?;
         let tile = AtlasTile {
             texture_id: self.id,
@@ -564,5 +780,56 @@ mod tests {
             swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
             vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
         );
+    }
+
+    #[test]
+    fn external_textures_are_whole_owned_tiles() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let id = ExternalTextureId(7);
+        let size = |w, h| Size {
+            width: DevicePixels(w),
+            height: DevicePixels(h),
+        };
+        assert!(atlas.external_texture_tile(id).is_none());
+        assert!(atlas.set_external_texture(id, size(300, 150), TextureSampling::Linear)?);
+        let tile = atlas.external_texture_tile(id).expect("set makes it");
+        assert_eq!(tile.bounds.size, size(300, 150));
+        assert_eq!(atlas.external_texture_bytes(), 300 * 150 * 4);
+        // The same size and sampling keep it; a new size or sampling remakes it.
+        assert!(!atlas.set_external_texture(id, size(300, 150), TextureSampling::Linear)?);
+        let before = atlas.get_texture_info(tile.texture_id).unwrap().generation;
+        assert!(!atlas.set_external_texture(id, size(300, 150), TextureSampling::Nearest)?);
+        assert_eq!(atlas.external_texture_tile(id).unwrap().texture_id, tile.texture_id, "a new sampling keeps the texture");
+        assert_ne!(atlas.get_texture_info(tile.texture_id).unwrap().generation, before, "and rebinds it");
+        let info = atlas
+            .get_texture_info(atlas.external_texture_tile(id).unwrap().texture_id)
+            .unwrap();
+        assert_eq!(info.sampling, TextureSampling::Nearest);
+        assert!(atlas.set_external_texture(id, size(64, 32), TextureSampling::Nearest)?);
+        assert_eq!(atlas.external_texture_bytes(), 64 * 32 * 4);
+        // Images never land in an external texture.
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let image = atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((size(8, 8), Cow::Owned(vec![0; 256]))))
+            })?
+            .unwrap();
+        assert_ne!(
+            image.texture_id,
+            atlas.external_texture_tile(id).unwrap().texture_id
+        );
+        assert!(
+            atlas
+                .set_external_texture(id, size(0, 4), TextureSampling::Linear)
+                .is_err()
+        );
+        atlas.remove_external_texture(id);
+        assert!(atlas.external_texture_tile(id).is_none());
+        assert_eq!(atlas.external_texture_bytes(), 0);
+        Ok(())
     }
 }
