@@ -3,11 +3,15 @@ use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    AtlasTile, Bounds, DevicePixels, ExternalTextureId, PlatformAtlas, Point, Size,
+    TextureSampling,
 };
 use metal::Device;
 use parking_lot::Mutex;
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
+
+/// The largest texture side on all modern Apple GPUs.
+const MAX_TEXTURE_SIDE: i32 = 16384;
 
 pub struct MetalAtlas(Mutex<AtlasState<MetalAtlasTextures>>);
 
@@ -18,7 +22,19 @@ impl MetalAtlas {
             supports_shared_storage,
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
+            externals: HashMap::new(),
+            copy_queue: None,
         })))
+    }
+
+    /// How texture `id` is sampled: an external texture's own choice, else linear.
+    pub(crate) fn sampling(&self, id: AtlasTextureId) -> TextureSampling {
+        self.0
+            .lock()
+            .backend
+            .texture(id)
+            .and_then(|t| t.external)
+            .unwrap_or_default()
     }
 
     /// Returns the GPU texture backing `id`, or `None` once every tile in it
@@ -35,6 +51,10 @@ struct MetalAtlasTextures {
     supports_shared_storage: bool,
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
+    /// External textures: each a whole polychrome texture of its own.
+    externals: HashMap<ExternalTextureId, AtlasTextureId>,
+    /// Blits into external textures, made on first use.
+    copy_queue: Option<AssertSend<metal::CommandQueue>>,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -48,6 +68,48 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn set_external_texture(
+        &self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) -> Result<bool> {
+        self.0.lock().backend.set_external(id, size, sampling)
+    }
+
+    fn external_texture_tile(&self, id: ExternalTextureId) -> Option<AtlasTile> {
+        let lock = self.0.lock();
+        let textures = &lock.backend;
+        let texture = textures.texture(*textures.externals.get(&id)?)?;
+        Some(texture.whole_tile())
+    }
+
+    /// Takes a `metal::Texture` of the same pixel format (BGRA8Unorm, straight
+    /// alpha), on this atlas's device; copies the overlap of the two sizes and
+    /// waits for the copy, so a frame encoded after it reads the new pixels.
+    fn copy_to_external_texture(
+        &self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.0.lock().backend.copy_external(id, source)
+    }
+
+    fn remove_external_texture(&self, id: ExternalTextureId) {
+        self.0.lock().backend.remove_external(id);
+    }
+
+    fn external_texture_bytes(&self) -> u64 {
+        let lock = self.0.lock();
+        let textures = &lock.backend;
+        textures
+            .externals
+            .values()
+            .filter_map(|id| textures.texture(*id))
+            .map(|t| t.metal_texture.width() * t.metal_texture.height() * u64::from(t.bytes_per_pixel()))
+            .sum()
     }
 }
 
@@ -96,6 +158,149 @@ impl AtlasBackend for MetalAtlasTextures {
 }
 
 impl MetalAtlasTextures {
+    /// See [`PlatformAtlas::set_external_texture`].
+    fn set_external(
+        &mut self,
+        id: ExternalTextureId,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            size.width.0 > 0
+                && size.height.0 > 0
+                && size.width.0 <= MAX_TEXTURE_SIDE
+                && size.height.0 <= MAX_TEXTURE_SIDE,
+            "external texture {}x{} is outside 1..={MAX_TEXTURE_SIDE} pixels a side",
+            size.width.0,
+            size.height.0
+        );
+        if let Some(texture_id) = self.externals.get(&id).copied()
+            && let Some(texture) = self
+                .polychrome_textures
+                .textures
+                .get_mut(texture_id.index as usize)
+                .and_then(|t| t.as_mut())
+            && texture.metal_texture.width() == size.width.0 as u64
+            && texture.metal_texture.height() == size.height.0 as u64
+        {
+            // Same size: keep the pixels; a new sampling only rebinds.
+            texture.external = Some(sampling);
+            return Ok(false);
+        }
+        self.remove_external(id);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let metal_texture = self.device.new_texture(&descriptor);
+        // A new texture starts transparent.
+        let bytes = (size.width.0 as u64) * (size.height.0 as u64) * 4;
+        let zeros = self.device.new_buffer(bytes, metal::MTLResourceOptions::StorageModePrivate);
+        self.blit(|blit| {
+            blit.fill_buffer(&zeros, metal::NSRange::new(0, bytes), 0);
+            blit.copy_from_buffer_to_texture(
+                &zeros,
+                0,
+                size.width.0 as u64 * 4,
+                0,
+                metal::MTLSize::new(size.width.0 as u64, size.height.0 as u64, 1),
+                &metal_texture,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLBlitOption::empty(),
+            );
+        });
+        let kind = AtlasTextureKind::Polychrome;
+        let index = self.polychrome_textures.free_list.pop();
+        let texture_id = AtlasTextureId {
+            index: index.unwrap_or(self.polychrome_textures.textures.len()) as u32,
+            kind,
+        };
+        let entry = MetalAtlasTexture {
+            id: texture_id,
+            allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
+            metal_texture: AssertSend(metal_texture),
+            live_atlas_keys: 0,
+            external: Some(sampling),
+        };
+        match index {
+            Some(ix) => self.polychrome_textures.textures[ix] = Some(entry),
+            None => self.polychrome_textures.textures.push(Some(entry)),
+        }
+        self.externals.insert(id, texture_id);
+        Ok(true)
+    }
+
+    fn remove_external(&mut self, id: ExternalTextureId) {
+        let Some(texture_id) = self.externals.remove(&id) else {
+            return;
+        };
+        if let Some(slot) = self
+            .polychrome_textures
+            .textures
+            .get_mut(texture_id.index as usize)
+            && slot.take().is_some()
+        {
+            self.polychrome_textures
+                .free_list
+                .push(texture_id.index as usize);
+        }
+    }
+
+    fn copy_external(&mut self, id: ExternalTextureId, source: &dyn std::any::Any) -> Result<()> {
+        let texture_id = *self
+            .externals
+            .get(&id)
+            .context("no such external texture")?;
+        let target = self
+            .texture(texture_id)
+            .context("the external texture was lost")?
+            .metal_texture
+            .clone();
+        let source = source
+            .downcast_ref::<metal::Texture>()
+            .context("a Metal external texture copies from a metal::Texture")?;
+        anyhow::ensure!(
+            source.pixel_format() == target.pixel_format(),
+            "an external texture copies from a {:?} texture, not {:?}",
+            target.pixel_format(),
+            source.pixel_format()
+        );
+        let width = source.width().min(target.width());
+        let height = source.height().min(target.height());
+        self.blit(|blit| {
+            blit.copy_from_texture(
+                source,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLSize::new(width, height, 1),
+                &target,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        });
+        Ok(())
+    }
+
+    /// Encodes blits on the atlas's own queue and waits for them: the renderer's
+    /// command buffers (another queue) read the result.
+    fn blit(&mut self, encode: impl FnOnce(&metal::BlitCommandEncoderRef)) {
+        let queue = self
+            .copy_queue
+            .get_or_insert_with(|| AssertSend(self.device.new_command_queue()));
+        let command_buffer = queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        encode(blit);
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -111,6 +316,7 @@ impl MetalAtlasTextures {
             if let Some(tile) = textures
                 .iter_mut()
                 .rev()
+                .filter(|texture| texture.external.is_none())
                 .find_map(|texture| texture.allocate(size))
             {
                 return Some(tile);
@@ -179,6 +385,7 @@ impl MetalAtlasTextures {
             allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
             metal_texture: AssertSend(metal_texture),
             live_atlas_keys: 0,
+            external: None,
         };
 
         if let Some(ix) = index {
@@ -208,9 +415,26 @@ struct MetalAtlasTexture {
     allocator: BucketedAtlasAllocator,
     metal_texture: AssertSend<metal::Texture>,
     live_atlas_keys: u32,
+    /// An external texture (and its sampling): one whole tile, never shared.
+    external: Option<TextureSampling>,
 }
 
 impl MetalAtlasTexture {
+    fn whole_tile(&self) -> AtlasTile {
+        AtlasTile {
+            texture_id: self.id,
+            tile_id: gpui::TileId(0),
+            bounds: Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: DevicePixels(self.metal_texture.width() as i32),
+                    height: DevicePixels(self.metal_texture.height() as i32),
+                },
+            },
+            padding: 0,
+        }
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(size_to_etagere(size))?;
         let tile = AtlasTile {
@@ -401,5 +625,88 @@ mod tests {
         };
         let key = make_image_key(999, 0);
         atlas.remove(&key);
+    }
+
+    fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(width),
+            height: DevicePixels(height),
+        }
+    }
+
+    /// The pixels of external texture `id`, read back through a shared buffer.
+    fn external_pixels(atlas: &MetalAtlas, id: ExternalTextureId) -> Vec<u8> {
+        let tile = atlas.external_texture_tile(id).unwrap();
+        let texture = atlas.metal_texture(tile.texture_id).unwrap();
+        let (w, h) = (texture.width(), texture.height());
+        let device = metal::Device::system_default().unwrap();
+        let buffer = device.new_buffer(w * h * 4, metal::MTLResourceOptions::StorageModeShared);
+        let queue = device.new_command_queue();
+        let cb = queue.new_command_buffer();
+        let blit = cb.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            &texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize::new(w, h, 1),
+            &buffer,
+            0,
+            w * 4,
+            0,
+            metal::MTLBlitOption::empty(),
+        );
+        blit.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, (w * h * 4) as usize) }.to_vec()
+    }
+
+    #[test]
+    fn test_external_texture_is_one_whole_tile_that_images_never_share() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let id = ExternalTextureId(7);
+        assert!(atlas.external_texture_tile(id).is_none());
+        assert!(atlas.set_external_texture(id, device_size(40, 30), TextureSampling::Linear).unwrap());
+        let tile = atlas.external_texture_tile(id).unwrap();
+        assert_eq!(tile.bounds.size, device_size(40, 30));
+        assert_eq!(tile.bounds.origin, Point::default());
+        assert_eq!(atlas.external_texture_bytes(), 40 * 30 * 4);
+        assert!(external_pixels(&atlas, id).iter().all(|b| *b == 0), "a new texture starts transparent");
+        let image = insert_tile(&atlas, make_image_key(1, 0), device_size(8, 8));
+        assert_ne!(image.texture_id, tile.texture_id, "images never share an external texture");
+        atlas.remove_external_texture(id);
+        assert!(atlas.external_texture_tile(id).is_none());
+        assert_eq!(atlas.external_texture_bytes(), 0);
+    }
+
+    #[test]
+    fn test_external_texture_keeps_its_pixels_at_its_size_and_sampling_rebinds() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let device = metal::Device::system_default().unwrap();
+        let id = ExternalTextureId(1);
+        atlas.set_external_texture(id, device_size(4, 2), TextureSampling::Linear).unwrap();
+        // A shared BGRA texture with known bytes, copied in on the GPU.
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(4);
+        descriptor.set_height(2);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let source = device.new_texture(&descriptor);
+        let bytes: Vec<u8> = (0..32).map(|i| i as u8 * 7).collect();
+        source.replace_region(metal::MTLRegion::new_2d(0, 0, 4, 2), 0, bytes.as_ptr() as *const _, 16);
+        atlas.copy_to_external_texture(id, &source).unwrap();
+        assert_eq!(external_pixels(&atlas, id), bytes);
+        let tile = atlas.external_texture_tile(id).unwrap();
+        assert!(!atlas.set_external_texture(id, device_size(4, 2), TextureSampling::Nearest).unwrap());
+        assert_eq!(atlas.sampling(tile.texture_id), TextureSampling::Nearest);
+        assert_eq!(external_pixels(&atlas, id), bytes, "same size keeps the pixels");
+        assert!(atlas.set_external_texture(id, device_size(5, 2), TextureSampling::Nearest).unwrap());
+        assert!(external_pixels(&atlas, id).iter().all(|b| *b == 0), "a resize starts over");
+        assert!(atlas.copy_to_external_texture(id, &5u32).is_err(), "only Metal textures copy in");
     }
 }

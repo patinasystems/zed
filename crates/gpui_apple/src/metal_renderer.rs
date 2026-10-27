@@ -145,6 +145,8 @@ pub struct MetalRenderer {
     custom_shaders: HashMap<gpui::ShaderId, Option<metal::RenderPipelineState>>,
     /// Samples a custom shader's backdrop.
     custom_shader_sampler: metal::SamplerState,
+    /// Polychrome sprites: linear, and nearest for external textures that ask for it.
+    sprite_samplers: [metal::SamplerState; 2],
     /// The backdrop of a custom shader that reads none.
     blank_texture: metal::Texture,
     /// GPU copies of retained shape buffers, by buffer id.
@@ -358,6 +360,12 @@ impl MetalRenderer {
             descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
             device.new_sampler(&descriptor)
         };
+        let sprite_samplers = [metal::MTLSamplerMinMagFilter::Linear, metal::MTLSamplerMinMagFilter::Nearest].map(|filter| {
+            let descriptor = metal::SamplerDescriptor::new();
+            descriptor.set_min_filter(filter);
+            descriptor.set_mag_filter(filter);
+            device.new_sampler(&descriptor)
+        });
         let blank_texture = {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(1);
@@ -519,6 +527,7 @@ impl MetalRenderer {
             texture_pool: TexturePool::default(),
             custom_shaders: HashMap::new(),
             custom_shader_sampler,
+            sprite_samplers,
             blank_texture,
             retained_shapes: HashMap::new(),
             frame_index: 0,
@@ -1930,6 +1939,11 @@ impl MetalRenderer {
             instance_bindings.polychrome_sprites.offset as u64,
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+        let sampler = match self.sprite_atlas.sampling(texture_id) {
+            gpui::TextureSampling::Linear => &self.sprite_samplers[0],
+            gpui::TextureSampling::Nearest => &self.sprite_samplers[1],
+        };
+        command_encoder.set_fragment_sampler_state(0, Some(sampler));
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
