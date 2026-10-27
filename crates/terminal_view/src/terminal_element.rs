@@ -1585,7 +1585,7 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) {
         let paint_start = Instant::now();
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::from(bounds)), |window| {
             let terminal_view = self.terminal_view.read(cx);
             let scroll_top = terminal_view.scroll_top;
             let mouse_input_mode = terminal_view.mouse_input_mode();

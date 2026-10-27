@@ -172,6 +172,8 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
+    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -1352,6 +1354,7 @@ impl MetalRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
+                content_mask: path.content_mask,
             }));
         }
         let vertex_instance_bindings = writer.write(&vertices)?;
@@ -2830,7 +2833,7 @@ mod tests {
             scene.insert_primitive(RetainedShapesDraw {
                 order: 0,
                 bounds,
-                content_mask: ContentMask { bounds },
+                content_mask: ContentMask::from(bounds),
                 shapes: shapes.clone(),
                 paint: RetainedShapesPaint::new(0..n as u32, camera),
                 opacity: 1.0,
@@ -2906,7 +2909,7 @@ mod tests {
             path.line_to(point(px(x), px(28.)));
             path.line_to(point(px(x), px(4.)));
             let mut path = path.scale(1.);
-            path.content_mask = ContentMask { bounds: all };
+            path.content_mask = ContentMask::from(all);
             path.color = gpui::Hsla {
                 h: 0.,
                 s: 0.,
@@ -2946,7 +2949,7 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(BackdropFilter {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::from(bounds),
             corner_radii: Corners::default(),
             blur_radius: ScaledPixels(2.),
             opacity: 1.,
@@ -3241,6 +3244,97 @@ mod tests {
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
     }
 
+    /// GPU cost of rounded content masks: `count` overlapping clipped quads (each the
+    /// size of a card, overfilling a rounded or a square mask) rendered and waited for,
+    /// alternating the two, at 2x. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn rounded_clip_cost() {
+        use gpui::{ContentMask, Corners, Quad, ScaledPixels, Scene};
+        let (width, height) = (1600i32, 1200i32);
+        let scene = |count: usize, radius: f32| {
+            let mut scene = Scene::default();
+            for i in 0..count {
+                let (x, y) = ((i % 12) as f32 * 130., ((i / 12) % 9) as f32 * 130.);
+                let bounds = |inset: f32| {
+                    Bounds::new(
+                        point(ScaledPixels(x + inset), ScaledPixels(y + inset)),
+                        size(
+                            ScaledPixels(240. - 2. * inset),
+                            ScaledPixels(240. - 2. * inset),
+                        ),
+                    )
+                };
+                scene.insert_primitive(Quad {
+                    bounds: bounds(0.),
+                    content_mask: ContentMask {
+                        bounds: bounds(8.),
+                        corner_radii: Corners::all(ScaledPixels(radius)),
+                    },
+                    background: gpui::Hsla {
+                        h: 0.6,
+                        s: 0.5,
+                        l: 0.5,
+                        a: 1.,
+                    }
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let mut renderer = MetalHeadlessRenderer::new();
+        let viewport = size(DevicePixels(width), DevicePixels(height));
+        for count in [100usize, 1000] {
+            let (square, rounded) = (scene(count, 0.), scene(count, 24.));
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..40 {
+                for (k, s) in [&square, &rounded].into_iter().enumerate() {
+                    let t = std::time::Instant::now();
+                    gpui::PlatformHeadlessRenderer::render_scene_to_image(
+                        &mut renderer,
+                        s,
+                        viewport,
+                    )
+                    .expect("render");
+                    if round >= 5 {
+                        times[k].push(t.elapsed().as_secs_f64() * 1000.);
+                    }
+                }
+            }
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let (sq, ro) = (median(&mut times[0]), median(&mut times[1]));
+            println!(
+                "{count} clipped quads (224 px masks): square {sq:.3} ms, rounded {ro:.3} ms, {:.2} us per clipped node",
+                (ro - sq) * 1000. / count as f64
+            );
+        }
+    }
+
+    #[test]
+    fn rounded_clips_render() {
+        use gpui::rounded_clip_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        assert!(probes.len() > 60, "{} probes", probes.len());
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("rounded_clips_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
     #[test]
     fn corner_shapes_render() {
         use gpui::corner_shape_test_scene as t;
@@ -3452,7 +3546,7 @@ mod tests {
         scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::from(bounds),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);

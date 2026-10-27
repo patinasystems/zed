@@ -808,7 +808,7 @@ impl Primitive {
             Primitive::RetainedShapes(draw) => &mut draw.content_mask,
             Primitive::BackdropFilter(filter) => &mut filter.content_mask,
         };
-        content_mask.bounds = content_mask.bounds.intersect(&mask.bounds);
+        *content_mask = content_mask.intersect(mask);
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
@@ -2636,9 +2636,7 @@ pub mod element_transformation_test_scene {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        };
+        let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let mut scene = Scene::default();
         // A red square turned 45 degrees: a diamond reaching 11.3 px from its center.
         scene.insert_primitive(Quad {
@@ -2750,9 +2748,7 @@ pub mod backdrop_filter_test_scene {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        };
+        let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let mut scene = Scene::default();
         // White one-pixel columns on black, over the top 40 rows.
         for x in (1..SIZE.0).step_by(2) {
@@ -2868,9 +2864,7 @@ pub mod compositing_group_test_scene {
     }
 
     fn full() -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        }
+        ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32))
     }
 
     fn quad(scene: &mut Scene, x: f32, y: f32, w: f32, h: f32, fill: Hsla) {
@@ -3035,12 +3029,10 @@ pub mod compositing_group_content_test_scene {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.), ScaledPixels(0.)),
-                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
-            ),
-        };
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
         let color = |r: f32, g: f32, b: f32| -> Hsla { Rgba { r, g, b, a: 1. }.into() };
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
@@ -3106,12 +3098,10 @@ pub mod group_mask_test_scene {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.), ScaledPixels(0.)),
-                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
-            ),
-        };
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
         let quad = |x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32| Quad {
             bounds: Bounds::new(
                 point(ScaledPixels(x), ScaledPixels(y)),
@@ -3200,6 +3190,155 @@ pub mod group_mask_test_scene {
     }
 }
 
+/// Rounded content masks (an `overflow` clip that follows a rounded border), for
+/// renderer tests: four masks with 12 px corners over white, each overfilled by one
+/// kind of primitive (a quad, a sharp drop shadow, a path, and a quad in a half
+/// opaque offscreen group), probed along each corner's diagonal inside and outside
+/// its curve.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod rounded_clip_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, px, size};
+
+    /// The corner radius of every mask.
+    pub const RADIUS: f32 = 12.;
+
+    /// The masks (x, y, width, height): one per primitive kind.
+    pub const MASKS: [[f32; 4]; 4] = [
+        [2., 2., 28., 28.],
+        [34., 2., 28., 28.],
+        [2., 34., 28., 28.],
+        [34., 34., 28., 28.],
+    ];
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
+        let color = |r: f32, g: f32, b: f32| -> Hsla { Rgba { r, g, b, a: 1. }.into() };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: color(1., 1., 1.).into(),
+            ..Default::default()
+        });
+        let masks = MASKS.map(|[x, y, w, h]| ContentMask {
+            bounds: bounds(x, y, w, h),
+            corner_radii: Corners::all(ScaledPixels(RADIUS)),
+        });
+        // Each primitive overfills its mask by 4 px on every side.
+        let over = |m: &ContentMask<ScaledPixels>| {
+            let b = m.bounds;
+            bounds(
+                b.origin.x.0 - 4.,
+                b.origin.y.0 - 4.,
+                b.size.width.0 + 8.,
+                b.size.height.0 + 8.,
+            )
+        };
+        scene.insert_primitive(Quad {
+            bounds: over(&masks[0]),
+            content_mask: masks[0],
+            background: color(1., 0., 0.).into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: over(&masks[1]),
+            corner_radii: Corners::default(),
+            content_mask: masks[1],
+            color: color(0., 1., 0.),
+            element_bounds: over(&masks[1]),
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+            transformation: TransformationMatrix::unit(),
+        });
+        let b = over(&masks[2]);
+        let (x0, y0) = (b.origin.x.0, b.origin.y.0);
+        let (x1, y1) = (x0 + b.size.width.0, y0 + b.size.height.0);
+        let mut square = Path::new(point(px(x0), px(y0)));
+        square.line_to(point(px(x1), px(y0)));
+        square.line_to(point(px(x1), px(y1)));
+        square.line_to(point(px(x0), px(y1)));
+        square.line_to(point(px(x0), px(y0)));
+        let mut square = square.scale(1.);
+        square.content_mask = masks[2];
+        square.color = color(0., 0., 1.).into();
+        scene.insert_primitive(square);
+        scene.push_group(GroupEffects {
+            opacity: 0.5,
+            content_mask: full,
+            ..GroupEffects::default()
+        });
+        scene.insert_primitive(Quad {
+            bounds: over(&masks[3]),
+            content_mask: masks[3],
+            background: color(1., 0., 0.).into(),
+            ..Default::default()
+        });
+        scene.pop_group();
+        scene.finish();
+
+        let inside_colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 128, 128, 255],
+        ];
+        let mut probes = Vec::new();
+        for ([x, y, w, h], rgba) in MASKS.into_iter().zip(inside_colors) {
+            let corners = [
+                ([x + RADIUS, y + RADIUS], [-1., -1.]),
+                ([x + w - RADIUS, y + RADIUS], [1., -1.]),
+                ([x + w - RADIUS, y + h - RADIUS], [1., 1.]),
+                ([x + RADIUS, y + h - RADIUS], [-1., 1.]),
+            ];
+            for (center, [dx, dy]) in corners {
+                for step in 1..18 {
+                    let t = step as f32 / 12.;
+                    let px = (center[0] + dx * t * RADIUS).floor();
+                    let py = (center[1] + dy * t * RADIUS).floor();
+                    // Inside the circle, or outside it but still inside the mask's
+                    // rectangle (the part a square clip would wrongly draw), clear of the
+                    // antialiased edge.
+                    let distance = |d: f32| {
+                        let cx = px + 0.5 + dx * d - center[0];
+                        let cy = py + 0.5 + dy * d - center[1];
+                        (cx * cx + cy * cy).sqrt() - RADIUS
+                    };
+                    let in_rect = px >= x && py >= y && px + 1. <= x + w && py + 1. <= y + h;
+                    if !in_rect || distance(0.).abs() < 1.5 {
+                        continue;
+                    }
+                    let here = distance(0.) < 0.;
+                    probes.push(Probe {
+                        what: if here {
+                            "inside a rounded clip"
+                        } else {
+                            "outside a rounded clip's curve"
+                        },
+                        x: px as u32,
+                        y: py as u32,
+                        rgba: if here { rgba } else { [255, 255, 255, 255] },
+                    });
+                }
+            }
+        }
+        (scene, probes)
+    }
+}
+
 /// Shaped corners (CSS `corner-shape`), for renderer tests: two red quads over white,
 /// each corner a different shape, probed along each corner's diagonal well inside
 /// and outside its curve.
@@ -3246,12 +3385,10 @@ pub mod corner_shape_test_scene {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.), ScaledPixels(0.)),
-                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
-            ),
-        };
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
         let color = |r: f32, g: f32, b: f32| -> Hsla { Rgba { r, g, b, a: 1. }.into() };
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
@@ -3356,12 +3493,10 @@ pub mod compositing_group_bench_scene {
     }
 
     fn mask(width: f32, height: f32) -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.), ScaledPixels(0.)),
-                size(ScaledPixels(width), ScaledPixels(height)),
-            ),
-        }
+        ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        ))
     }
 
     /// `count` quads in rows (each overlapping its neighbor), as a busy UI paints:
@@ -3618,12 +3753,10 @@ pub mod blend_mode_test_scene {
     /// The scene and the probes every renderer must hit. Cell `(column, row)` covers
     /// 16 x 3 device pixels at `(16 column, 3 row)`.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.), ScaledPixels(0.)),
-                size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
-            ),
-        };
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds: full.bounds,
@@ -3862,9 +3995,7 @@ mod tests {
         let mut path = Path::new(point(crate::px(0.), crate::px(0.))).scale(1.);
         path.bounds = bounds;
         path.order = order;
-        path.content_mask = ContentMask {
-            bounds: scaled_bounds(-1000., -1000., 4000., 4000.),
-        };
+        path.content_mask = ContentMask::from(scaled_bounds(-1000., -1000., 4000., 4000.));
         path
     }
 
@@ -3934,9 +4065,7 @@ mod tests {
             grayscale: false.into(),
             opacity: 1.,
             bounds,
-            content_mask: ContentMask {
-                bounds: content_mask,
-            },
+            content_mask: ContentMask::from(content_mask),
             corner_radii: Corners::default(),
             transformation,
         }
@@ -4039,9 +4168,7 @@ mod tests {
         let draw = previous.add_shader(&shader, &[1, 2, 3, 4], true, 2.);
         previous.insert_primitive(BackdropFilter {
             bounds: scaled_bounds(0., 0., 10., 10.),
-            content_mask: ContentMask {
-                bounds: scaled_bounds(0., 0., 10., 10.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(0., 0., 10., 10.)),
             shader: draw,
             ..Default::default()
         });
@@ -4062,7 +4189,7 @@ mod tests {
         scene.insert_primitive(quad(scaled_bounds(0., 0., 40., 40.)));
         scene.insert_primitive(BackdropFilter {
             bounds: scaled_bounds(5., 5., 20., 20.),
-            content_mask: ContentMask { bounds: layer },
+            content_mask: ContentMask::from(layer),
             ..Default::default()
         });
         scene.insert_primitive(quad(scaled_bounds(5., 5., 20., 20.)));
@@ -4082,9 +4209,7 @@ mod tests {
         scene.insert_primitive(quad(scaled_bounds(0., 0., 10., 10.)));
         scene.insert_primitive(BackdropFilter {
             bounds: scaled_bounds(12., 0., 20., 20.),
-            content_mask: ContentMask {
-                bounds: scaled_bounds(12., 0., 20., 20.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(12., 0., 20., 20.)),
             blur_radius: ScaledPixels(2.),
             ..Default::default()
         });
@@ -4100,9 +4225,7 @@ mod tests {
         let filter_bounds = scaled_bounds(14., 0., 20., 20.);
         scene.insert_primitive(BackdropFilter {
             bounds: filter_bounds,
-            content_mask: ContentMask {
-                bounds: scaled_bounds(-100., -100., 1000., 1000.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(-100., -100., 1000., 1000.)),
             blur_radius: ScaledPixels(2.),
             ..Default::default()
         });
@@ -4126,7 +4249,7 @@ mod tests {
     fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
         Quad {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::from(bounds),
             ..Default::default()
         }
     }
@@ -4138,7 +4261,7 @@ mod tests {
         RetainedShapesDraw {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::from(bounds),
             shapes: shapes.clone(),
             paint: crate::RetainedShapesPaint::new(0..1, TransformationMatrix::unit()),
             opacity: 1.,
@@ -4188,9 +4311,7 @@ mod tests {
     fn effects(opacity: f32) -> GroupEffects {
         GroupEffects {
             opacity,
-            content_mask: ContentMask {
-                bounds: scaled_bounds(0., 0., 100., 100.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(0., 0., 100., 100.)),
             ..GroupEffects::default()
         }
     }
@@ -4482,9 +4603,7 @@ mod tests {
         // its mask cuts the child's left half.
         let mut scene = Scene::default();
         scene.push_group(GroupEffects {
-            content_mask: ContentMask {
-                bounds: scaled_bounds(20., 0., 80., 80.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(20., 0., 80., 80.)),
             ..effects(0.5)
         });
         scene.push_group(effects(0.5));
@@ -4508,9 +4627,7 @@ mod tests {
     fn a_directly_painted_group_keeps_its_mask() {
         let mut scene = Scene::default();
         scene.push_group(GroupEffects {
-            content_mask: ContentMask {
-                bounds: scaled_bounds(0., 0., 5., 5.),
-            },
+            content_mask: ContentMask::from(scaled_bounds(0., 0., 5., 5.)),
             ..effects(0.5)
         });
         scene.insert_primitive(opaque_quad(scaled_bounds(0., 0., 10., 10.)));
@@ -4776,9 +4893,7 @@ fn shade(input: ShaderInput) -> vec4<f32> {
         opacity: f32,
         reads_backdrop: bool,
     ) {
-        let full = ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        };
+        let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
         // Scale factor 2: the gradient's 8 logical pixels are 16 device pixels.
         let shader = scene.add_shader(&Shader::new(source), &bytes, reads_backdrop, 2.);
@@ -4794,9 +4909,7 @@ fn shade(input: ShaderInput) -> vec4<f32> {
 
     /// The scene and the probes every renderer must hit.
     pub fn scene() -> (Scene, Vec<Probe>) {
-        let full = ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        };
+        let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let mut scene = Scene::default();
         // A red band behind the inverting shader.
         scene.insert_primitive(Quad {

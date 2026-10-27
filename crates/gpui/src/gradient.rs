@@ -821,12 +821,10 @@ mod tests {
                 crate::point(crate::ScaledPixels(0.), crate::ScaledPixels(0.)),
                 size(crate::ScaledPixels(10.), crate::ScaledPixels(10.)),
             ),
-            content_mask: crate::ContentMask {
-                bounds: crate::Bounds::new(
-                    crate::point(crate::ScaledPixels(0.), crate::ScaledPixels(0.)),
-                    size(crate::ScaledPixels(100.), crate::ScaledPixels(100.)),
-                ),
-            },
+            content_mask: crate::ContentMask::from(crate::Bounds::new(
+                crate::point(crate::ScaledPixels(0.), crate::ScaledPixels(0.)),
+                size(crate::ScaledPixels(100.), crate::ScaledPixels(100.)),
+            )),
             background: crate::Background::painted_gradient(start, gradient.first_color()),
             ..Default::default()
         }
@@ -927,9 +925,7 @@ pub mod gradient_test_scene {
     }
 
     fn full() -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32),
-        }
+        ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32))
     }
 
     fn color(hex: u32) -> Hsla {
@@ -1056,9 +1052,7 @@ pub mod gradient_test_scene {
     /// fill-rate benchmark of gradients against solid fills.
     pub fn bench(count: usize, width: f32, height: f32, fill: BenchFill) -> Scene {
         let mut scene = Scene::default();
-        let mask = ContentMask {
-            bounds: bounds(0., 0., width, height),
-        };
+        let mask = ContentMask::from(bounds(0., 0., width, height));
         for i in 0..count {
             let (x, y) = (
                 (i * 37 % 100) as f32 / 100. * width / 2.,

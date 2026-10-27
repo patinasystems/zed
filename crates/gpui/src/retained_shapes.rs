@@ -390,6 +390,25 @@ impl RetainedShapesDraw {
     /// Shader uniforms for this draw on a target of `viewport` device pixels.
     pub fn uniforms(&self, viewport: [f32; 2]) -> RetainedShapesUniforms {
         let mask = self.content_mask.bounds.intersect(&self.bounds);
+        // A rounded content mask (an `overflow` clip with a rounded border) is one more
+        // clip, already in device pixels; past `MAX_RETAINED_CLIPS` it clips square.
+        let rounded = self.content_mask.is_rounded().then(|| {
+            let b = self.content_mask.bounds;
+            let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
+            let r = self.content_mask.corner_radii;
+            RetainedClipUniform {
+                matrix: [1.0, 0.0, 0.0, 1.0],
+                translation: [-b.origin.x.0, -b.origin.y.0],
+                half_size: [0.5 * w, 0.5 * h],
+                corner_radii: [
+                    r.top_left.0,
+                    r.top_right.0,
+                    r.bottom_right.0,
+                    r.bottom_left.0,
+                ]
+                .map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+            }
+        });
         let m = |t: &TransformationMatrix| {
             let [[a, b], [c, d]] = t.rotation_scale;
             let [x, y] = t.translation;
@@ -408,13 +427,18 @@ impl RetainedShapesDraw {
             lod_min_px: self.paint.lod_min_device_px,
             greek_band: self.paint.text_bar_band_px,
             layer1: m(&self.paint.layer_transformation),
-            clip_count: self.paint.clips.len().min(MAX_RETAINED_CLIPS) as u32,
+            clip_count: (self.paint.clips.len() + usize::from(rounded.is_some()))
+                .min(MAX_RETAINED_CLIPS) as u32,
             _pad: 0.0,
             clips: std::array::from_fn(|i| {
-                self.paint
-                    .clips
-                    .get(i)
-                    .map_or_else(RetainedClipUniform::default, |clip| self.clip_uniform(clip))
+                self.paint.clips.get(i).map_or_else(
+                    || {
+                        rounded
+                            .filter(|_| i == self.paint.clips.len())
+                            .unwrap_or_default()
+                    },
+                    |clip| self.clip_uniform(clip),
+                )
             }),
         }
     }
@@ -582,7 +606,7 @@ pub mod retained_shapes_test_scene {
         scene.insert_primitive(RetainedShapesDraw {
             order: 0,
             bounds: full,
-            content_mask: ContentMask { bounds: clip },
+            content_mask: ContentMask::from(clip),
             shapes: shapes.clone(),
             paint: RetainedShapesPaint::new(0..5, TransformationMatrix::unit()).layer(
                 TransformationMatrix {
@@ -663,7 +687,7 @@ pub mod retained_shapes_test_scene {
         scene.insert_primitive(RetainedShapesDraw {
             order: 0,
             bounds: full,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask::from(full),
             shapes: shapes.clone(),
             paint: RetainedShapesPaint::new(0..5, TransformationMatrix::unit()),
             opacity: 1.0,
@@ -699,7 +723,7 @@ pub mod retained_shapes_test_scene {
         scene.insert_primitive(RetainedShapesDraw {
             order: 0,
             bounds: full,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask::from(full),
             shapes: shapes.clone(),
             paint: RetainedShapesPaint::new(0..1, TransformationMatrix::unit()),
             opacity: 1.0,
@@ -814,7 +838,7 @@ pub mod retained_shapes_test_scene {
             scene.insert_primitive(RetainedShapesDraw {
                 order,
                 bounds,
-                content_mask: ContentMask { bounds: full },
+                content_mask: ContentMask::from(full),
                 shapes: shapes.clone(),
                 paint,
                 opacity: 1.0,
@@ -948,7 +972,7 @@ pub mod retained_shapes_test_scene {
             scene.insert_primitive(RetainedShapesDraw {
                 order,
                 bounds: full,
-                content_mask: ContentMask { bounds: full },
+                content_mask: ContentMask::from(full),
                 shapes: shapes.clone(),
                 paint,
                 opacity: 0.9,
@@ -1125,6 +1149,64 @@ mod tests {
             ..draw
         };
         assert!(flat.uniforms([1.0, 1.0]).clips[0].half_size[0] < 0.0);
+    }
+
+    #[test]
+    fn a_rounded_content_mask_is_one_more_clip_in_device_pixels() {
+        use crate::{Corners, point, size};
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(10.0), ScaledPixels(20.0)),
+                size(ScaledPixels(40.0), ScaledPixels(30.0)),
+            ),
+            corner_radii: Corners {
+                top_left: ScaledPixels(8.0),
+                top_right: ScaledPixels(0.0),
+                bottom_right: ScaledPixels(40.0),
+                bottom_left: ScaledPixels(2.0),
+            },
+        };
+        let draw = RetainedShapesDraw {
+            order: 0,
+            bounds: Bounds::default(),
+            content_mask: mask,
+            shapes: RetainedShapes::new(),
+            paint: RetainedShapesPaint::new(0..1, TransformationMatrix::unit()),
+            opacity: 1.0,
+        };
+        let u = draw.uniforms([100.0, 100.0]);
+        assert_eq!(u.clip_count, 1);
+        let c = u.clips[0];
+        // Device (10, 20) is the clip's (0, 0).
+        assert_eq!(
+            (c.matrix, c.translation),
+            ([1.0, 0.0, 0.0, 1.0], [-10.0, -20.0])
+        );
+        assert_eq!(c.half_size, [20.0, 15.0]);
+        assert_eq!(
+            c.corner_radii,
+            [8.0, 0.0, 15.0, 2.0],
+            "clamped to half the shorter side"
+        );
+        // A square mask adds no clip; past the clip limit a rounded one clips square.
+        let square = RetainedShapesDraw {
+            content_mask: ContentMask::from(mask.bounds),
+            ..draw.clone()
+        };
+        assert_eq!(square.uniforms([100.0, 100.0]).clip_count, 0);
+        let mut paint = RetainedShapesPaint::new(0..1, TransformationMatrix::unit());
+        for _ in 0..MAX_RETAINED_CLIPS {
+            paint = paint.clip(RetainedClip {
+                width: 1.0,
+                height: 1.0,
+                ..Default::default()
+            });
+        }
+        let full = RetainedShapesDraw { paint, ..draw };
+        assert_eq!(
+            full.uniforms([100.0, 100.0]).clip_count as usize,
+            MAX_RETAINED_CLIPS
+        );
     }
 
     #[test]
