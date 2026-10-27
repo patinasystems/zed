@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, BackgroundTag, Bounds, ContentMask, Corners,
-    DevicePixels, Edges, Hsla, Pixels, Point, Radians, RetainedShapesDraw, ScaledPixels, Size,
-    bounds_tree::BoundsTree, point,
+    DevicePixels, Edges, ExternalTextureId, Hsla, Pixels, Point, Radians, RetainedShapesDraw,
+    ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -72,6 +72,10 @@ pub struct Scene {
     pub shader_uniforms: Vec<u8>,
     /// Groups drawn offscreen and composited as one image ([`Scene::push_group`]).
     pub groups: Vec<CompositedGroup>,
+    /// Subtrees painted into external textures, never composited
+    /// ([`Scene::push_texture_target`]). Only the scene a window paints has them;
+    /// renderers draw them before the scene, in this order.
+    pub texture_targets: Vec<TextureTargetScene>,
     /// The records of the gradients this frame's quads paint ([`crate::GradientRecord`]),
     /// in 16-byte texels. A group's scene refers to the window's.
     pub gradients: Vec<[f32; 4]>,
@@ -88,6 +92,7 @@ impl Scene {
         self.has_layers = false;
         self.drawn_bounds = None;
         self.groups.clear();
+        self.texture_targets.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -214,12 +219,35 @@ impl Scene {
         self.open_groups.push(OpenGroup::new(effects));
     }
 
-    /// Ends the innermost group ([`Scene::push_group`]).
+    /// Starts painting into external texture `id`, `size` device pixels: what is painted
+    /// until [`Scene::pop_group`] goes into the texture (cleared to transparent first),
+    /// in the texture's device pixels, and is not drawn in the scene. Groups inside it
+    /// composite into it; texture targets inside it are drawn before it.
+    pub fn push_texture_target(&mut self, id: ExternalTextureId, size: Size<DevicePixels>) {
+        self.paint_operations
+            .push(PaintOperation::StartTextureTarget(id, size));
+        self.open_groups.push(OpenGroup::texture_target(id, size));
+    }
+
+    /// Ends the innermost group or texture target ([`Scene::push_group`],
+    /// [`Scene::push_texture_target`]).
     pub fn pop_group(&mut self) {
         self.paint_operations.push(PaintOperation::EndGroup);
-        let Some(group) = self.open_groups.pop() else {
+        let Some(mut group) = self.open_groups.pop() else {
             return;
         };
+        if let Some((id, size)) = group.texture_target {
+            group.scene.finish();
+            let mut targets = std::mem::take(&mut group.scene.texture_targets);
+            targets.push(TextureTargetScene {
+                id,
+                size,
+                scene: group.scene,
+            });
+            // Inner targets first: a target may sample one painted inside it.
+            self.texture_targets.extend(targets);
+            return;
+        }
         let masks_parent = group.effects.masks_parent;
         let closed = group.close();
         // A mask group's image masks the group around it (outside any group, nothing).
@@ -406,6 +434,9 @@ impl Scene {
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartGroup(effects) => self.push_group(effects.clone()),
+                PaintOperation::StartTextureTarget(id, size) => {
+                    self.push_texture_target(*id, *size)
+                }
                 PaintOperation::EndGroup => self.pop_group(),
             }
         }
@@ -436,6 +467,9 @@ impl Scene {
     /// the order renderers draw them.
     pub fn scenes(&self) -> SmallVec<[&Scene; 4]> {
         fn visit<'a>(scene: &'a Scene, out: &mut SmallVec<[&'a Scene; 4]>) {
+            for target in &scene.texture_targets {
+                visit(&target.scene, out);
+            }
             out.push(scene);
             for group in &scene.groups {
                 visit(&group.scene, out);
@@ -456,14 +490,16 @@ impl Scene {
     pub fn without_groups(&self) -> Scene {
         let mut scene = Scene::default();
         let mut opacities = vec![1f32];
-        // Inside a mask group, how many groups deep: masks are not drawn (content
-        // draws unmasked).
+        // Inside a mask group or a texture target, how many groups deep: masks are not
+        // drawn (content draws unmasked), and neither are texture targets.
         let mut in_mask = 0usize;
         for operation in &self.paint_operations {
             let opacity = opacities.last().copied().unwrap_or(1.);
             if in_mask > 0 {
                 match operation {
-                    PaintOperation::StartGroup(_) => in_mask += 1,
+                    PaintOperation::StartGroup(_) | PaintOperation::StartTextureTarget(..) => {
+                        in_mask += 1
+                    }
                     PaintOperation::EndGroup => in_mask -= 1,
                     _ => {}
                 }
@@ -472,6 +508,10 @@ impl Scene {
             if let PaintOperation::StartGroup(effects) = operation
                 && effects.masks_parent.is_some()
             {
+                in_mask = 1;
+                continue;
+            }
+            if let PaintOperation::StartTextureTarget(..) = operation {
                 in_mask = 1;
                 continue;
             }
@@ -511,6 +551,8 @@ impl Scene {
                 PaintOperation::EndGroup => {
                     opacities.pop();
                 }
+                // Skipped above.
+                PaintOperation::StartTextureTarget(..) => {}
             }
         }
         scene.finish();
@@ -680,6 +722,7 @@ pub(crate) enum PaintOperation {
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     StartGroup(GroupEffects),
+    StartTextureTarget(ExternalTextureId, Size<DevicePixels>),
     EndGroup,
 }
 
@@ -1834,8 +1877,21 @@ impl GroupCompositeUniforms {
     }
 }
 
+/// A subtree painted into an external texture ([`Scene::push_texture_target`]).
+pub struct TextureTargetScene {
+    /// The external texture it is drawn into (the window's atlas holds it).
+    pub id: ExternalTextureId,
+    /// The texture's size; what is painted is in its device pixels.
+    pub size: Size<DevicePixels>,
+    /// What is drawn into it, finished.
+    pub scene: Scene,
+}
+
 /// A group being painted ([`Scene::push_group`]).
 struct OpenGroup {
+    /// Set on a texture target ([`Scene::push_texture_target`]): its scene is drawn
+    /// into the texture, not composited.
+    texture_target: Option<(ExternalTextureId, Size<DevicePixels>)>,
     effects: GroupEffects,
     scene: Scene,
     /// Its mask, once painted ([`GroupEffects::masks_parent`]).
@@ -1864,6 +1920,7 @@ impl OpenGroup {
             && (effects.backdrop.is_none() || effects.opacity >= 1.)
             && effects.masks_parent.is_none();
         Self {
+            texture_target: None,
             mask: None,
             masked_out: false,
             effects,
@@ -1872,6 +1929,34 @@ impl OpenGroup {
                 ..Scene::default()
             },
             operations: direct.then(Vec::new),
+        }
+    }
+
+    /// A texture target: always offscreen, clipped to the texture.
+    fn texture_target(id: ExternalTextureId, size: Size<DevicePixels>) -> Self {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels(size.width.0 as f32),
+                height: ScaledPixels(size.height.0 as f32),
+            },
+        };
+        Self {
+            texture_target: Some((id, size)),
+            mask: None,
+            masked_out: false,
+            effects: GroupEffects {
+                content_mask: ContentMask {
+                    bounds,
+                    corner_radii: Corners::default(),
+                },
+                ..GroupEffects::default()
+            },
+            scene: Scene {
+                in_group: true,
+                ..Scene::default()
+            },
+            operations: None,
         }
     }
 
@@ -2845,6 +2930,107 @@ pub mod backdrop_filter_test_scene {
 /// - nested half-opaque groups;
 /// - groups filtered with grayscale, invert and a blur;
 /// - an inverting group whose image starts with its backdrop, darkened.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod texture_target_test_scene {
+    //! A window scene with texture targets (`Window::paint_to_texture`) and the probes
+    //! every renderer must hit, in the window and in the textures.
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    /// The outer target: 32x16 device pixels.
+    pub const OUTER: (ExternalTextureId, (i32, i32)) = (ExternalTextureId(0x7e57), (32, 16));
+    /// A target painted inside it: 8x8.
+    pub const INNER: (ExternalTextureId, (i32, i32)) = (ExternalTextureId(0x7e58), (8, 8));
+
+    fn color(r: f32, g: f32, b: f32, a: f32) -> Hsla {
+        Rgba { r, g, b, a }.into()
+    }
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    fn quad(scene: &mut Scene, x: f32, y: f32, w: f32, h: f32, fill: Hsla) {
+        scene.insert_primitive(Quad {
+            bounds: bounds(x, y, w, h),
+            content_mask: ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32)),
+            background: fill.into(),
+            ..Default::default()
+        });
+    }
+
+    fn target_size((_, (w, h)): (ExternalTextureId, (i32, i32))) -> Size<DevicePixels> {
+        size(DevicePixels(w), DevicePixels(h))
+    }
+
+    /// The scene, the probes of the window, and the probes of each target's texture.
+    pub fn scene() -> (Scene, Vec<Probe>, Vec<(ExternalTextureId, Vec<Probe>)>) {
+        let mut scene = Scene::default();
+        let white = color(1., 1., 1., 1.);
+        quad(&mut scene, 0., 0., SIZE.0 as f32, SIZE.1 as f32, white);
+
+        scene.push_texture_target(OUTER.0, target_size(OUTER));
+        quad(&mut scene, 0., 0., 16., 16., color(1., 0., 0., 1.));
+        quad(&mut scene, 16., 0., 16., 16., color(0., 0., 1., 1.));
+        // A half-opaque group composites into the texture.
+        scene.push_group(GroupEffects {
+            opacity: 0.5,
+            content_mask: ContentMask::from(bounds(0., 0., 32., 16.)),
+            ..GroupEffects::default()
+        });
+        quad(&mut scene, 4., 4., 8., 8., color(0., 1., 0., 1.));
+        quad(&mut scene, 6., 4., 8., 8., color(0., 1., 0., 1.));
+        scene.pop_group();
+        scene.push_texture_target(INNER.0, target_size(INNER));
+        quad(&mut scene, 0., 0., 8., 8., color(1., 1., 0., 1.));
+        scene.pop_group();
+        scene.pop_group();
+
+        quad(&mut scene, 40., 40., 8., 8., color(0., 0., 0., 1.));
+        scene.finish();
+
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let window = vec![
+            probe(
+                "the outer target is not drawn in the window",
+                2,
+                2,
+                [255, 255, 255, 255],
+            ),
+            probe("nor its blue half", 20, 4, [255, 255, 255, 255]),
+            probe(
+                "the window's own quad after the targets",
+                44,
+                44,
+                [0, 0, 0, 255],
+            ),
+        ];
+        let outer = vec![
+            probe("red in the outer target", 1, 1, [255, 0, 0, 255]),
+            probe("blue in the outer target", 20, 4, [0, 0, 255, 255]),
+            probe("the half-opaque group over red", 8, 8, [128, 128, 0, 255]),
+            probe("blue to the texture's corner", 31, 15, [0, 0, 255, 255]),
+        ];
+        let inner = vec![probe(
+            "yellow in the inner target",
+            4,
+            4,
+            [255, 255, 0, 255],
+        )];
+        (scene, window, vec![(OUTER.0, outer), (INNER.0, inner)])
+    }
+
+    /// The targets' sizes, to make their textures before rendering.
+    pub fn targets() -> [(ExternalTextureId, Size<DevicePixels>); 2] {
+        [(OUTER.0, target_size(OUTER)), (INNER.0, target_size(INNER))]
+    }
+}
+
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 #[doc(hidden)]
 pub mod compositing_group_test_scene {
