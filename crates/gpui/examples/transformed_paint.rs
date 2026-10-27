@@ -222,7 +222,7 @@ impl Render for TransformedPaintExample {
                     // Clipping: the content mask applies after the transformation.
                     let mask = Bounds::new(at(40., 490.), size(px(680.), px(60.)));
                     window.paint_quad(outline(mask, rgb(0x0969da), BorderStyle::Dashed));
-                    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                    window.with_content_mask(Some(ContentMask::from(mask)), |window| {
                         let clipped_bounds =
                             Bounds::new(at(120., 470.), size(IMAGE_SIZE, IMAGE_SIZE));
                         window
