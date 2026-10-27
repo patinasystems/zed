@@ -4106,7 +4106,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
-        self.frame_rendered.set(true);
+        self.frame_rendered
+            .set(self.platform_window.frame_rendered());
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,

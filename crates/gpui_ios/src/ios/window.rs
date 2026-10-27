@@ -1009,6 +1009,10 @@ impl PlatformWindow for IosWindow {
         self.renderer.lock().draw(scene);
     }
 
+    fn frame_rendered(&self) -> bool {
+        self.renderer.lock().rendered()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.renderer.lock().sprite_atlas().clone()
     }
