@@ -132,6 +132,27 @@ pub fn preferred_device() -> metal::Device {
     })
 }
 
+/// The command queue every GPUI renderer and atlas on `device` encodes on: one per device,
+/// made on first use. Code that renders into textures GPUI samples (external textures) encodes
+/// on it too, so its command buffers run in commit order with GPUI's frames: a texture written
+/// before a frame commits is ready for that frame, with no fence and no CPU wait.
+pub fn shared_command_queue(device: &metal::DeviceRef) -> metal::CommandQueue {
+    static QUEUES: std::sync::Mutex<Vec<(u64, SendQueue)>> = std::sync::Mutex::new(Vec::new());
+    let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let id = device.registry_id();
+    if let Some((_, q)) = queues.iter().find(|(d, _)| *d == id) {
+        return q.0.clone();
+    }
+    let queue = device.new_command_queue();
+    queues.push((id, SendQueue(queue.clone())));
+    queue
+}
+
+/// Metal command queues are thread-safe (`MTLCommandQueue` may be used from any thread).
+struct SendQueue(metal::CommandQueue);
+// SAFETY: see above.
+unsafe impl Send for SendQueue {}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -472,7 +493,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
-        let command_queue = device.new_command_queue();
+        let command_queue = shared_command_queue(&device);
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
         // metal and objc2-metal expose the same Objective-C device; the borrowed
