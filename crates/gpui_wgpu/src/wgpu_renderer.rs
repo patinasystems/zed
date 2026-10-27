@@ -427,6 +427,8 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    /// For external textures drawn pixelated ([`gpui::TextureSampling::Nearest`]).
+    nearest_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -1657,6 +1659,12 @@ impl WgpuRendererCore {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nearest_sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -1762,6 +1770,7 @@ impl WgpuRendererCore {
                 pipelines,
                 bind_group_layouts,
                 atlas_sampler,
+                nearest_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
                 globals_buffer,
                 globals_bind_group,
@@ -2778,7 +2787,20 @@ impl WgpuRendererCore {
         label: &str,
         texture_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
+        self.create_sampled_texture_bind_group(label, texture_view, gpui::TextureSampling::Linear)
+    }
+
+    fn create_sampled_texture_bind_group(
+        &self,
+        label: &str,
+        texture_view: &wgpu::TextureView,
+        sampling: gpui::TextureSampling,
+    ) -> wgpu::BindGroup {
         let resources = self.resources();
+        let sampler = match sampling {
+            gpui::TextureSampling::Linear => &resources.atlas_sampler,
+            gpui::TextureSampling::Nearest => &resources.nearest_sampler,
+        };
         resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2791,7 +2813,7 @@ impl WgpuRendererCore {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
@@ -2831,8 +2853,11 @@ impl WgpuRendererCore {
                 continue;
             }
 
-            let bind_group =
-                self.create_texture_bind_group("atlas_texture_bind_group", &texture_info.view);
+            let bind_group = self.create_sampled_texture_bind_group(
+                "atlas_texture_bind_group",
+                &texture_info.view,
+                texture_info.sampling,
+            );
             self.resources_mut().atlas_texture_bind_groups.insert(
                 texture_id,
                 CachedTextureBindGroup {
