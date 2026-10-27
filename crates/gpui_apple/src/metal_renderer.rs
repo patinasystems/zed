@@ -111,6 +111,27 @@ impl InstanceBufferPool {
     }
 }
 
+/// The Metal device GPUI's windows render with: on Intel Macs the low-power
+/// integrated GPU when there is one (on Apple silicon and iOS there is only
+/// one). Code that hands GPUI textures (external textures) makes them on it.
+pub fn preferred_device() -> metal::Device {
+    #[cfg(target_os = "macos")]
+    if let Some(d) = metal::Device::all()
+        .into_iter()
+        .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
+    {
+        return d;
+    }
+    // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
+    // In that case, we fall back to the system default device.
+    #[cfg(target_os = "macos")]
+    log::error!("Unable to enumerate Metal devices; attempting to use system default device");
+    metal::Device::system_default().unwrap_or_else(|| {
+        log::error!("unable to access a compatible graphics device");
+        std::process::exit(1);
+    })
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -268,36 +289,8 @@ impl MetalRenderer {
         Self::new_internal(device, None, true, instance_buffer_pool)
     }
 
-    #[cfg(target_os = "macos")]
     fn create_device() -> metal::Device {
-        // Prefer low‐power integrated GPUs on Intel Mac. On Apple
-        // Silicon, there is only ever one GPU, so this is equivalent to
-        // `metal::Device::system_default()`.
-        if let Some(d) = metal::Device::all()
-            .into_iter()
-            .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
-        {
-            d
-        } else {
-            // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
-            // In that case, we fall back to the system default device.
-            log::error!(
-                "Unable to enumerate Metal devices; attempting to use system default device"
-            );
-            Self::system_default_device()
-        }
-    }
-
-    #[cfg(target_os = "ios")]
-    fn create_device() -> metal::Device {
-        Self::system_default_device()
-    }
-
-    fn system_default_device() -> metal::Device {
-        metal::Device::system_default().unwrap_or_else(|| {
-            log::error!("unable to access a compatible graphics device");
-            std::process::exit(1);
-        })
+        preferred_device()
     }
 
     fn new_internal(
