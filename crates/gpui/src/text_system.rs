@@ -1367,6 +1367,20 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    pub font_smoothing: FontSmoothing,
+}
+
+/// How a glyph's strokes are rendered, as CSS `-webkit-font-smoothing` chooses on macOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FontSmoothing {
+    /// The platform's text rendering. On macOS, Core Graphics smooths fonts (thickening
+    /// strokes by an amount that depends on the text color, see `dilation`) and subpixel
+    /// antialiasing applies where the window supports it.
+    #[default]
+    Platform,
+    /// Grayscale antialiasing without font smoothing: thinner, lighter strokes. CSS
+    /// `-webkit-font-smoothing: antialiased` (`-moz-osx-font-smoothing: grayscale`).
+    Antialiased,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1381,6 +1395,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.font_smoothing.hash(state);
     }
 }
 

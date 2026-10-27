@@ -2044,6 +2044,7 @@ mod tests {
                 is_emoji: true,
                 subpixel_rendering: false,
                 dilation: 0,
+                font_smoothing: gpui::FontSmoothing::Platform,
             };
             let raster_bounds = text_system.glyph_raster_bounds(&params)?;
             if raster_bounds.size.width.0 == 0 || raster_bounds.size.height.0 == 0 {
