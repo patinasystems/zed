@@ -1827,6 +1827,20 @@ pub trait PlatformAtlas {
         anyhow::bail!("this platform has no external textures")
     }
 
+    /// Shows `source`, a GPU texture its producer keeps drawing into, as external texture `id`
+    /// with `sampling`: the atlas holds the texture itself, with no copy. Sharing the texture
+    /// `id` already shows only rebinds the sampling. Which sources a platform takes, and how a
+    /// producer orders its writes before the frames that read them, is its own: Metal takes a
+    /// BGRA8Unorm `metal::Texture` written on `shared_command_queue`.
+    fn share_external_texture(
+        &self,
+        _id: ExternalTextureId,
+        _source: &dyn std::any::Any,
+        _sampling: TextureSampling,
+    ) -> Result<()> {
+        anyhow::bail!("this platform cannot share textures with its atlas")
+    }
+
     /// Frees external texture `id`.
     fn remove_external_texture(&self, _id: ExternalTextureId) {}
 

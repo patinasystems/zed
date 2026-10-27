@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
 use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
+use foreign_types::ForeignType as _;
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
     AtlasTile, Bounds, DevicePixels, ExternalTextureId, PlatformAtlas, Point, Size,
@@ -23,7 +24,6 @@ impl MetalAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             externals: HashMap::new(),
-            copy_queue: None,
         })))
     }
 
@@ -53,8 +53,6 @@ struct MetalAtlasTextures {
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
     /// External textures: each a whole polychrome texture of its own.
     externals: HashMap<ExternalTextureId, AtlasTextureId>,
-    /// Blits into external textures, made on first use.
-    copy_queue: Option<AssertSend<metal::CommandQueue>>,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -95,6 +93,19 @@ impl PlatformAtlas for MetalAtlas {
         source: &dyn std::any::Any,
     ) -> Result<()> {
         self.0.lock().backend.copy_external(id, source)
+    }
+
+    /// Takes a `metal::Texture` (BGRA8Unorm, straight alpha, shader-readable) on this atlas's
+    /// device and shows it as external texture `id` itself: no copy. Its producer encodes its
+    /// writes on [`crate::metal_renderer::shared_command_queue`], so a frame committed after them
+    /// reads them.
+    fn share_external_texture(
+        &self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+        sampling: TextureSampling,
+    ) -> Result<()> {
+        self.0.lock().backend.share_external(id, source, sampling)
     }
 
     fn remove_external_texture(&self, id: ExternalTextureId) {
@@ -213,6 +224,62 @@ impl MetalAtlasTextures {
                 metal::MTLBlitOption::empty(),
             );
         });
+        self.insert_external(id, metal_texture, size, sampling);
+        Ok(true)
+    }
+
+    /// See [`PlatformAtlas::share_external_texture`].
+    fn share_external(
+        &mut self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+        sampling: TextureSampling,
+    ) -> Result<()> {
+        let source = source
+            .downcast_ref::<metal::Texture>()
+            .context("a Metal external texture shares a metal::Texture")?;
+        anyhow::ensure!(
+            source.device().registry_id() == self.device.registry_id(),
+            "an external texture shares a texture on its own Metal device (`preferred_device`)"
+        );
+        anyhow::ensure!(
+            source.pixel_format() == metal::MTLPixelFormat::BGRA8Unorm,
+            "an external texture shares a BGRA8Unorm texture, not {:?}",
+            source.pixel_format()
+        );
+        anyhow::ensure!(
+            source.usage().contains(metal::MTLTextureUsage::ShaderRead),
+            "an external texture shares a texture with ShaderRead usage"
+        );
+        if let Some(texture_id) = self.externals.get(&id).copied()
+            && let Some(texture) = self
+                .polychrome_textures
+                .textures
+                .get_mut(texture_id.index as usize)
+                .and_then(|t| t.as_mut())
+            && texture.metal_texture.as_ptr() == source.as_ptr()
+        {
+            // The same texture: its pixels are already the producer's; only rebind the sampling.
+            texture.external = Some(sampling);
+            return Ok(());
+        }
+        let size = Size {
+            width: DevicePixels(source.width() as i32),
+            height: DevicePixels(source.height() as i32),
+        };
+        self.remove_external(id);
+        self.insert_external(id, source.clone(), size, sampling);
+        Ok(())
+    }
+
+    /// Records `metal_texture` as external texture `id`: one whole polychrome texture.
+    fn insert_external(
+        &mut self,
+        id: ExternalTextureId,
+        metal_texture: metal::Texture,
+        size: Size<DevicePixels>,
+        sampling: TextureSampling,
+    ) {
         let kind = AtlasTextureKind::Polychrome;
         let index = self.polychrome_textures.free_list.pop();
         let texture_id = AtlasTextureId {
@@ -231,7 +298,6 @@ impl MetalAtlasTextures {
             None => self.polychrome_textures.textures.push(Some(entry)),
         }
         self.externals.insert(id, texture_id);
-        Ok(true)
     }
 
     fn remove_external(&mut self, id: ExternalTextureId) {
@@ -291,18 +357,15 @@ impl MetalAtlasTextures {
         Ok(())
     }
 
-    /// Encodes blits on the atlas's own queue and waits for them: the renderer's
-    /// command buffers (another queue) read the result.
+    /// Encodes blits on the renderers' queue ([`crate::metal_renderer::shared_command_queue`])
+    /// and commits them: frames committed after them read the result, with no wait.
     fn blit(&mut self, encode: impl FnOnce(&metal::BlitCommandEncoderRef)) {
-        let queue = self
-            .copy_queue
-            .get_or_insert_with(|| AssertSend(self.device.new_command_queue()));
+        let queue = crate::metal_renderer::shared_command_queue(&self.device);
         let command_buffer = queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();
         encode(blit);
         blit.end_encoding();
         command_buffer.commit();
-        command_buffer.wait_until_completed();
     }
 
     fn allocate(
@@ -645,7 +708,7 @@ mod tests {
         let (w, h) = (texture.width(), texture.height());
         let device = metal::Device::system_default().unwrap();
         let buffer = device.new_buffer(w * h * 4, metal::MTLResourceOptions::StorageModeShared);
-        let queue = device.new_command_queue();
+        let queue = crate::metal_renderer::shared_command_queue(&device);
         let cb = queue.new_command_buffer();
         let blit = cb.new_blit_command_encoder();
         blit.copy_from_texture_to_buffer(
@@ -712,5 +775,123 @@ mod tests {
         assert!(atlas.set_external_texture(id, device_size(5, 2), TextureSampling::Nearest).unwrap());
         assert!(external_pixels(&atlas, id).iter().all(|b| *b == 0), "a resize starts over");
         assert!(atlas.copy_to_external_texture(id, &5u32).is_err(), "only Metal textures copy in");
+    }
+
+    /// A producer's texture: BGRA8Unorm, private, drawn into and sampled.
+    fn producer_texture(
+        device: &metal::DeviceRef,
+        w: u64,
+        h: u64,
+        format: metal::MTLPixelFormat,
+    ) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(w);
+        descriptor.set_height(h);
+        descriptor.set_pixel_format(format);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
+        device.new_texture(&descriptor)
+    }
+
+    /// Clears `texture` to `bgra` in a render pass on the shared queue, without waiting.
+    fn clear_on_shared_queue(texture: &metal::TextureRef, bgra: [u8; 4]) {
+        let queue = crate::metal_renderer::shared_command_queue(&texture.device());
+        let cb = queue.new_command_buffer();
+        let pass = metal::RenderPassDescriptor::new();
+        let color = pass.color_attachments().object_at(0).unwrap();
+        color.set_texture(Some(texture));
+        color.set_load_action(metal::MTLLoadAction::Clear);
+        color.set_store_action(metal::MTLStoreAction::Store);
+        let c = |v: u8| v as f64 / 255.0;
+        color.set_clear_color(metal::MTLClearColor::new(
+            c(bgra[2]),
+            c(bgra[1]),
+            c(bgra[0]),
+            c(bgra[3]),
+        ));
+        cb.new_render_command_encoder(pass).end_encoding();
+        cb.commit();
+    }
+
+    #[test]
+    fn test_shared_external_texture_is_the_producers_texture_with_no_copy() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let device = metal::Device::system_default().unwrap();
+        let id = ExternalTextureId(3);
+        let source = producer_texture(&device, 6, 4, metal::MTLPixelFormat::BGRA8Unorm);
+        clear_on_shared_queue(&source, [10, 20, 30, 255]);
+        atlas
+            .share_external_texture(id, &source, TextureSampling::Linear)
+            .unwrap();
+
+        let tile = atlas.external_texture_tile(id).unwrap();
+        assert_eq!(tile.bounds.size, device_size(6, 4));
+        let shown = atlas.metal_texture(tile.texture_id).unwrap();
+        assert_eq!(
+            shown.as_ptr(),
+            source.as_ptr(),
+            "the atlas shows the producer's texture itself"
+        );
+        // Read on the shared queue after the producer's clear, with no wait between them.
+        assert!(
+            external_pixels(&atlas, id)
+                .chunks(4)
+                .all(|p| p == [10, 20, 30, 255])
+        );
+
+        // New pixels in the same texture: nothing to copy, the next read sees them.
+        clear_on_shared_queue(&source, [1, 2, 3, 255]);
+        assert!(
+            external_pixels(&atlas, id)
+                .chunks(4)
+                .all(|p| p == [1, 2, 3, 255])
+        );
+
+        // Sharing it again only rebinds the sampling.
+        atlas
+            .share_external_texture(id, &source, TextureSampling::Nearest)
+            .unwrap();
+        let again = atlas.external_texture_tile(id).unwrap();
+        assert_eq!(again.texture_id, tile.texture_id);
+        assert_eq!(atlas.sampling(again.texture_id), TextureSampling::Nearest);
+
+        // Another texture replaces it.
+        let bigger = producer_texture(&device, 8, 8, metal::MTLPixelFormat::BGRA8Unorm);
+        atlas
+            .share_external_texture(id, &bigger, TextureSampling::Linear)
+            .unwrap();
+        let replaced = atlas.external_texture_tile(id).unwrap();
+        assert_eq!(replaced.bounds.size, device_size(8, 8));
+        assert_eq!(
+            atlas.metal_texture(replaced.texture_id).unwrap().as_ptr(),
+            bigger.as_ptr()
+        );
+
+        atlas.remove_external_texture(id);
+        assert!(atlas.external_texture_tile(id).is_none());
+    }
+
+    #[test]
+    fn test_shared_external_textures_must_be_bgra_metal_textures() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let device = metal::Device::system_default().unwrap();
+        let id = ExternalTextureId(4);
+        let rgba = producer_texture(&device, 2, 2, metal::MTLPixelFormat::RGBA8Unorm);
+        assert!(
+            atlas
+                .share_external_texture(id, &rgba, TextureSampling::Linear)
+                .is_err()
+        );
+        assert!(
+            atlas
+                .share_external_texture(id, &5u32, TextureSampling::Linear)
+                .is_err()
+        );
+        assert!(atlas.external_texture_tile(id).is_none());
     }
 }

@@ -6270,6 +6270,19 @@ impl Window {
         self.sprite_atlas.copy_to_external_texture(id, source)
     }
 
+    /// Shows `source` as external texture `id`, with no copy (see
+    /// [`PlatformAtlas::share_external_texture`]). Call [`Window::refresh`] or notify a view
+    /// to draw it.
+    pub fn share_external_texture(
+        &self,
+        id: ExternalTextureId,
+        source: &dyn std::any::Any,
+        sampling: TextureSampling,
+    ) -> Result<()> {
+        self.sprite_atlas
+            .share_external_texture(id, source, sampling)
+    }
+
     /// Frees external texture `id`.
     pub fn remove_external_texture(&self, id: ExternalTextureId) {
         self.sprite_atlas.remove_external_texture(id);
