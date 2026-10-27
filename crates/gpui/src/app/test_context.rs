@@ -218,6 +218,12 @@ impl TestAppContext {
         self.test_platform.did_prompt_for_new_path()
     }
 
+    /// The cursor style the platform was last asked to show: what the hovered element's
+    /// `set_cursor_style` resolved to at the end of the last frame.
+    pub fn active_cursor(&self) -> crate::CursorStyle {
+        self.test_platform.active_cursor()
+    }
+
     /// Returns the number of active idle sleep prevention tokens.
     pub fn active_idle_sleep_preventions(&self) -> usize {
         self.test_platform.active_idle_sleep_preventions()

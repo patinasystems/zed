@@ -401,6 +401,11 @@ impl TestPlatform {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    /// The cursor style the platform was last asked to show.
+    pub fn active_cursor(&self) -> CursorStyle {
+        *self.active_cursor.lock()
+    }
+
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
     }
