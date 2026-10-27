@@ -1294,6 +1294,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Whether the last [`PlatformWindow::draw`] rendered its scene (it may find no
+    /// drawable, or a lost device). A frame that was not rendered keeps its texture
+    /// targets for the next one ([`crate::Window::paint_to_texture`]).
+    fn frame_rendered(&self) -> bool {
+        true
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

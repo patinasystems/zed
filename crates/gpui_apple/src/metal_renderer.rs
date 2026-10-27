@@ -216,6 +216,8 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// Whether the last [`MetalRenderer::draw`] committed its frame.
+    rendered: bool,
 }
 
 #[repr(C)]
@@ -563,6 +565,7 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            rendered: false,
         }
     }
 
@@ -644,7 +647,14 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    /// Whether the last [`MetalRenderer::draw`] committed its frame: false when it found no
+    /// layer or drawable, or failed to encode.
+    pub fn rendered(&self) -> bool {
+        self.rendered
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
+        self.rendered = false;
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -686,6 +696,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        self.rendered = true;
         retained_stats::record_encode(encode_started.elapsed().as_secs_f64() * 1e3);
     }
 
@@ -3345,6 +3356,17 @@ mod tests {
             buffer.wait_until_completed();
         }
         first.wait_until_completed();
+    }
+
+    /// A `draw` with nothing to draw into (no layer, so no drawable) does not count as rendered,
+    /// so the window keeps the frame's texture targets for the next frame.
+    #[test]
+    fn a_draw_without_a_drawable_is_not_rendered() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer.renderer.draw(&scene);
+        assert!(!renderer.renderer.rendered());
     }
 
     #[test]
