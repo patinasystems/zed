@@ -349,9 +349,7 @@ impl Element for SplitBufferHeadersElement {
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(
-                    Some(ContentMask {
-                        bounds: prepaint.content_bounds,
-                    }),
+                    Some(ContentMask::from(prepaint.content_bounds)),
                     |window| {
                         for header_layout in &mut prepaint.non_sticky_headers {
                             header_layout.element.paint(window, cx);
@@ -688,7 +686,7 @@ impl SplitBufferHeadersElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::from(bounds)), |window| {
             header.prepaint_as_root(origin, available_size, window, cx);
         });
     }

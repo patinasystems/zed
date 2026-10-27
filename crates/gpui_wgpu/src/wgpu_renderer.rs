@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -112,6 +112,8 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
+    content_mask: ContentMask<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -2974,6 +2976,7 @@ impl WgpuRendererCore {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask: path.content_mask,
             }));
         }
 
@@ -3853,7 +3856,7 @@ mod tests {
             order: 0,
             border_style: BorderStyle::Solid,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::from(bounds),
             background: color.into(),
             border_color: color,
             corner_radii: Corners::default(),
@@ -4136,6 +4139,34 @@ mod tests {
         empty.finish();
         renderer.render_scene_to_image(&empty, size)?;
         assert_eq!(renderer.core.group_texture_bytes(), 0);
+        Ok(())
+    }
+
+    /// The shared rounded content mask scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn rounded_clips_render() -> anyhow::Result<()> {
+        use gpui::rounded_clip_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("rounded_clips_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
         Ok(())
     }
 
@@ -4446,14 +4477,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 48 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 34 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 52 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
     }
 
     #[test]
@@ -4481,6 +4512,12 @@ mod tests {
                         width: 7.0.into(),
                         height: 8.0.into(),
                     },
+                },
+                corner_radii: Corners {
+                    top_left: 90.0.into(),
+                    top_right: 91.0.into(),
+                    bottom_right: 92.0.into(),
+                    bottom_left: 93.0.into(),
                 },
             },
             background: linear_gradient(
@@ -4545,6 +4582,10 @@ mod tests {
                 6.0_f32.to_bits(),
                 7.0_f32.to_bits(),
                 8.0_f32.to_bits(),
+                90.0_f32.to_bits(),
+                91.0_f32.to_bits(),
+                92.0_f32.to_bits(),
+                93.0_f32.to_bits(),
                 1,
                 1,
                 0,

@@ -542,6 +542,8 @@ struct Quad {
     uint border_style;
     Bounds bounds;
     Bounds content_mask;
+    // `ContentMask::corner_radii`: Direct3D clips square.
+    Corners content_mask_radii;
     Background background;
     Hsla border_color;
     Corners corner_radii;
@@ -929,6 +931,8 @@ struct Shadow {
     Bounds bounds;
     Corners corner_radii;
     Bounds content_mask;
+    // `ContentMask::corner_radii`: Direct3D clips square.
+    Corners content_mask_radii;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
@@ -1161,6 +1165,8 @@ struct Underline {
     uint pad;
     Bounds bounds;
     Bounds content_mask;
+    // `ContentMask::corner_radii`: Direct3D clips square.
+    Corners content_mask_radii;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1262,6 +1268,8 @@ struct MonochromeSprite {
     AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
+    // `ContentMask::corner_radii`: Direct3D clips square.
+    Corners content_mask_radii;
     Hsla color;
     TransformationMatrix transformation;
 };
@@ -1337,6 +1345,8 @@ struct PolychromeSprite {
     float opacity;
     Bounds bounds;
     Bounds content_mask;
+    // `ContentMask::corner_radii`: Direct3D clips square.
+    Corners content_mask_radii;
     Corners corner_radii;
     TransformationMatrix transformation;
 };
