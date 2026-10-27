@@ -3485,6 +3485,18 @@ impl WgpuHeadlessRenderer {
         })
     }
 
+    /// The device and queue this renderer draws with (`WgpuContext::device`, `queue`), so
+    /// other GPU work (a Canvas 2D backend, a 3D pass) can make textures it shows and
+    /// submit work it orders after; on Linux without a display, lavapipe's.
+    pub fn context(&self) -> &WgpuContext {
+        &self.context
+    }
+
+    /// The format it renders in.
+    pub fn target_format(&self) -> wgpu::TextureFormat {
+        self.core.target_format
+    }
+
     fn ensure_render_target(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
@@ -4106,6 +4118,71 @@ mod tests {
                 renderer.core.group_texture_bytes()
             );
         }
+        Ok(())
+    }
+
+    /// Other GPU work runs on the headless renderer's own device: a texture made and drawn
+    /// there can be shown by its atlas.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn headless_renderers_share_their_device() -> anyhow::Result<()> {
+        use gpui::{ExternalTextureId, PlatformHeadlessRenderer as _, TextureSampling};
+        let renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let context = renderer.context();
+        let atlas = renderer.sprite_atlas();
+        // The atlas takes textures in its color format: one of these two.
+        let shared = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ]
+        .into_iter()
+        .any(|format| {
+            let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("producer"),
+                size: wgpu::Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let mut encoder = context.device.create_command_encoder(&Default::default());
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            context.queue.submit([encoder.finish()]);
+            atlas
+                .share_external_texture(ExternalTextureId(1), &texture, TextureSampling::Linear)
+                .is_ok()
+        });
+        assert!(
+            shared,
+            "a texture made on the renderer's device is shared with its atlas"
+        );
+        assert!(atlas.external_texture_tile(ExternalTextureId(1)).is_some());
         Ok(())
     }
 
