@@ -16,6 +16,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
+float2 clamp_to_tile(float2 tile_position, AtlasTile tile, float2 atlas_size);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -885,8 +886,11 @@ fragment float4 polychrome_sprite_fragment(
     sampler atlas_texture_sampler [[sampler(0)]]) {
   float clip_alpha = content_mask_alpha(input.position.xy, sprites[input.sprite_id].content_mask);
   PolychromeSprite sprite = sprites[input.sprite_id];
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
+  // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
+  float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
+  float4 sample = atlas_texture.sample(
+      atlas_texture_sampler, clamp_to_tile(input.tile_position, sprite.tile, atlas_size));
   float distance =
       quad_sdf(input.sprite_position, sprite.bounds, sprite.corner_radii);
 
@@ -1196,6 +1200,15 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
   return float4(device_position, 0., 1.);
 }
 
+
+// A tile position kept half a texel inside the tile, so linear filtering reads only the tile.
+float2 clamp_to_tile(float2 tile_position, AtlasTile tile, float2 atlas_size) {
+  float2 origin = float2(tile.bounds.origin.x, tile.bounds.origin.y);
+  float2 size = float2(tile.bounds.size.width, tile.bounds.size.height);
+  float2 lo = (origin + min(float2(0.5), size * 0.5)) / atlas_size;
+  float2 hi = (origin + size - min(float2(0.5), size * 0.5)) / atlas_size;
+  return clamp(tile_position, lo, hi);
+}
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size) {

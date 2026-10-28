@@ -196,6 +196,15 @@ fn to_tile_position(unit_vertex: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
   return (vec2<f32>(tile.bounds.origin) + unit_vertex * vec2<f32>(tile.bounds.size)) / atlas_size;
 }
 
+// A tile position kept half a texel inside the tile, so linear filtering reads only the tile.
+fn clamp_to_tile(tile_position: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
+  let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+  let origin = vec2<f32>(tile.bounds.origin);
+  let size = vec2<f32>(tile.bounds.size);
+  let inset = min(vec2<f32>(0.5), size * 0.5);
+  return clamp(tile_position, (origin + inset) / atlas_size, (origin + size - inset) / atlas_size);
+}
+
 fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec4<f32> {
     let tl = position - clip_bounds.origin;
     let br = clip_bounds.origin + clip_bounds.size - position;
@@ -1641,13 +1650,15 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sprite = load_poly_sprite(input.sprite_id);
+    // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
+    // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
+    let sample = textureSample(t_sprite, s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
     let clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
     let distance = quad_sdf(input.sprite_position, sprite.bounds, sprite.corner_radii);
 

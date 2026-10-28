@@ -2969,6 +2969,49 @@ mod tests {
     }
 
     #[test]
+    fn scaled_up_images_fill_to_their_edges() {
+        // A 1x1 image drawn 40 px square fills it flat: linear filtering must not read past the
+        // tile into its (transparent) atlas neighbours, which faded the edges to 1/4 alpha.
+        use gpui::{
+            AtlasKey, Bounds, ContentMask, Corners, ImageId, PaddedBool32, PolychromeSprite,
+            RenderImageParams, ScaledPixels, TransformationMatrix,
+        };
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.update_transparency(true);
+        let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+        // BGRA: opaque green.
+        let pixel: [u8; 4] = [0, 128, 0, 255];
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(1), frame_index: 0 }),
+                &mut || Ok(Some((size(DevicePixels(1), DevicePixels(1)), std::borrow::Cow::Borrowed(&pixel[..])))),
+            )
+            .expect("insert")
+            .expect("tile");
+        let all = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(48.), ScaledPixels(48.)));
+        let mut scene = Scene::default();
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            tile,
+            grayscale: PaddedBool32::from(false),
+            opacity: 1.,
+            bounds: Bounds::new(point(ScaledPixels(4.), ScaledPixels(4.)), size(ScaledPixels(40.), ScaledPixels(40.))),
+            content_mask: ContentMask::from(all),
+            corner_radii: Corners::default(),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size(DevicePixels(48), DevicePixels(48)))
+            .expect("render");
+        for (x, y) in [(4, 4), (43, 4), (4, 43), (43, 43), (24, 4), (4, 24), (24, 24)] {
+            let p = image.get_pixel(x, y).0;
+            assert!(p[3] >= 254 && p[1] >= 126 && p[0] <= 1, "pixel ({x}, {y}) is {p:?}");
+        }
+        assert_eq!(image.get_pixel(2, 2).0[3], 0, "nothing outside the sprite");
+    }
+
+    #[test]
     fn backdrop_filters_keep_transparent_backdrops_transparent() {
         use gpui::{BackdropFilter, Bounds, ContentMask, Corners, ScaledPixels};
         let mut renderer = MetalHeadlessRenderer::new();
