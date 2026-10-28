@@ -24,6 +24,8 @@ mod http_client;
 mod ime_mirror;
 #[cfg(target_family = "wasm")]
 mod keyboard;
+#[cfg(any(target_family = "wasm", test))]
+mod launch_failure;
 #[cfg(target_family = "wasm")]
 mod logging;
 #[cfg(target_family = "wasm")]

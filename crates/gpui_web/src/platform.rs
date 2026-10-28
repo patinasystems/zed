@@ -4,6 +4,7 @@ use crate::display::WebDisplay;
 use crate::events::EventListenerHandle;
 use crate::http_client::FetchHttpClient;
 use crate::keyboard::WebKeyboardLayout;
+use crate::launch_failure::LaunchFailure;
 use crate::text_system::WebTextSystem;
 use crate::window::WebWindow;
 use anyhow::Result;
@@ -44,6 +45,7 @@ pub struct WebPlatform {
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
     prepared_window: Rc<RefCell<Option<PreparedWebWindow>>>,
     window_lifecycle: Rc<Cell<WebWindowLifecycle>>,
+    graphics_unavailable: Rc<LaunchFailure<anyhow::Error>>,
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
     gestures: Rc<WebGestures>,
@@ -247,6 +249,7 @@ impl WebPlatform {
             wgpu_context: Rc::new(RefCell::new(None)),
             prepared_window: Rc::new(RefCell::new(None)),
             window_lifecycle: Rc::new(Cell::new(WebWindowLifecycle::Available)),
+            graphics_unavailable: Rc::default(),
             cursor_visible,
             last_cursor_css,
             gestures,
@@ -265,6 +268,16 @@ impl WebPlatform {
         user_agent: &str,
     ) -> anyhow::Result<FetchHttpClient> {
         FetchHttpClient::with_user_agent(self.dispatcher.clone(), user_agent)
+    }
+
+    /// Registers a handler for when no browser graphics backend can be
+    /// initialized. `Platform::run` then never calls its launch callback, so an
+    /// application that embeds GPUI in a page uses this to report the failure.
+    /// With a handler, the platform leaves the page alone; without one, it
+    /// appends the error message to the document body. Register it before
+    /// `Platform::run`.
+    pub fn on_graphics_unavailable(&self, handler: impl FnOnce(anyhow::Error) + 'static) {
+        self.graphics_unavailable.set(Box::new(handler));
     }
 }
 
@@ -371,6 +384,7 @@ impl Platform for WebPlatform {
         let wgpu_context = self.wgpu_context.clone();
         let prepared_window = self.prepared_window.clone();
         let window_lifecycle = self.window_lifecycle.clone();
+        let graphics_unavailable = self.graphics_unavailable.clone();
         let browser_window = self.browser_window.clone();
         let backend_preference = self.backend_preference;
         let container = self.container.clone();
@@ -389,7 +403,9 @@ impl Platform for WebPlatform {
                 Err(error) => {
                     window_lifecycle.set(WebWindowLifecycle::Unavailable);
                     log::error!("Failed to initialize browser graphics: {error:#}");
-                    show_graphics_unavailable_message(&browser_window, &error);
+                    if let Some(error) = graphics_unavailable.report(error) {
+                        show_graphics_unavailable_message(&browser_window, &error);
+                    }
                 }
             }
         });
