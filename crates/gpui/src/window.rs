@@ -6539,6 +6539,19 @@ impl Window {
         bounds
     }
 
+    /// The size of the content the given LayoutId scrolls over: its scrollable overflow, which
+    /// reaches past its children to their descendants, less its padding.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_scrollable_content_size(&mut self, layout_id: LayoutId) -> Size<Pixels> {
+        self.invalidator.debug_assert_prepaint();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .scrollable_content_size(layout_id, scale_factor)
+    }
+
     /// This method should be called during `prepaint`. You can use
     /// the returned [Hitbox] during `paint` or in an event handler
     /// to determine whether the inserted hitbox was the topmost.

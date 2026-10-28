@@ -353,6 +353,22 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
+    /// The size of a node's content for scrolling: its scrollable overflow rectangle (CSS
+    /// Overflow 3), which Taffy builds from every descendant whose overflow reaches the node (a
+    /// clipping descendant adds only its own box), measured from the padding box's corner and
+    /// less the node's padding, so that `content + padding` is the overflow's far edge.
+    pub fn scrollable_content_size(&self, id: LayoutId, scale_factor: f32) -> Size<Pixels> {
+        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
+        let rect = layout.scrollable_overflow_rect;
+        let padding = layout.padding;
+        let width = rect.right - padding.left - padding.right;
+        let height = rect.bottom - padding.top - padding.bottom;
+        size(
+            Pixels(width.max(0.).round() / scale_factor),
+            Pixels(height.max(0.).round() / scale_factor),
+        )
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;

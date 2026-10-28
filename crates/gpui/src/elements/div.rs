@@ -1901,6 +1901,7 @@ impl Div {
 /// a child element of the `Div`. These IDs are used to query the layout engine for the computed
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
+    layout_id: LayoutId,
     child_layout_ids: SmallVec<[LayoutId; 2]>,
 }
 
@@ -2007,7 +2008,13 @@ impl Element for Div {
             )
         });
 
-        (layout_id, DivFrameState { child_layout_ids })
+        (
+            layout_id,
+            DivFrameState {
+                layout_id,
+                child_layout_ids,
+            },
+        )
     }
 
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
@@ -2060,6 +2067,13 @@ impl Element for Div {
                 }
             }
             (child_max - child_min).into()
+        };
+        // The children's descendants can overflow them (a child as tall as this element whose
+        // own children are taller): the element scrolls over its scrollable overflow.
+        let content_size = if request_layout.child_layout_ids.is_empty() {
+            content_size
+        } else {
+            content_size.max(&window.layout_scrollable_content_size(request_layout.layout_id))
         };
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
@@ -5754,6 +5768,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    /// The vertical scroll range of a 100px scroll container holding `child`.
+    fn max_scroll_y(cx: &mut TestAppContext, child: fn() -> Div) -> Pixels {
+        struct Scroller {
+            scroll_handle: ScrollHandle,
+            child: fn() -> Div,
+        }
+
+        impl Render for Scroller {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .id("scroller")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .child((self.child)()),
+                )
+            }
+        }
+
+        let scroll_handle = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let scroll_handle = scroll_handle.clone();
+                move |_, _| Scroller {
+                    scroll_handle,
+                    child,
+                }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        scroll_handle.max_offset().y
+    }
+
+    #[gpui::test]
+    fn test_scroll_range_includes_overflowing_descendants(cx: &mut TestAppContext) {
+        // The child is exactly as tall as the container; its own child overflows both.
+        let nested = || {
+            div()
+                .size_full()
+                .flex_shrink_0()
+                .child(div().w(px(50.)).h(px(500.)).flex_shrink_0())
+        };
+        assert_eq!(max_scroll_y(cx, nested), px(400.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_range_includes_positioned_descendants(cx: &mut TestAppContext) {
+        let positioned = || {
+            div().size_full().relative().flex_shrink_0().child(
+                div()
+                    .absolute()
+                    .top(px(400.))
+                    .left_0()
+                    .w(px(20.))
+                    .h(px(50.)),
+            )
+        };
+        assert_eq!(max_scroll_y(cx, positioned), px(350.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_range_stops_at_clipping_descendants(cx: &mut TestAppContext) {
+        // The child clips its overflow: only its own box counts, and it fits.
+        let clipped = || {
+            div()
+                .size_full()
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(div().w(px(50.)).h(px(500.)).flex_shrink_0())
+        };
+        assert_eq!(max_scroll_y(cx, clipped), px(0.));
     }
 
     struct ContentSizedGrid;
