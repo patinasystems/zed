@@ -6473,16 +6473,12 @@ impl Window {
     ) {
         let transformation = self.device_element_transformation().compose(transformation);
         let exact_scale = exact
-            && transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
-            && {
-                let scale_factor = self.scale_factor();
-                let whole = |drawn: Pixels, texels: DevicePixels| {
-                    let ratio = drawn.0 * scale_factor / texels.0 as f32;
-                    ratio >= 1. - 1e-3 && (ratio - ratio.round()).abs() < 1e-3
-                };
-                whole(image_bounds.size.width, tile.bounds.size.width)
-                    && whole(image_bounds.size.height, tile.bounds.size.height)
-            };
+            && samples_texel_centres(
+                image_bounds,
+                tile.bounds.size,
+                self.scale_factor(),
+                &transformation,
+            );
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
@@ -9388,6 +9384,34 @@ fn glyph_raster_transformation(
     ))
 }
 
+/// Whether an image tile of `texels` drawn over `image_bounds` through the device-space
+/// `transformation` puts every texel edge on a device pixel edge: no rotation or scale,
+/// a pixel-aligned origin, and a whole number (at least one) of device pixels per texel.
+/// Only then does sampling texel centres match how browsers draw images.
+fn samples_texel_centres(
+    image_bounds: Bounds<Pixels>,
+    texels: Size<DevicePixels>,
+    scale_factor: f32,
+    transformation: &TransformationMatrix,
+) -> bool {
+    // Device coordinates are f32; this absorbs rounding noise, not real offsets.
+    const TOLERANCE: f32 = 1e-2;
+    let aligned = |device: f32| (device - device.round()).abs() < TOLERANCE;
+    let whole_multiple = |logical: Pixels, texels: DevicePixels| {
+        let device = logical.0 * scale_factor;
+        let device_pixels = device.round() as i32;
+        aligned(device)
+            && texels.0 > 0
+            && device_pixels >= texels.0
+            && device_pixels % texels.0 == 0
+    };
+    transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
+        && aligned(image_bounds.origin.x.0 * scale_factor + transformation.translation[0])
+        && aligned(image_bounds.origin.y.0 * scale_factor + transformation.translation[1])
+        && whole_multiple(image_bounds.size.width, texels.width)
+        && whole_multiple(image_bounds.size.height, texels.height)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -10475,6 +10499,94 @@ mod tests {
                 window.invalidator.set_phase(super::DrawPhase::None);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn images_sample_texel_centres_only_on_the_device_pixel_grid() {
+        use super::{TransformationMatrix, samples_texel_centres};
+        use crate::DevicePixels;
+
+        let texels = size(DevicePixels(4), DevicePixels(4));
+        let unit = TransformationMatrix::unit();
+        let image =
+            |x: f32, y: f32, side: f32| Bounds::new(point(px(x), px(y)), size(px(side), px(side)));
+        let translated = |x: f32, y: f32| TransformationMatrix {
+            translation: [x, y],
+            ..TransformationMatrix::unit()
+        };
+
+        // A 4-texel image drawn 4 or 8 px wide at 2x: 2 or 4 device pixels per texel.
+        assert!(samples_texel_centres(
+            image(10., 10., 4.),
+            texels,
+            2.,
+            &unit
+        ));
+        assert!(samples_texel_centres(
+            image(10., 10., 8.),
+            texels,
+            2.,
+            &unit
+        ));
+        // Half a logical pixel is a whole device pixel at 2x.
+        assert!(samples_texel_centres(
+            image(10.5, 10., 4.),
+            texels,
+            2.,
+            &unit
+        ));
+        assert!(samples_texel_centres(
+            image(10., 10., 4.),
+            texels,
+            2.,
+            &translated(3., 5.)
+        ));
+
+        // A fractional device origin, from the image or the transformation, filters.
+        assert!(!samples_texel_centres(
+            image(10.25, 10., 4.),
+            texels,
+            2.,
+            &unit
+        ));
+        assert!(!samples_texel_centres(
+            image(10., 10., 4.),
+            texels,
+            2.,
+            &translated(0.5, 0.)
+        ));
+        // Sizes that are not a whole multiple of the texels filter.
+        assert!(!samples_texel_centres(
+            image(10., 10., 3.),
+            texels,
+            2.,
+            &unit
+        ));
+        assert!(!samples_texel_centres(
+            image(10., 10., 4.05),
+            texels,
+            1.,
+            &unit
+        ));
+        assert!(!samples_texel_centres(
+            image(10., 10., 6.),
+            texels,
+            1.,
+            &unit
+        ));
+        // Downscales, and rotations or scales, filter.
+        assert!(!samples_texel_centres(
+            image(10., 10., 1.),
+            texels,
+            2.,
+            &unit
+        ));
+        assert!(!samples_texel_centres(
+            image(10., 10., 4.),
+            texels,
+            2.,
+            &TransformationMatrix::unit().scale(size(1.5, 1.5))
+        ));
     }
 
     #[test]
