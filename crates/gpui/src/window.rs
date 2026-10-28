@@ -9,7 +9,7 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BlendMode,
     BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, CornerShapes, Corners,
     CursorHideMode, CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
-    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
+    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing,
     Global, GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
     InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent,
