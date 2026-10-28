@@ -9,7 +9,7 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BlendMode,
     BorderStyle, Bounds, BoxShadow, Capslock, ColorFilter, Context, CornerShapes, Corners,
     CursorHideMode, CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
-    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
+    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing,
     Global, GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
     InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent,
@@ -5876,6 +5876,33 @@ impl Window {
         color: Hsla,
         transformation: TransformationMatrix,
     ) -> Result<()> {
+        self.paint_glyph_with_smoothing(
+            origin,
+            font_id,
+            glyph_id,
+            font_size,
+            color,
+            transformation,
+            FontSmoothing::Platform,
+        )
+    }
+
+    /// Paints a monochrome (non-emoji) glyph like [`Window::paint_glyph_with_transformation`],
+    /// with its strokes rendered as `smoothing` says. [`FontSmoothing::Antialiased`] draws
+    /// grayscale antialiased strokes without the platform's font smoothing or subpixel
+    /// antialiasing, as CSS `-webkit-font-smoothing: antialiased` does on macOS.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_with_smoothing(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transformation: TransformationMatrix,
+        smoothing: FontSmoothing,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
@@ -5898,9 +5925,15 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = transformation == TransformationMatrix::unit()
+        let platform = smoothing == FontSmoothing::Platform;
+        let subpixel_rendering = platform
+            && transformation == TransformationMatrix::unit()
             && self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let dilation = if platform {
+            self.text_system().glyph_dilation_for_color(color)
+        } else {
+            0
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -5910,6 +5943,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            font_smoothing: smoothing,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -6028,6 +6062,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            font_smoothing: FontSmoothing::Platform,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;

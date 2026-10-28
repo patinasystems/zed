@@ -33,9 +33,9 @@ use font_kit::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams,
-    Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode,
-    point, px, size, swap_rgba_pa_to_bgra,
+    FontSmoothing, FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem,
+    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size,
+    TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -720,7 +720,12 @@ impl AppleTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
-            if cfg!(target_os = "macos") && params.dilation > 0 {
+            if params.font_smoothing == FontSmoothing::Antialiased {
+                // Grayscale coverage only: Core Graphics smooths fonts in bitmap contexts
+                // unless told not to, which thickens strokes even at dilation 0.
+                cx.set_should_smooth_fonts(false);
+                cx.set_gray_fill_color(0.0, 1.0);
+            } else if cfg!(target_os = "macos") && params.dilation > 0 {
                 let luminance = params.dilation as f64 * 0.25;
                 cx.set_should_smooth_fonts(true);
                 cx.set_gray_fill_color(luminance, 1.0);
@@ -1050,7 +1055,7 @@ mod lenient_font_attributes {
 mod tests {
     use crate::AppleTextSystem;
     use gpui::{
-        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem,
+        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, FontSmoothing, GlyphId, PlatformTextSystem,
         RenderGlyphParams, font, point, px,
     };
     use std::sync::Arc;
@@ -1403,6 +1408,7 @@ mod tests {
                             is_emoji: false,
                             subpixel_rendering: false,
                             dilation: 0,
+                            font_smoothing: FontSmoothing::Platform,
                         };
                         let bounds = fonts.glyph_raster_bounds(&params).unwrap();
                         let (size, _) = fonts.rasterize_glyph(&params, bounds).unwrap();
@@ -1434,5 +1440,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_antialiased_glyphs_draw_lighter_strokes() {
+        let fonts = AppleTextSystem::new();
+        let font_id = fonts.font_id(&font(".SystemUIFont")).unwrap();
+        let glyph_id = fonts.glyph_for_char(font_id, 'm').unwrap();
+        let ink = |font_smoothing| {
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: px(15.),
+                subpixel_variant: point(0, 0),
+                scale_factor: 2.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+                font_smoothing,
+            };
+            let bounds = fonts.glyph_raster_bounds(&params).unwrap();
+            let (_, alpha) = fonts.rasterize_glyph(&params, bounds).unwrap();
+            alpha.iter().map(|&a| a as u64).sum::<u64>()
+        };
+        let platform = ink(FontSmoothing::Platform);
+        let antialiased = ink(FontSmoothing::Antialiased);
+        // Core Graphics' font smoothing thickens dark text's strokes; without it they are thinner.
+        assert!(
+            antialiased > 0 && antialiased < platform,
+            "antialiased ink {antialiased} against platform {platform}"
+        );
     }
 }
