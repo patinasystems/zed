@@ -3744,15 +3744,7 @@ impl Window {
 
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
-        let scale_factor = self.scale_factor();
-        let left = round_to_device_pixel(bounds.left().0, scale_factor);
-        let top = round_to_device_pixel(bounds.top().0, scale_factor);
-        let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
-        let bottom = round_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
-        Bounds::from_corners(
-            point(ScaledPixels(left), ScaledPixels(top)),
-            point(ScaledPixels(right), ScaledPixels(bottom)),
-        )
+        snap_bounds_to_device(bounds, self.scale_factor())
     }
 
     /// Rounds half-to-zero but clamps any non-zero input up to 1 dp so thin strokes do not disappear.
@@ -6472,13 +6464,6 @@ impl Window {
         exact: bool,
     ) {
         let transformation = self.device_element_transformation().compose(transformation);
-        let exact_scale = exact
-            && samples_texel_centres(
-                image_bounds,
-                tile.bounds.size,
-                self.scale_factor(),
-                &transformation,
-            );
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
@@ -6521,6 +6506,14 @@ impl Window {
             }
         };
 
+        // Checked on the sprite as drawn: its snapped bounds, moved by the translation, over
+        // the texels it shows.
+        let exact_scale = exact
+            && sprite_samples_texel_centres(
+                visible_bounds_snapped,
+                sub_tile.bounds.size,
+                &transformation,
+            );
         let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
@@ -9384,32 +9377,43 @@ fn glyph_raster_transformation(
     ))
 }
 
-/// Whether an image tile of `texels` drawn over `image_bounds` through the device-space
-/// `transformation` puts every texel edge on a device pixel edge: no rotation or scale,
-/// a pixel-aligned origin, and a whole number (at least one) of device pixels per texel.
-/// Only then does sampling texel centres match how browsers draw images.
-fn samples_texel_centres(
-    image_bounds: Bounds<Pixels>,
+/// `bounds` in device pixels, each edge rounded to the nearest device pixel (half toward zero).
+fn snap_bounds_to_device(bounds: Bounds<Pixels>, scale_factor: f32) -> Bounds<ScaledPixels> {
+    let left = round_to_device_pixel(bounds.left().0, scale_factor);
+    let top = round_to_device_pixel(bounds.top().0, scale_factor);
+    let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
+    let bottom = round_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
+    Bounds::from_corners(
+        point(ScaledPixels(left), ScaledPixels(top)),
+        point(ScaledPixels(right), ScaledPixels(bottom)),
+    )
+}
+
+/// Whether a sprite drawn over `sprite` (snapped device bounds) through the device-space
+/// `transformation`, showing `texels`, puts every texel edge on a device pixel edge: no
+/// rotation or scale, a pixel-aligned origin once translated, and a whole number (at least
+/// one) of device pixels per texel. Only then does sampling texel centres match how browsers
+/// draw images.
+fn sprite_samples_texel_centres(
+    sprite: Bounds<ScaledPixels>,
     texels: Size<DevicePixels>,
-    scale_factor: f32,
     transformation: &TransformationMatrix,
 ) -> bool {
     // Device coordinates are f32; this absorbs rounding noise, not real offsets.
     const TOLERANCE: f32 = 1e-2;
     let aligned = |device: f32| (device - device.round()).abs() < TOLERANCE;
-    let whole_multiple = |logical: Pixels, texels: DevicePixels| {
-        let device = logical.0 * scale_factor;
-        let device_pixels = device.round() as i32;
-        aligned(device)
+    let whole_multiple = |device: ScaledPixels, texels: DevicePixels| {
+        let device_pixels = device.0.round() as i32;
+        aligned(device.0)
             && texels.0 > 0
             && device_pixels >= texels.0
             && device_pixels % texels.0 == 0
     };
     transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
-        && aligned(image_bounds.origin.x.0 * scale_factor + transformation.translation[0])
-        && aligned(image_bounds.origin.y.0 * scale_factor + transformation.translation[1])
-        && whole_multiple(image_bounds.size.width, texels.width)
-        && whole_multiple(image_bounds.size.height, texels.height)
+        && aligned(sprite.origin.x.0 + transformation.translation[0])
+        && aligned(sprite.origin.y.0 + transformation.translation[1])
+        && whole_multiple(sprite.size.width, texels.width)
+        && whole_multiple(sprite.size.height, texels.height)
 }
 
 #[cfg(test)]
@@ -10503,87 +10507,46 @@ mod tests {
 
     #[test]
     fn images_sample_texel_centres_only_on_the_device_pixel_grid() {
-        use super::{TransformationMatrix, samples_texel_centres};
+        use super::{TransformationMatrix, snap_bounds_to_device, sprite_samples_texel_centres};
         use crate::DevicePixels;
 
         let texels = size(DevicePixels(4), DevicePixels(4));
         let unit = TransformationMatrix::unit();
-        let image =
-            |x: f32, y: f32, side: f32| Bounds::new(point(px(x), px(y)), size(px(side), px(side)));
         let translated = |x: f32, y: f32| TransformationMatrix {
             translation: [x, y],
             ..TransformationMatrix::unit()
         };
+        // An image at (x, 10), `side` px square, drawn as a sprite at `scale`.
+        let exact = |x: f32, side: f32, scale: f32, transformation: &TransformationMatrix| {
+            let image = Bounds::new(point(px(x), px(10.)), size(px(side), px(side)));
+            sprite_samples_texel_centres(
+                snap_bounds_to_device(image, scale),
+                texels,
+                transformation,
+            )
+        };
 
         // A 4-texel image drawn 4 or 8 px wide at 2x: 2 or 4 device pixels per texel.
-        assert!(samples_texel_centres(
-            image(10., 10., 4.),
-            texels,
-            2.,
-            &unit
-        ));
-        assert!(samples_texel_centres(
-            image(10., 10., 8.),
-            texels,
-            2.,
-            &unit
-        ));
-        // Half a logical pixel is a whole device pixel at 2x.
-        assert!(samples_texel_centres(
-            image(10.5, 10., 4.),
-            texels,
-            2.,
-            &unit
-        ));
-        assert!(samples_texel_centres(
-            image(10., 10., 4.),
-            texels,
-            2.,
-            &translated(3., 5.)
-        ));
-
-        // A fractional device origin, from the image or the transformation, filters.
-        assert!(!samples_texel_centres(
-            image(10.25, 10., 4.),
-            texels,
-            2.,
-            &unit
-        ));
-        assert!(!samples_texel_centres(
-            image(10., 10., 4.),
-            texels,
-            2.,
-            &translated(0.5, 0.)
-        ));
-        // Sizes that are not a whole multiple of the texels filter.
-        assert!(!samples_texel_centres(
-            image(10., 10., 3.),
-            texels,
-            2.,
-            &unit
-        ));
-        assert!(!samples_texel_centres(
-            image(10., 10., 4.05),
-            texels,
-            1.,
-            &unit
-        ));
-        assert!(!samples_texel_centres(
-            image(10., 10., 6.),
-            texels,
-            1.,
-            &unit
-        ));
+        assert!(exact(10., 4., 2., &unit));
+        assert!(exact(10., 8., 2., &unit));
+        assert!(exact(10.5, 4., 2., &unit));
+        assert!(exact(10., 4., 2., &translated(3., 5.)));
+        // At 10.25 logical px, 2x, the sprite snaps to device pixel 20, 8 px wide: exact.
+        assert!(exact(10.25, 4., 2., &unit));
+        // Half a device pixel of translation puts the drawn sprite off the grid, whether or
+        // not the unsnapped origin plus the translation would land on it.
+        assert!(!exact(10.25, 4., 2., &translated(0.5, 0.)));
+        assert!(!exact(10., 4., 2., &translated(0.5, 0.)));
+        assert!(!exact(10., 4., 2., &translated(0., 0.5)));
+        // Drawn sizes that are not a whole multiple of the texels filter.
+        assert!(!exact(10., 3., 2., &unit));
+        assert!(!exact(10.25, 4.5, 2., &unit));
+        assert!(!exact(10., 6., 1., &unit));
         // Downscales, and rotations or scales, filter.
-        assert!(!samples_texel_centres(
-            image(10., 10., 1.),
-            texels,
-            2.,
-            &unit
-        ));
-        assert!(!samples_texel_centres(
-            image(10., 10., 4.),
-            texels,
+        assert!(!exact(10., 1., 2., &unit));
+        assert!(!exact(
+            10.,
+            4.,
             2.,
             &TransformationMatrix::unit().scale(size(1.5, 1.5))
         ));
