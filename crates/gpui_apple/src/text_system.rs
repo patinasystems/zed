@@ -1055,7 +1055,7 @@ mod lenient_font_attributes {
 mod tests {
     use crate::AppleTextSystem;
     use gpui::{
-        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem,
+        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, FontSmoothing, GlyphId, PlatformTextSystem,
         RenderGlyphParams, font, point, px,
     };
     use std::sync::Arc;
