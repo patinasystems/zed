@@ -9,6 +9,7 @@ mod dispatcher;
 pub mod keychain;
 mod metal_atlas;
 mod metal_custom_shader;
+mod metal_marks;
 pub mod metal_renderer;
 pub mod thermal;
 

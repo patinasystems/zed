@@ -10,6 +10,7 @@ use gpui::{
 #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
@@ -193,6 +194,9 @@ pub struct MetalRenderer {
     /// Pipelines of custom shaders by id; `None` for one that failed to compile
     /// (logged once).
     custom_shaders: HashMap<gpui::ShaderId, Option<metal::RenderPipelineState>>,
+    /// Pipelines of marks programs by id; `None` for one that failed to compile
+    /// (logged once).
+    marks_pipelines: HashMap<gpui::MarksShaderId, Option<crate::metal_marks::MarksPipeline>>,
     /// Samples a custom shader's backdrop.
     custom_shader_sampler: metal::SamplerState,
     /// Polychrome sprites: linear, and nearest for external textures that ask for it.
@@ -550,6 +554,7 @@ impl MetalRenderer {
             backdrop_group_pipeline_state,
             texture_pool: TexturePool::default(),
             custom_shaders: HashMap::new(),
+            marks_pipelines: HashMap::new(),
             custom_shader_sampler,
             sprite_samplers,
             blank_texture,
@@ -1004,6 +1009,11 @@ impl MetalRenderer {
                     viewport_size,
                     open(&mut encoder),
                 ),
+                PrimitiveBatch::Marks(range) => self.draw_marks(
+                    &scene.marks[range],
+                    viewport_size,
+                    open(&mut encoder),
+                ),
                 PrimitiveBatch::BackdropFilters(range) => {
                     close_encoder(&mut encoder);
                     for filter in &scene.backdrop_filters[range] {
@@ -1423,6 +1433,56 @@ impl MetalRenderer {
                 6,
                 range.len() as u64,
                 range.start as u64,
+            );
+        }
+    }
+
+    /// Draws marks into the open pass: no pass, upload or copy of their own.
+    /// Programs compile on first use; one that fails to compile draws nothing.
+    fn draw_marks(
+        &mut self,
+        draws: &[gpui::MarksDraw],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        let viewport = [viewport_size.width.0 as f32, viewport_size.height.0 as f32];
+        let mut bound = None;
+        for draw in draws {
+            let device = &self.device;
+            let pipeline = self
+                .marks_pipelines
+                .entry(draw.shader.id)
+                .or_insert_with(|| {
+                    crate::metal_marks::build_pipeline(
+                        device,
+                        &draw.shader,
+                        MTLPixelFormat::BGRA8Unorm,
+                    )
+                    .inspect_err(|error| log::error!("marks program: {error:#}"))
+                    .ok()
+                });
+            let Some(pipeline) = pipeline.as_ref() else {
+                continue;
+            };
+            let textures: SmallVec<[Option<metal::Texture>; 2]> = draw
+                .bindings
+                .textures
+                .iter()
+                .map(|id| {
+                    self.sprite_atlas
+                        .external_texture_tile(*id)
+                        .and_then(|tile| self.sprite_atlas.metal_texture(tile.texture_id))
+                })
+                .collect();
+            crate::metal_marks::encode(
+                command_encoder,
+                pipeline,
+                draw,
+                viewport,
+                &textures,
+                &self.blank_texture,
+                &self.custom_shader_sampler,
+                &mut bound,
             );
         }
     }
@@ -2170,6 +2230,8 @@ fn new_command_encoder_for_texture<'a>(
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
+    #[cfg(test)]
+    render_passes::opened();
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = render_pass_descriptor
         .color_attachments()
@@ -3714,6 +3776,268 @@ mod tests {
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
     }
 
+    fn marks_buffer(device: &metal::DeviceRef, bytes: &[u8]) -> gpui::MarksBuffer {
+        let buffer = device.new_buffer_with_data(
+            bytes.as_ptr().cast(),
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        gpui::MarksBuffer::new(Arc::new(buffer))
+    }
+
+    #[test]
+    fn marks_render() {
+        use gpui::marks_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let buffer = marks_buffer(&renderer.renderer.device, &t::buffer_bytes());
+        let (scene, probes) = t::scene(buffer);
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("marks_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    /// Marks draw inside the frame's pass: a scene with marks between two quads
+    /// opens as many render passes as the same scene without them.
+    #[test]
+    fn marks_open_no_render_pass() {
+        use gpui::marks_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let buffer = marks_buffer(&renderer.renderer.device, &t::buffer_bytes());
+        let (with_marks, _) = t::scene(buffer);
+        assert_eq!(with_marks.marks.len(), 3);
+        let mut quads_only = Scene::default();
+        let mut with = Scene::default();
+        let backdrop = with_marks.quads[0];
+        let mut cover = backdrop;
+        cover.bounds = Bounds::new(
+            point(ScaledPixels(8.), ScaledPixels(8.)),
+            gpui::size(ScaledPixels(8.), ScaledPixels(8.)),
+        );
+        quads_only.insert_primitive(backdrop);
+        quads_only.insert_primitive(cover);
+        quads_only.finish();
+        with.insert_primitive(backdrop);
+        for draw in &with_marks.marks {
+            with.insert_primitive(draw.clone());
+        }
+        // Over the marks: its own batch after them.
+        with.insert_primitive(cover);
+        with.finish();
+        let labels: Vec<String> = with.batches().map(|b| b.label()).collect();
+        assert_eq!(labels, ["quads (1)", "marks (3)", "quads (1)"]);
+        let size = size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1));
+        let mut passes = |scene: &Scene| {
+            let before = render_passes::count();
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, size)
+                .expect("render");
+            render_passes::count() - before
+        };
+        let base = passes(&quads_only);
+        assert_eq!(passes(&with), base, "marks opened a render pass");
+    }
+
+    /// The marks gate (r-marks §17 P0): 1M instanced points pulled from three f32
+    /// storage buffers and a color table, as the spike's scatter scene draws them,
+    /// drawn inside GPUI's frame pass at 2800x1800. Prints GPU time per frame (the
+    /// command buffer: clear + the draw) next to a clear-only frame, CPU encode,
+    /// encode per extra mark draw, and render passes per frame.
+    /// `cargo test -p gpui_apple --release --lib marks_points_frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn marks_points_frame_cost() {
+        use gpui::{MarksBindings, MarksDraw, MarksPaint, MarksShader, TransformationMatrix};
+        const PROGRAM: &str = "
+@group(0) @binding(2) var<storage, read> xs: array<f32>;
+@group(0) @binding(3) var<storage, read> ys: array<f32>;
+@group(0) @binding(4) var<storage, read> vs: array<f32>;
+@group(0) @binding(5) var<storage, read> lut: array<vec4<f32>>;
+struct Points { point_px: f32, d0: f32, d1: f32, pad: f32 }
+@group(0) @binding(1) var<uniform> points: Points;
+
+fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex {
+    let c = gpui_marks_strip_corner(vertex) * 2.0 - 1.0;
+    let r = points.point_px * 0.5 + 0.5;
+    var out = gpui_mark_vertex(vec2<f32>(xs[instance], ys[instance]));
+    out.offset_px = c * r;
+    out.local = vec4<f32>(c * r, 0.0, 0.0);
+    let t = clamp((vs[instance] - points.d0) / max(points.d1 - points.d0, 1e-30), 0.0, 1.0);
+    out.color = lut[u32(t * 255.0 + 0.5)];
+    return out;
+}
+
+fn mark_fragment(input: MarkFragment) -> vec4<f32> {
+    let a = clamp(points.point_px * 0.5 - length(input.local.xy) + 0.5, 0.0, 1.0);
+    return vec4<f32>(input.color.rgb, input.color.a * a);
+}
+";
+        let n: usize = std::env::var("MARKS_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        // The spike's columns: half uniform, half in 16 clusters; value 0.7x + 0.3y.
+        let mut seed = 7u64;
+        let mut unit = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let (mut xs, mut ys, mut vs) = (vec![], vec![], vec![]);
+        for i in 0..n {
+            let (x, y) = if i % 2 == 0 {
+                (unit(), unit())
+            } else {
+                let c = (unit() * 16.0).floor();
+                let (cx, cy) = (
+                    (c * 0.37).fract() * 0.8 + 0.1,
+                    (c * 0.61).fract() * 0.8 + 0.1,
+                );
+                let mut g = || (unit() + unit() + unit() - 1.5) * 0.05;
+                (cx + g(), cy + g())
+            };
+            xs.push(x);
+            ys.push(y);
+            vs.push(x * 0.7 + y * 0.3);
+        }
+        let lut: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                let t = i as f32 / 255.0;
+                [t, 0.4 + 0.5 * t * (1.0 - t), 1.0 - t, 1.0]
+            })
+            .collect();
+        let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_ne_bytes()).collect() };
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let device = renderer.device.clone();
+        let buffers: Vec<gpui::MarksBuffer> = [&xs, &ys, &vs, &lut]
+            .map(|v| marks_buffer(&device, &bytes(v)))
+            .into();
+        let uniforms: Arc<[u8]> = bytes(&[3.0, 0.0, 1.0, 0.0]).into();
+        let shader = MarksShader::new(PROGRAM);
+        let (w, h) = (2800, 1800);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(w as u64);
+        descriptor.set_height(h as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let texture = device.new_texture(&descriptor);
+        let target = size(DevicePixels(w), DevicePixels(h));
+        let full = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            gpui::size(ScaledPixels(w as f32), ScaledPixels(h as f32)),
+        );
+        let draw = |instances: std::ops::Range<u32>, camera: TransformationMatrix| MarksDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask::from(full),
+            shader: shader.clone(),
+            bindings: MarksBindings::buffers(buffers.iter().cloned()).uniforms(uniforms.clone()),
+            paint: MarksPaint::new(instances, 4, camera).strip(),
+            opacity: 1.0,
+        };
+        let camera = |zoom: f32, pan: f32| TransformationMatrix {
+            rotation_scale: [[w as f32 * zoom, 0.0], [0.0, h as f32 * zoom]],
+            translation: [-pan, -pan * 0.5],
+        };
+        let q = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+        };
+        // One frame: encode `scene`, commit, wait. Returns (encode ms, GPU ms, passes).
+        let mut frame = |scene: &Scene| -> (f64, f64, usize) {
+            objc2::rc::autoreleasepool(|_| {
+                let passes = render_passes::count();
+                let started = std::time::Instant::now();
+                let mut writer = InstanceBufferWriter::new(
+                    &renderer.device,
+                    &renderer.instance_buffer_pool,
+                    renderer.is_unified_memory,
+                );
+                let gradients = write_gradients(scene, &mut writer).unwrap();
+                let bindings = write_instances(&gradients, scene, &mut writer).unwrap();
+                let cb = renderer
+                    .draw_primitives_to_texture(scene, &bindings, &mut writer, &texture, target)
+                    .unwrap();
+                let encoded = started.elapsed().as_secs_f64() * 1e3;
+                cb.commit();
+                cb.wait_until_completed();
+                let (start, end): (f64, f64) = unsafe {
+                    let cb = &*(cb.as_ptr() as *const AnyObject);
+                    (
+                        objc2::msg_send![cb, GPUStartTime],
+                        objc2::msg_send![cb, GPUEndTime],
+                    )
+                };
+                drop(writer);
+                (
+                    encoded,
+                    (end - start) * 1e3,
+                    render_passes::count() - passes,
+                )
+            })
+        };
+        let frames = 120;
+        let mut run = |what: &str, make: &dyn Fn(usize) -> Scene| {
+            let (mut encode, mut gpu, mut passes) = (vec![], vec![], 0);
+            for i in 0..frames + 10 {
+                let scene = make(i);
+                let (e, g, p) = frame(&scene);
+                if i >= 10 {
+                    encode.push(e);
+                    gpu.push(g);
+                    passes = passes.max(p);
+                }
+            }
+            println!(
+                "MARKS_P0 {what:<36} n {n} target {w}x{h} encode_cpu_ms p50 {:.4} p95 {:.4} gpu_ms p50 {:.3} p95 {:.3} render_passes {passes}",
+                q(&mut encode, 0.5),
+                q(&mut encode, 0.95),
+                q(&mut gpu, 0.5),
+                q(&mut gpu, 0.95),
+            );
+            (q(&mut encode, 0.5), q(&mut gpu, 0.5))
+        };
+        let scene_of = |draws: Vec<MarksDraw>| {
+            let mut scene = Scene::default();
+            for d in draws {
+                scene.insert_primitive(d);
+            }
+            scene.finish();
+            scene
+        };
+        run("clear only (empty scene)", &|_| scene_of(vec![]));
+        run("1M points, pan at fit", &|i| {
+            scene_of(vec![draw(0..n as u32, camera(1.0, (i % 40) as f32 * 3.0))])
+        });
+        run("1M points, pan zoomed 4x", &|i| {
+            scene_of(vec![draw(
+                0..n as u32,
+                camera(4.0, (i % 40) as f32 * 3.0 + w as f32 * 1.5),
+            )])
+        });
+        // Encode per mark: 1 against 101 one-instance draws (each its own draw call).
+        let (one, _) = run("1 one-point mark draw", &|_| {
+            scene_of(vec![draw(0..1, camera(1.0, 0.0))])
+        });
+        let (many, _) = run("101 one-point mark draws", &|_| {
+            scene_of((0..101).map(|k| draw(k..k + 1, camera(1.0, 0.0))).collect())
+        });
+        println!(
+            "MARKS_P0 encode per extra mark draw {:.2} us (p50s)",
+            (many - one) / 100.0 * 1e3
+        );
+    }
+
     #[test]
     fn element_transformations_render() {
         use gpui::element_transformation_test_scene as t;
@@ -3926,6 +4250,20 @@ fn copy_ranges<'a>(
 
 /// Opt-in frame statistics for retained shapes (`GPUI_RETAINED_SHAPES_STATS=1`):
 /// every 120 frames, stderr gets CPU encode time, GPU time and bytes uploaded.
+/// Render passes opened for a texture, counted in tests: marks must open none.
+#[cfg(test)]
+mod render_passes {
+    use std::cell::Cell;
+    thread_local!(static OPENED: Cell<usize> = const { Cell::new(0) });
+    pub fn opened() {
+        OPENED.with(|n| n.set(n.get() + 1));
+    }
+    /// Passes opened on this thread so far.
+    pub fn count() -> usize {
+        OPENED.with(Cell::get)
+    }
+}
+
 mod retained_stats {
     use parking_lot::Mutex;
     use std::sync::OnceLock;

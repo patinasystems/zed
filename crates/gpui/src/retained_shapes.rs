@@ -315,58 +315,163 @@ impl RetainedShapesPaint {
         self
     }
 
-    /// `clip`'s space to `transformation`'s target, as `[a, b, c, d, tx, ty]`
-    /// in f64 (x' = a·x + c·y + tx).
-    fn clip_to_target(&self, clip: &RetainedClip) -> [f64; 6] {
-        let mut m = clip.transform.map(f64::from);
-        let mut then = |t: &TransformationMatrix| {
-            let [[a, c], [b, d]] = t.rotation_scale.map(|row| row.map(f64::from));
-            let [tx, ty] = t.translation.map(f64::from);
-            m = [
-                a * m[0] + c * m[1],
-                b * m[0] + d * m[1],
-                a * m[2] + c * m[3],
-                b * m[2] + d * m[3],
-                a * m[4] + c * m[5] + tx,
-                b * m[4] + d * m[5] + ty,
-            ];
-        };
-        if clip.layer_1 {
-            then(&self.layer_transformation);
-        }
-        then(&self.transformation);
-        m
-    }
-
     /// Axis-aligned bounds, in `transformation`'s target, that hold the
     /// intersection of the clips and their antialiased edges; `None` without clips.
     pub fn clip_bounds(&self) -> Option<Bounds<ScaledPixels>> {
-        self.clips
-            .iter()
-            .take(MAX_RETAINED_CLIPS)
-            .map(|clip| {
-                let m = self.clip_to_target(clip);
-                let (w, h) = (f64::from(clip.width), f64::from(clip.height));
-                let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
-                    .map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
-                let (x0, y0, x1, y1) = corners
-                    .iter()
-                    .fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |b, c| {
-                        (b.0.min(c.0), b.1.min(c.1), b.2.max(c.0), b.3.max(c.1))
-                    });
-                Bounds::from_corners(
-                    crate::point(
-                        ScaledPixels(x0.floor() as f32 - 1.0),
-                        ScaledPixels(y0.floor() as f32 - 1.0),
-                    ),
-                    crate::point(
-                        ScaledPixels(x1.ceil() as f32 + 1.0),
-                        ScaledPixels(y1.ceil() as f32 + 1.0),
-                    ),
-                )
-            })
-            .reduce(|a, b| a.intersect(&b))
+        clips_bounds(
+            &self.transformation,
+            &self.layer_transformation,
+            &self.clips,
+        )
     }
+}
+
+/// `clip`'s space to `transformation`'s target (through `layer` first when the
+/// clip is [`RetainedClip::layer_1`]), as `[a, b, c, d, tx, ty]` in f64
+/// (x' = a·x + c·y + tx).
+pub(crate) fn clip_to_target(
+    transformation: &TransformationMatrix,
+    layer: &TransformationMatrix,
+    clip: &RetainedClip,
+) -> [f64; 6] {
+    let mut m = clip.transform.map(f64::from);
+    let mut then = |t: &TransformationMatrix| {
+        let [[a, c], [b, d]] = t.rotation_scale.map(|row| row.map(f64::from));
+        let [tx, ty] = t.translation.map(f64::from);
+        m = [
+            a * m[0] + c * m[1],
+            b * m[0] + d * m[1],
+            a * m[2] + c * m[3],
+            b * m[2] + d * m[3],
+            a * m[4] + c * m[5] + tx,
+            b * m[4] + d * m[5] + ty,
+        ];
+    };
+    if clip.layer_1 {
+        then(layer);
+    }
+    then(transformation);
+    m
+}
+
+/// Axis-aligned bounds, in `transformation`'s target, that hold the intersection
+/// of `clips` and their antialiased edges; `None` without clips.
+pub(crate) fn clips_bounds(
+    transformation: &TransformationMatrix,
+    layer: &TransformationMatrix,
+    clips: &[RetainedClip],
+) -> Option<Bounds<ScaledPixels>> {
+    clips
+        .iter()
+        .take(MAX_RETAINED_CLIPS)
+        .map(|clip| {
+            let m = clip_to_target(transformation, layer, clip);
+            let (w, h) = (f64::from(clip.width), f64::from(clip.height));
+            let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)]
+                .map(|(x, y)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]));
+            let (x0, y0, x1, y1) = corners
+                .iter()
+                .fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |b, c| {
+                    (b.0.min(c.0), b.1.min(c.1), b.2.max(c.0), b.3.max(c.1))
+                });
+            Bounds::from_corners(
+                crate::point(
+                    ScaledPixels(x0.floor() as f32 - 1.0),
+                    ScaledPixels(y0.floor() as f32 - 1.0),
+                ),
+                crate::point(
+                    ScaledPixels(x1.ceil() as f32 + 1.0),
+                    ScaledPixels(y1.ceil() as f32 + 1.0),
+                ),
+            )
+        })
+        .reduce(|a, b| a.intersect(&b))
+}
+
+/// A clip's uniform: the map from device pixels to the clip's space (the
+/// inverse of the clip's transform followed by the draw's).
+pub(crate) fn clip_uniform(
+    transformation: &TransformationMatrix,
+    layer: &TransformationMatrix,
+    clip: &RetainedClip,
+) -> RetainedClipUniform {
+    // A clip with no area hides everything.
+    const EMPTY: RetainedClipUniform = RetainedClipUniform {
+        matrix: [0.0; 4],
+        translation: [0.0; 2],
+        half_size: [-1.0, -1.0],
+        corner_radii: [0.0; 4],
+    };
+    let (w, h) = (clip.width, clip.height);
+    if !(w > 0.0 && h > 0.0) {
+        return EMPTY;
+    }
+    let m = clip_to_target(transformation, layer, clip);
+    let det = m[0] * m[3] - m[2] * m[1];
+    let inverse = [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det];
+    let [a, b, c, d] = inverse.map(|v| v as f32);
+    let (tx, ty) = (
+        -(inverse[0] * m[4] + inverse[2] * m[5]),
+        -(inverse[1] * m[4] + inverse[3] * m[5]),
+    );
+    let uniform = RetainedClipUniform {
+        matrix: [a, b, c, d],
+        translation: [tx as f32, ty as f32],
+        half_size: [0.5 * w, 0.5 * h],
+        corner_radii: clip.corner_radii.map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+    };
+    let finite = uniform
+        .matrix
+        .iter()
+        .chain(&uniform.translation)
+        .all(|v| v.is_finite());
+    if det == 0.0 || !finite {
+        EMPTY
+    } else {
+        uniform
+    }
+}
+
+/// A rounded content mask (an `overflow` clip with a rounded border) as one more
+/// clip, already in device pixels; `None` for a square mask.
+pub(crate) fn rounded_mask_clip(mask: &ContentMask<ScaledPixels>) -> Option<RetainedClipUniform> {
+    mask.is_rounded().then(|| {
+        let b = mask.bounds;
+        let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
+        let r = mask.corner_radii;
+        RetainedClipUniform {
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            translation: [-b.origin.x.0, -b.origin.y.0],
+            half_size: [0.5 * w, 0.5 * h],
+            corner_radii: [
+                r.top_left.0,
+                r.top_right.0,
+                r.bottom_right.0,
+                r.bottom_left.0,
+            ]
+            .map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+        }
+    })
+}
+
+/// The clip uniforms of a draw: `clips`, then the rounded content mask, at most
+/// [`MAX_RETAINED_CLIPS`] in all (past it the mask clips square). Returns them and
+/// how many apply.
+pub(crate) fn clip_uniforms(
+    transformation: &TransformationMatrix,
+    layer: &TransformationMatrix,
+    clips: &[RetainedClip],
+    mask: &ContentMask<ScaledPixels>,
+) -> ([RetainedClipUniform; MAX_RETAINED_CLIPS], u32) {
+    let rounded = rounded_mask_clip(mask);
+    let count = (clips.len() + usize::from(rounded.is_some())).min(MAX_RETAINED_CLIPS) as u32;
+    let uniforms = std::array::from_fn(|i| {
+        clips.get(i).map_or_else(
+            || rounded.filter(|_| i == clips.len()).unwrap_or_default(),
+            |clip| clip_uniform(transformation, layer, clip),
+        )
+    });
+    (uniforms, count)
 }
 
 /// A draw of retained shapes, as recorded in the scene.
@@ -390,30 +495,17 @@ impl RetainedShapesDraw {
     /// Shader uniforms for this draw on a target of `viewport` device pixels.
     pub fn uniforms(&self, viewport: [f32; 2]) -> RetainedShapesUniforms {
         let mask = self.content_mask.bounds.intersect(&self.bounds);
-        // A rounded content mask (an `overflow` clip with a rounded border) is one more
-        // clip, already in device pixels; past `MAX_RETAINED_CLIPS` it clips square.
-        let rounded = self.content_mask.is_rounded().then(|| {
-            let b = self.content_mask.bounds;
-            let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
-            let r = self.content_mask.corner_radii;
-            RetainedClipUniform {
-                matrix: [1.0, 0.0, 0.0, 1.0],
-                translation: [-b.origin.x.0, -b.origin.y.0],
-                half_size: [0.5 * w, 0.5 * h],
-                corner_radii: [
-                    r.top_left.0,
-                    r.top_right.0,
-                    r.bottom_right.0,
-                    r.bottom_left.0,
-                ]
-                .map(|r| r.clamp(0.0, 0.5 * w.min(h))),
-            }
-        });
         let m = |t: &TransformationMatrix| {
             let [[a, b], [c, d]] = t.rotation_scale;
             let [x, y] = t.translation;
             [a, b, c, d, x, y]
         };
+        let (clips, clip_count) = clip_uniforms(
+            &self.paint.transformation,
+            &self.paint.layer_transformation,
+            &self.paint.clips,
+            &self.content_mask,
+        );
         RetainedShapesUniforms {
             transform: m(&self.paint.transformation),
             viewport_size: viewport,
@@ -427,59 +519,9 @@ impl RetainedShapesDraw {
             lod_min_px: self.paint.lod_min_device_px,
             greek_band: self.paint.text_bar_band_px,
             layer1: m(&self.paint.layer_transformation),
-            clip_count: (self.paint.clips.len() + usize::from(rounded.is_some()))
-                .min(MAX_RETAINED_CLIPS) as u32,
+            clip_count,
             _pad: 0.0,
-            clips: std::array::from_fn(|i| {
-                self.paint.clips.get(i).map_or_else(
-                    || {
-                        rounded
-                            .filter(|_| i == self.paint.clips.len())
-                            .unwrap_or_default()
-                    },
-                    |clip| self.clip_uniform(clip),
-                )
-            }),
-        }
-    }
-
-    /// A clip's uniform: the map from device pixels to the clip's space
-    /// (the inverse of the clip's transform followed by the draw's).
-    fn clip_uniform(&self, clip: &RetainedClip) -> RetainedClipUniform {
-        // A clip with no area hides everything.
-        const EMPTY: RetainedClipUniform = RetainedClipUniform {
-            matrix: [0.0; 4],
-            translation: [0.0; 2],
-            half_size: [-1.0, -1.0],
-            corner_radii: [0.0; 4],
-        };
-        let (w, h) = (clip.width, clip.height);
-        if !(w > 0.0 && h > 0.0) {
-            return EMPTY;
-        }
-        let m = self.paint.clip_to_target(clip);
-        let det = m[0] * m[3] - m[2] * m[1];
-        let inverse = [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det];
-        let [a, b, c, d] = inverse.map(|v| v as f32);
-        let (tx, ty) = (
-            -(inverse[0] * m[4] + inverse[2] * m[5]),
-            -(inverse[1] * m[4] + inverse[3] * m[5]),
-        );
-        let uniform = RetainedClipUniform {
-            matrix: [a, b, c, d],
-            translation: [tx as f32, ty as f32],
-            half_size: [0.5 * w, 0.5 * h],
-            corner_radii: clip.corner_radii.map(|r| r.clamp(0.0, 0.5 * w.min(h))),
-        };
-        let finite = uniform
-            .matrix
-            .iter()
-            .chain(&uniform.translation)
-            .all(|v| v.is_finite());
-        if det == 0.0 || !finite {
-            EMPTY
-        } else {
-            uniform
+            clips,
         }
     }
 }

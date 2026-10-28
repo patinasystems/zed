@@ -12,7 +12,8 @@ use crate::{
     DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, FontSmoothing,
     Global, GlobalElementId, GlyphId, GpuSpecs, Gradient, GroupEffects, Hsla, InputHandler,
     InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, MaskMode, Modifiers, ModifiersChangedEvent,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, MarksBindings, MarksDraw, MarksPaint, MarksShader,
+    MaskMode, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -5892,6 +5893,52 @@ impl Window {
         self.next_frame.scene.insert_primitive(draw);
     }
 
+    /// Paint marks: `paint.instances` of `shader`, `paint.vertices` each, over the
+    /// caller's GPU buffers and textures in `bindings` (see [`MarksShader`]), under
+    /// `paint.transformation` (the buffers' space to window pixels). `bounds` is the
+    /// window area the marks may cover; it orders the draw against other primitives
+    /// and clips it, together with the current content mask and `paint.clips`.
+    ///
+    /// The draw goes into the frame's own render pass, as retained shapes do: GPUI
+    /// uploads nothing and opens no pass for it, and moving the transformation or
+    /// the layer transformation costs one uniform block. The caller writes its
+    /// buffers before the frame that reads them.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_marks(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shader: &MarksShader,
+        bindings: MarksBindings,
+        mut paint: MarksPaint,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if paint.instances.is_empty() || paint.vertices < 3 {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let element = self.device_element_transformation();
+        paint.transformation = element.compose(
+            TransformationMatrix::unit()
+                .scale(size(scale_factor, scale_factor))
+                .compose(paint.transformation),
+        );
+        let mut bounds = element.transform_bounds(bounds.scale(scale_factor));
+        if let Some(clip) = paint.clip_bounds() {
+            bounds = bounds.intersect(&clip);
+        }
+        let draw = MarksDraw {
+            order: 0,
+            bounds,
+            content_mask: self.content_mask().scale(scale_factor),
+            shader: shader.clone(),
+            bindings,
+            paint,
+            opacity: self.element_opacity(),
+        };
+        self.next_frame.scene.insert_primitive(draw);
+    }
+
     /// Paint an underline into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -9480,6 +9527,73 @@ mod tests {
             assert_eq!(filter.shader.scale_factor, scale);
             assert_eq!(filter.shader.uniforms(scene), &1f32.to_le_bytes());
             assert!(filter.shader.shader(scene).is_some());
+        })
+        .unwrap();
+    }
+
+    /// A canvas that paints marks at half opacity, under an element offset.
+    struct MarksProbe;
+
+    impl Render for MarksProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| {},
+                |_, _, window, _| {
+                    let shader = crate::MarksShader::new(
+                        "fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex { return gpui_mark_vertex(vec2<f32>(0.0)); }
+fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
+                    );
+                    let bounds = Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)));
+                    let paint = crate::MarksPaint::new(
+                        3..7,
+                        6,
+                        crate::TransformationMatrix::unit()
+                            .translate(point(ScaledPixels(5.), ScaledPixels(0.))),
+                    );
+                    window.with_element_opacity(Some(0.5), |window| {
+                        window.paint_marks(
+                            bounds,
+                            &shader,
+                            crate::MarksBindings::default().uniforms(vec![1u8, 2, 3, 4]),
+                            paint.clone(),
+                        );
+                        // Nothing to draw: not recorded.
+                        window.paint_marks(
+                            bounds,
+                            &shader,
+                            crate::MarksBindings::default(),
+                            crate::MarksPaint { instances: 0..0, ..paint },
+                        );
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn test_paint_marks_records_a_marks_draw(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| MarksProbe);
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.marks.len(), 1);
+            let draw = &scene.marks[0];
+            assert_eq!(draw.opacity, 0.5, "fades with the element");
+            assert_eq!(draw.bounds.origin.x, ScaledPixels(10. * scale));
+            assert_eq!(draw.paint.instances, 3..7);
+            assert_eq!(&*draw.bindings.uniforms, &[1, 2, 3, 4]);
+            // The buffer's space to device pixels: scaled, then the caller's offset.
+            assert_eq!(
+                draw.paint.transformation.rotation_scale,
+                [[scale, 0.], [0., scale]]
+            );
+            assert_eq!(draw.paint.transformation.translation, [5. * scale, 0.]);
+            let labels: Vec<String> = scene.batches().map(|b| b.label()).collect();
+            assert!(labels.contains(&"marks (1)".to_string()), "{labels:?}");
         })
         .unwrap();
     }

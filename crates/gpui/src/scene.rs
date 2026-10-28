@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, BackgroundTag, Bounds, ContentMask, Corners,
-    DevicePixels, Edges, ExternalTextureId, Hsla, Pixels, Point, Radians, RetainedShapesDraw,
-    ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    DevicePixels, Edges, ExternalTextureId, Hsla, MarksDraw, Pixels, Point, Radians,
+    RetainedShapesDraw, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -65,6 +65,8 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub retained_shapes: Vec<RetainedShapesDraw>,
+    /// Marks draws ([`crate::Window::paint_marks`]), each its own draw call.
+    pub marks: Vec<MarksDraw>,
     pub backdrop_filters: Vec<BackdropFilter>,
     /// The sources of the shaders this frame's backdrop filters run, once each.
     pub shaders: Vec<Shader>,
@@ -102,6 +104,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.retained_shapes.clear();
+        self.marks.clear();
         self.backdrop_filters.clear();
         self.shaders.clear();
         self.shader_uniforms.clear();
@@ -359,6 +362,10 @@ impl Scene {
                 draw.order = order;
                 self.retained_shapes.push(draw.clone());
             }
+            Primitive::Marks(draw) => {
+                draw.order = order;
+                self.marks.push(draw.clone());
+            }
             Primitive::BackdropFilter(filter) => {
                 filter.order = order;
                 self.backdrop_filters.push(*filter);
@@ -463,6 +470,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.retained_shapes.sort_by_key(|draw| draw.order);
+        self.marks.sort_by_key(|draw| draw.order);
         self.backdrop_filters.sort_by_key(|filter| filter.order);
         self.groups.sort_by_key(|group| group.order);
     }
@@ -626,6 +634,12 @@ impl Scene {
             draw.paint.transformation.translation[0] += offset.x.0;
             draw.paint.transformation.translation[1] += offset.y.0;
         }
+        for draw in &mut self.marks {
+            bounds(&mut draw.bounds);
+            mask(&mut draw.content_mask);
+            draw.paint.transformation.translation[0] += offset.x.0;
+            draw.paint.transformation.translation[1] += offset.y.0;
+        }
         for filter in &mut self.backdrop_filters {
             bounds(&mut filter.bounds);
             mask(&mut filter.content_mask);
@@ -688,6 +702,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             retained_start: 0,
             retained_iter: self.retained_shapes.iter().peekable(),
+            marks_start: 0,
+            marks_iter: self.marks.iter().peekable(),
             backdrop_filters_start: 0,
             backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
             groups_start: 0,
@@ -718,6 +734,7 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     RetainedShapes,
+    Marks,
     Group,
 }
 
@@ -742,6 +759,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     RetainedShapes(RetainedShapesDraw),
+    Marks(MarksDraw),
     BackdropFilter(BackdropFilter),
 }
 
@@ -758,6 +776,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::RetainedShapes(draw) => &draw.bounds,
+            Primitive::Marks(draw) => &draw.bounds,
             Primitive::BackdropFilter(filter) => &filter.bounds,
         }
     }
@@ -816,9 +835,10 @@ impl Primitive {
             | Primitive::MonochromeSprite(_)
             | Primitive::SubpixelSprite(_)
             | Primitive::PolychromeSprite(_) => true,
-            Primitive::Surface(_) | Primitive::RetainedShapes(_) | Primitive::BackdropFilter(_) => {
-                false
-            }
+            Primitive::Surface(_)
+            | Primitive::RetainedShapes(_)
+            | Primitive::Marks(_)
+            | Primitive::BackdropFilter(_) => false,
         }
     }
 
@@ -836,6 +856,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => sprite.color = sprite.color.opacity(opacity),
             Primitive::PolychromeSprite(sprite) => sprite.opacity *= opacity,
             Primitive::RetainedShapes(draw) => draw.opacity *= opacity,
+            Primitive::Marks(draw) => draw.opacity *= opacity,
             Primitive::BackdropFilter(filter) => filter.opacity *= opacity,
             Primitive::Surface(_) => {}
         }
@@ -853,6 +874,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &mut sprite.content_mask,
             Primitive::Surface(surface) => &mut surface.content_mask,
             Primitive::RetainedShapes(draw) => &mut draw.content_mask,
+            Primitive::Marks(draw) => &mut draw.content_mask,
             Primitive::BackdropFilter(filter) => &mut filter.content_mask,
         };
         *content_mask = content_mask.intersect(mask);
@@ -869,6 +891,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::RetainedShapes(draw) => &draw.content_mask,
+            Primitive::Marks(draw) => &draw.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
         }
     }
@@ -900,6 +923,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     retained_start: usize,
     retained_iter: Peekable<slice::Iter<'a, RetainedShapesDraw>>,
+    marks_start: usize,
+    marks_iter: Peekable<slice::Iter<'a, MarksDraw>>,
     backdrop_filters_start: usize,
     backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
     groups_start: usize,
@@ -940,6 +965,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.retained_iter.peek().map(|s| s.order),
                 PrimitiveKind::RetainedShapes,
+            ),
+            (
+                self.marks_iter.peek().map(|m| m.order),
+                PrimitiveKind::Marks,
             ),
             (
                 self.backdrop_filters_iter.peek().map(|f| f.order),
@@ -1108,6 +1137,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.retained_start = end;
                 Some(PrimitiveBatch::RetainedShapes(start..end))
             }
+            PrimitiveKind::Marks => {
+                let start = self.marks_start;
+                let mut end = start + 1;
+                self.marks_iter.next();
+                while self
+                    .marks_iter
+                    .next_if(|draw| (draw.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.marks_start = end;
+                Some(PrimitiveBatch::Marks(start..end))
+            }
             PrimitiveKind::BackdropFilter => {
                 let start = self.backdrop_filters_start;
                 let mut end = start + 1;
@@ -1170,6 +1213,8 @@ pub enum PrimitiveBatch {
     Surfaces(Range<usize>),
     /// Draws of retained shape buffers, each its own draw call.
     RetainedShapes(Range<usize>),
+    /// Marks draws ([`Scene::marks`]), each its own draw call in the open pass.
+    Marks(Range<usize>),
     /// Backdrop filters, each read from and drawn back to the target in turn.
     BackdropFilters(Range<usize>),
     /// Groups ([`Scene::groups`]), each drawn offscreen and composited in turn.
@@ -1209,6 +1254,7 @@ impl PrimitiveBatch {
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
             Self::RetainedShapes(range) => format!("retained shapes ({})", range.len()),
+            Self::Marks(range) => format!("marks ({})", range.len()),
         }
     }
 }
@@ -2470,6 +2516,12 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
+}
+
+impl From<MarksDraw> for Primitive {
+    fn from(draw: MarksDraw) -> Self {
+        Primitive::Marks(draw)
+    }
 }
 
 impl From<RetainedShapesDraw> for Primitive {

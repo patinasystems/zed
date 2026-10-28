@@ -16,6 +16,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[path = "marks.rs"]
+mod marks;
 #[path = "retained_shapes.rs"]
 mod retained_shapes;
 
@@ -241,6 +243,8 @@ struct FrameScene<'a> {
     instance_bindings: InstanceBindings,
     /// The uniform slot of its first retained shape draw.
     retained_base: usize,
+    /// The frame's index of its first marks draw.
+    marks_base: usize,
 }
 
 impl<'a> FrameScenes<'a> {
@@ -441,6 +445,7 @@ struct WgpuResources {
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
     retained: retained_shapes::RetainedState,
+    marks: marks::MarksState,
     /// Group images and their blur and backdrop copies, reused across frames and
     /// freed when a frame does not use them.
     texture_pool: TexturePool,
@@ -1786,6 +1791,7 @@ impl WgpuRendererCore {
                 path_msaa_texture: None,
                 path_msaa_view: None,
                 retained: Default::default(),
+                marks: Default::default(),
                 texture_pool: TexturePool::default(),
                 group_globals: FxHashMap::default(),
                 group_frame: 0,
@@ -1968,6 +1974,7 @@ impl WgpuRendererCore {
         let retained_stride = self
             .prepare_retained_shapes(&viewports)
             .context("retained shapes")?;
+        self.prepare_marks(&viewports);
         let mut instance_offset = 0;
         // First, at offset 0: the WebGL texture transport indexes its texture
         // absolutely and quads index gradient records from 0.
@@ -1985,6 +1992,7 @@ impl WgpuRendererCore {
             gradients,
         };
         let mut retained_base = 0;
+        let mut marks_base = 0;
         for drawn in &scenes {
             let instance_bindings = self
                 .write_instances(drawn, &mut instance_offset)
@@ -2004,8 +2012,10 @@ impl WgpuRendererCore {
                 scene: drawn,
                 instance_bindings,
                 retained_base,
+                marks_base,
             });
             retained_base += drawn.retained_shapes.len();
+            marks_base += drawn.marks.len();
         }
         self.prepare_texture_bind_groups(&scenes);
 
@@ -2183,6 +2193,11 @@ impl WgpuRendererCore {
                     &scene.retained_shapes[range.clone()],
                     drawn.retained_base + range.start,
                     frame.retained_stride,
+                    open_pass(&mut pass, encoder, target),
+                ),
+                PrimitiveBatch::Marks(range) => self.draw_marks(
+                    &scene.marks[range.clone()],
+                    drawn.marks_base + range.start,
                     open_pass(&mut pass, encoder, target),
                 ),
                 PrimitiveBatch::BackdropFilters(range) => {
@@ -4515,6 +4530,45 @@ mod tests {
             image.save(std::path::Path::new(&dir).join("custom_shaders_wgpu.png"))?;
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
+        Ok(())
+    }
+
+    /// The shared marks scene on the wgpu backend, over a storage buffer on the
+    /// renderer's device; Metal draws the same probes.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn marks_render() -> anyhow::Result<()> {
+        use gpui::marks_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        use wgpu::util::DeviceExt as _;
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let buffer =
+            renderer
+                .context()
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("marks_test"),
+                    contents: &t::buffer_bytes(),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let (scene, probes) = t::scene(gpui::MarksBuffer::new(std::sync::Arc::new(buffer)));
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("marks_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
         Ok(())
     }
 
