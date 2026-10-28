@@ -312,6 +312,16 @@ impl WgpuRendererCore {
             // rest of a larger buffer as zeros.
             let binding_size =
                 |buffer: &wgpu::Buffer, offset: u64| (buffer.size() - offset).min(max_binding) & !3;
+            // wgpu binds whole words: a buffer with under four bytes past its offset
+            // cannot be bound at all.
+            if buffers
+                .iter()
+                .any(|(buffer, offset)| binding_size(buffer, *offset) == 0)
+            {
+                log::warn!("marks: a buffer has under 4 bytes past its offset");
+                state.frame.push(None);
+                continue;
+            }
             let missing = needs.iter().find(|(index, min)| {
                 buffers
                     .get(*index)
