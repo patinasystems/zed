@@ -839,6 +839,13 @@ impl HitboxId {
     }
 }
 
+/// The scroll event being dispatched: its id, and the axes a scroll container scrolled along.
+#[derive(Clone, Copy, Default)]
+struct ScrollDispatch {
+    id: u64,
+    consumed: Point<bool>,
+}
+
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [Window::insert_hitbox] for more details.
 #[derive(Clone, Debug, Deref)]
@@ -1449,6 +1456,7 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    scroll_dispatch: ScrollDispatch,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2359,6 +2367,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            scroll_dispatch: ScrollDispatch::default(),
             modifiers,
             capslock,
             scale_factor,
@@ -6745,6 +6754,27 @@ impl Window {
         )));
     }
 
+    /// The axes of the scroll event being dispatched that a scroll container has already
+    /// scrolled along. Like a browser, a wheel scrolls the innermost container under it that can
+    /// still move in each axis; an outer container skips the axes an inner one consumed, and
+    /// takes the rest (an inner container at its edge chains to it).
+    pub fn scroll_consumed(&self) -> Point<bool> {
+        self.scroll_dispatch.consumed
+    }
+
+    /// Marks axes of the scroll event being dispatched as scrolled; see [`Window::scroll_consumed`].
+    pub fn consume_scroll(&mut self, axes: Point<bool>) {
+        let consumed = &mut self.scroll_dispatch.consumed;
+        consumed.x |= axes.x;
+        consumed.y |= axes.y;
+    }
+
+    /// Identifies the scroll event being dispatched: every listener that one wheel reaches sees
+    /// the same id, and the next wheel a new one.
+    pub fn scroll_event_id(&self) -> u64 {
+        self.scroll_dispatch.id
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -7244,6 +7274,13 @@ impl Window {
             self.handle_inspector_mouse_event(event, cx);
             // When inspector is picking, all other mouse handling is skipped.
             return;
+        }
+
+        if event.is::<crate::ScrollEvent>() {
+            self.scroll_dispatch = ScrollDispatch {
+                id: self.scroll_dispatch.id.wrapping_add(1),
+                consumed: Point::default(),
+            };
         }
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);

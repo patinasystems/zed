@@ -2210,6 +2210,8 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    /// The scroll offset's range from the last prepaint, `-scroll_max..=0` per axis.
+    pub(crate) scroll_max: Cell<Point<Pixels>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2551,6 +2553,7 @@ impl Interactivity {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
+            self.scroll_max.set(scroll_max);
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
@@ -3413,6 +3416,7 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
+            let scroll_max = self.scroll_max.get();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
@@ -3430,24 +3434,44 @@ impl Interactivity {
                             .filter(&mut delta, event.touch_phase);
                     }
 
-                    let mut delta_x = match overflow.x {
-                        Overflow::Scroll if !delta.x.is_zero() => delta.x,
+                    // Each delta axis, and the wheel axis it comes from (a container that
+                    // scrolls in one axis takes the other's wheel).
+                    let (mut delta_x, x_from_y) = match overflow.x {
+                        Overflow::Scroll if !delta.x.is_zero() => (delta.x, false),
                         Overflow::Scroll
                             if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
                         {
-                            delta.y
+                            (delta.y, true)
                         }
-                        _ => Pixels::ZERO,
+                        _ => (Pixels::ZERO, false),
                     };
-                    let mut delta_y = match overflow.y {
-                        Overflow::Scroll if !delta.y.is_zero() => delta.y,
+                    let (mut delta_y, y_from_x) = match overflow.y {
+                        Overflow::Scroll if !delta.y.is_zero() => (delta.y, false),
                         Overflow::Scroll
                             if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
                         {
-                            delta.x
+                            (delta.x, true)
                         }
-                        _ => Pixels::ZERO,
+                        _ => (Pixels::ZERO, false),
                     };
+                    // As in a browser, the wheel scrolls the innermost container under it that
+                    // can still move, per axis: a container whose offset is at its edge in the
+                    // delta's direction (or whose wheel axis an inner container took) passes it
+                    // to the containers around it. The range is the last prepaint's.
+                    let consumed = window.scroll_consumed();
+                    // In f32: `Pixels` orders by `total_cmp`, where -0 < 0.
+                    let can_move = |offset: Pixels, delta: Pixels, max: Pixels| {
+                        let (offset, delta, max) = (offset.0, delta.0, max.0);
+                        (delta > 0. && offset < 0.) || (delta < 0. && offset > -max)
+                    };
+                    let x_taken = if x_from_y { consumed.y } else { consumed.x };
+                    if x_taken || !can_move(old_scroll_offset.x, delta_x, scroll_max.x) {
+                        delta_x = Pixels::ZERO;
+                    }
+                    let y_taken = if y_from_x { consumed.x } else { consumed.y };
+                    if y_taken || !can_move(old_scroll_offset.y, delta_y, scroll_max.y) {
+                        delta_y = Pixels::ZERO;
+                    }
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
                         if delta_x.abs() > delta_y.abs() {
                             delta_y = Pixels::ZERO;
@@ -3455,6 +3479,11 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
+                    let (moves_x, moves_y) = (!delta_x.is_zero(), !delta_y.is_zero());
+                    window.consume_scroll(point(
+                        (moves_x && !x_from_y) || (moves_y && y_from_x),
+                        (moves_y && !y_from_x) || (moves_x && x_from_y),
+                    ));
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
@@ -5850,6 +5879,115 @@ mod tests {
                 .child(div().w(px(50.)).h(px(500.)).flex_shrink_0())
         };
         assert_eq!(max_scroll_y(cx, clipped), px(0.));
+    }
+
+    /// A 100x100 vertical scroller over 300 px holding, at its top, a 100x100 scroller (both
+    /// axes) over `inner_content`.
+    struct NestedScrollers {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+        inner_content: Size<Pixels>,
+    }
+
+    impl Render for NestedScrollers {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("outer")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.outer)
+                    .child(
+                        div()
+                            .id("inner")
+                            .w(px(100.))
+                            .h(px(100.))
+                            .flex_shrink_0()
+                            .overflow_scroll()
+                            .track_scroll(&self.inner)
+                            .child(
+                                div()
+                                    .w(self.inner_content.width)
+                                    .h(self.inner_content.height)
+                                    .flex_shrink_0(),
+                            ),
+                    )
+                    .child(div().w(px(100.)).h(px(200.)).flex_shrink_0()),
+            )
+        }
+    }
+
+    fn nested_scrollers(
+        cx: &mut TestAppContext,
+        inner_content: Size<Pixels>,
+    ) -> (ScrollHandle, ScrollHandle, &mut crate::VisualTestContext) {
+        let (outer, inner) = (ScrollHandle::new(), ScrollHandle::new());
+        let (_, cx) = cx.add_window_view({
+            let (outer, inner) = (outer.clone(), inner.clone());
+            move |_, _| NestedScrollers {
+                outer,
+                inner,
+                inner_content,
+            }
+        });
+        cx.run_until_parked();
+        (outer, inner, cx)
+    }
+
+    fn wheel(cx: &mut crate::VisualTestContext, delta: Point<Pixels>) {
+        cx.simulate_event(ScrollEvent {
+            position: point(px(50.), px(50.)),
+            delta: crate::ScrollDelta::Pixels(delta),
+            ..Default::default()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    fn test_a_wheel_scrolls_only_the_innermost_scroller_that_can_move(cx: &mut TestAppContext) {
+        let (outer, inner, cx) = nested_scrollers(cx, size(px(100.), px(300.)));
+        wheel(cx, point(px(0.), px(-40.)));
+        assert_eq!(inner.offset().y, px(-40.));
+        assert_eq!(outer.offset().y, px(0.), "the outer scroller stays put");
+    }
+
+    #[gpui::test]
+    fn test_a_scroller_at_its_edge_passes_the_wheel_to_its_parent(cx: &mut TestAppContext) {
+        let (outer, inner, cx) = nested_scrollers(cx, size(px(100.), px(300.)));
+        // Down past the inner scroller's 200 px range: it stops at its edge.
+        wheel(cx, point(px(0.), px(-300.)));
+        assert_eq!(inner.offset().y, px(-200.));
+        assert_eq!(outer.offset().y, px(0.));
+        wheel(cx, point(px(0.), px(-40.)));
+        assert_eq!(inner.offset().y, px(-200.));
+        assert_eq!(
+            outer.offset().y,
+            px(-40.),
+            "the next wheel chains to the outer scroller"
+        );
+        // Up: the inner scroller can move again, and takes it.
+        wheel(cx, point(px(0.), px(30.)));
+        assert_eq!(inner.offset().y, px(-170.));
+        assert_eq!(outer.offset().y, px(-40.));
+    }
+
+    #[gpui::test]
+    fn test_a_wheel_chains_per_axis(cx: &mut TestAppContext) {
+        // The inner scroller overflows horizontally only.
+        let (outer, inner, cx) = nested_scrollers(cx, size(px(300.), px(100.)));
+        wheel(cx, point(px(0.), px(-40.)));
+        assert_eq!(inner.offset(), point(px(0.), px(0.)));
+        assert_eq!(outer.offset().y, px(-40.), "the vertical wheel passes up");
+        wheel(cx, point(px(-30.), px(0.)));
+        assert_eq!(
+            inner.offset().x,
+            px(-30.),
+            "the horizontal wheel stays inside"
+        );
+        assert_eq!(outer.offset().y, px(-40.));
     }
 
     struct ContentSizedGrid;
