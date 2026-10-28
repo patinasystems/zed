@@ -24,6 +24,9 @@ pub(crate) struct MarksPipeline {
     /// For each `_mslBufferSizes` member, in order, the storage buffer whose
     /// bound length it carries.
     sized_buffers: Vec<usize>,
+    /// Every storage buffer the program declares, and the fewest bytes it reads
+    /// (a fixed-size type's size, or one element of a runtime-sized array).
+    storage: Vec<(usize, u64)>,
 }
 
 /// What a resource declared in a module is.
@@ -56,7 +59,9 @@ fn resource_kind(module: &naga::Module, variable: &naga::GlobalVariable) -> Mark
 
 /// Translates `shader` (with the prelude) to MSL. Returns the source, the MSL
 /// names of the vertex and fragment entry points, and the sized buffers.
-pub(crate) fn translate(shader: &MarksShader) -> Result<(String, String, String, Vec<usize>)> {
+pub(crate) fn translate(
+    shader: &MarksShader,
+) -> Result<(String, String, String, Vec<usize>, Vec<(usize, u64)>)> {
     let source = shader.module_source();
     let module = naga::front::wgsl::parse_str(&source)
         .map_err(|error| anyhow!(error.emit_to_string(&source)))?;
@@ -67,9 +72,22 @@ pub(crate) fn translate(shader: &MarksShader) -> Result<(String, String, String,
     .validate(&module)
     .map_err(|error| anyhow!(error.emit_to_string(&source)))?;
     let mut sized_buffers = Vec::new();
+    let mut storage = Vec::new();
     for (_, variable) in module.global_variables.iter() {
         if let Some(binding) = &variable.binding {
             let kind = resource_kind(&module, variable);
+            let size = module.types[variable.ty]
+                .inner
+                .try_size(module.to_ctx())
+                .ok_or_else(|| anyhow!("@binding({}) is too large", binding.binding))?;
+            if binding.binding == 1 && size as usize > MARKS_UNIFORM_BYTES {
+                return Err(anyhow!(
+                    "@binding(1) declares {size} bytes of uniforms; marks take at most {MARKS_UNIFORM_BYTES}"
+                ));
+            }
+            if kind == MarksResource::StorageRead {
+                storage.push(((binding.binding - 2) as usize, u64::from(size)));
+            }
             if !gpui::marks_binding_allowed(
                 binding.group,
                 binding.binding,
@@ -162,6 +180,7 @@ pub(crate) fn translate(shader: &MarksShader) -> Result<(String, String, String,
         name("gpui_marks_vertex")?,
         name("gpui_marks_fragment")?,
         sized_buffers,
+        storage,
     ))
 }
 
@@ -171,7 +190,7 @@ pub(crate) fn build_pipeline(
     shader: &MarksShader,
     pixel_format: metal::MTLPixelFormat,
 ) -> Result<MarksPipeline> {
-    let (source, vertex_name, fragment_name, sized_buffers) = translate(shader)?;
+    let (source, vertex_name, fragment_name, sized_buffers, storage) = translate(shader)?;
     let library = device
         .new_library_with_source(&source, &metal::CompileOptions::new())
         .map_err(|error| anyhow!("compiling the marks program's MSL: {error}"))?;
@@ -200,6 +219,7 @@ pub(crate) fn build_pipeline(
     Ok(MarksPipeline {
         state,
         sized_buffers,
+        storage,
     })
 }
 
@@ -220,8 +240,8 @@ fn metal_buffers(draw: &MarksDraw) -> Option<Vec<(&metal::Buffer, u64)>> {
 
 /// Encodes `draw` into `encoder` (the frame's open pass). `textures` are its
 /// textures, resolved; `blank` stands in for missing ones. Returns false when it
-/// skipped the draw (a buffer it cannot bind, or a program bound to fewer buffers
-/// than it reads).
+/// skipped the draw: a buffer it cannot bind, or a storage binding the program
+/// declares that the draw leaves out or binds with fewer bytes than its type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode(
     encoder: &metal::RenderCommandEncoderRef,
@@ -240,6 +260,17 @@ pub(crate) fn encode(
         log::warn!("marks: a buffer is not a metal::Buffer or its offset is not 256-aligned");
         return false;
     };
+    for &(index, min) in &pipeline.storage {
+        let fits = buffers
+            .get(index)
+            .is_some_and(|(buffer, offset)| buffer.length() - offset >= min);
+        if !fits {
+            log::warn!(
+                "marks: storage buffer {index} is missing or under the {min} bytes its program reads"
+            );
+            return false;
+        }
+    }
     let mut sizes = [0u32; MAX_MARKS_BUFFERS];
     for (member, &index) in pipeline.sized_buffers.iter().enumerate() {
         let Some((buffer, offset)) = buffers.get(index) else {
@@ -331,10 +362,12 @@ mod tests {
 
     #[test]
     fn test_scene_program_translates_to_msl() {
-        let (msl, vertex, fragment, sized) =
+        let (msl, vertex, fragment, sized, storage) =
             translate(&MarksShader::new(gpui::marks_test_scene::RECTS)).unwrap();
         assert!(msl.contains(&vertex) && msl.contains(&fragment));
         assert_eq!(sized, vec![0]);
+        // One `Rect` (32 bytes) at least.
+        assert_eq!(storage, vec![(0, 32)]);
     }
 
     #[test]
@@ -351,6 +384,14 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return vec4<f32>(1.0); }";
 fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex { return gpui_mark_vertex(u.xy); }
 fn mark_fragment(input: MarkFragment) -> vec4<f32> { return vec4<f32>(1.0); }";
         assert!(translate(&MarksShader::new(extra)).is_err());
+        let big = "@group(0) @binding(1) var<uniform> u: array<vec4<f32>, 17>;
+fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex { return gpui_mark_vertex(u[16].xy); }
+fn mark_fragment(input: MarkFragment) -> vec4<f32> { return vec4<f32>(1.0); }";
+        let error = match translate(&MarksShader::new(big)) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("272 bytes of uniforms translated"),
+        };
+        assert!(error.contains("272"), "{error}");
     }
 
     #[test]

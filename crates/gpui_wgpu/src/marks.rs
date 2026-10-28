@@ -43,8 +43,13 @@ fn resource_kind(module: &naga::Module, variable: &naga::GlobalVariable) -> Mark
     }
 }
 
-/// Validates `shader` (with the prelude) as wgpu would compile it.
-pub(crate) fn validate(shader: &MarksShader) -> Result<String> {
+/// Every storage buffer a program declares, and the fewest bytes it reads (a
+/// fixed-size type's size, or one element of a runtime-sized array).
+type StorageNeeds = Vec<(usize, u64)>;
+
+/// Validates `shader` (with the prelude) as wgpu would compile it. Returns the
+/// module's source and its storage needs.
+pub(crate) fn validate(shader: &MarksShader) -> Result<(String, StorageNeeds)> {
     let source = shader.module_source();
     let module = naga::front::wgsl::parse_str(&source)
         .map_err(|error| anyhow::anyhow!(error.emit_to_string(&source)))?;
@@ -54,19 +59,34 @@ pub(crate) fn validate(shader: &MarksShader) -> Result<String> {
     )
     .validate(&module)
     .map_err(|error| anyhow::anyhow!(error.emit_to_string(&source)))?;
+    let mut storage = Vec::new();
     for (_, variable) in module.global_variables.iter() {
-        if let Some(binding) = &variable.binding
-            && !gpui::marks_binding_allowed(
-                binding.group,
-                binding.binding,
-                variable.name.as_deref(),
-                resource_kind(&module, variable),
-            )
-        {
+        let Some(binding) = &variable.binding else {
+            continue;
+        };
+        let kind = resource_kind(&module, variable);
+        if !gpui::marks_binding_allowed(
+            binding.group,
+            binding.binding,
+            variable.name.as_deref(),
+            kind,
+        ) {
             anyhow::bail!(gpui::marks_binding_error(binding.group, binding.binding));
         }
+        let size = module.types[variable.ty]
+            .inner
+            .try_size(module.to_ctx())
+            .ok_or_else(|| anyhow::anyhow!("@binding({}) is too large", binding.binding))?;
+        if binding.binding == 1 && size as usize > MARKS_UNIFORM_BYTES {
+            anyhow::bail!(
+                "@binding(1) declares {size} bytes of uniforms; marks take at most {MARKS_UNIFORM_BYTES}"
+            );
+        }
+        if kind == MarksResource::StorageRead {
+            storage.push(((binding.binding - 2) as usize, u64::from(size)));
+        }
     }
-    Ok(source)
+    Ok((source, storage))
 }
 
 /// Device objects every marks draw shares.
@@ -188,7 +208,10 @@ impl MarksGpu {
 pub(super) struct MarksState {
     gpu: Option<MarksGpu>,
     /// `None` for a program that failed to compile (logged once).
-    pipelines: FxHashMap<(MarksShaderId, gpui::MarksTopology), Option<wgpu::RenderPipeline>>,
+    pipelines: FxHashMap<
+        (MarksShaderId, gpui::MarksTopology),
+        Option<(wgpu::RenderPipeline, Rc<StorageNeeds>)>,
+    >,
     /// The frame's uniform ring.
     uniforms: Option<(wgpu::Buffer, u64)>,
     /// The frame's draws, in the order `prepare_marks` saw them: what to bind,
@@ -238,6 +261,7 @@ impl WgpuRendererCore {
         }
         let device = &resources.device;
         let queue = &resources.queue;
+        let max_binding = u64::from(device.limits().max_storage_buffer_binding_size);
         let gpu = state
             .gpu
             .get_or_insert_with(|| MarksGpu::new(device, queue));
@@ -269,17 +293,37 @@ impl WgpuRendererCore {
             let pipeline = state
                 .pipelines
                 .entry((draw.shader.id, draw.paint.topology))
-                .or_insert_with(|| build_pipeline(device, gpu, format, &draw.shader, draw.paint.topology))
+                .or_insert_with(|| {
+                    build_pipeline(device, gpu, format, &draw.shader, draw.paint.topology)
+                })
                 .clone();
-            let (Some(pipeline), Some(buffers)) = (pipeline, wgpu_buffers(draw)) else {
-                if wgpu_buffers(draw).is_none() {
-                    log::warn!(
-                        "marks: a buffer is not a STORAGE wgpu::Buffer or its offset is not 256-aligned"
-                    );
-                }
+            let Some((pipeline, needs)) = pipeline else {
                 state.frame.push(None);
                 continue;
             };
+            let Some(buffers) = wgpu_buffers(draw) else {
+                log::warn!(
+                    "marks: a buffer is not a STORAGE wgpu::Buffer or its offset is not 256-aligned"
+                );
+                state.frame.push(None);
+                continue;
+            };
+            // A storage binding takes at most the device's limit; the program sees the
+            // rest of a larger buffer as zeros.
+            let binding_size =
+                |buffer: &wgpu::Buffer, offset: u64| (buffer.size() - offset).min(max_binding) & !3;
+            let missing = needs.iter().find(|(index, min)| {
+                buffers
+                    .get(*index)
+                    .is_none_or(|(buffer, offset)| binding_size(buffer, *offset) < *min)
+            });
+            if let Some((index, min)) = missing {
+                log::warn!(
+                    "marks: storage buffer {index} is missing or under the {min} bytes its program reads"
+                );
+                state.frame.push(None);
+                continue;
+            }
             let uniforms = draw.uniforms(viewport);
             bytes[at as usize..(at + MARKS_UNIFORMS_SIZE) as usize]
                 .copy_from_slice(uniforms.as_bytes());
@@ -319,7 +363,7 @@ impl WgpuRendererCore {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer,
                         offset,
-                        size: None,
+                        size: NonZeroU64::new(binding_size(buffer, offset)),
                     }),
                 });
             }
@@ -375,15 +419,15 @@ fn build_pipeline(
     format: wgpu::TextureFormat,
     shader: &MarksShader,
     topology: gpui::MarksTopology,
-) -> Option<wgpu::RenderPipeline> {
-    let source = validate(shader)
+) -> Option<(wgpu::RenderPipeline, Rc<StorageNeeds>)> {
+    let (source, needs) = validate(shader)
         .inspect_err(|error| log::error!("marks program: {error:#}"))
         .ok()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("marks"),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
-    Some(
+    Some((
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("marks"),
             layout: Some(&gpu.pipeline_layout),
@@ -415,7 +459,8 @@ fn build_pipeline(
             multiview_mask: None,
             cache: None,
         }),
-    )
+        Rc::new(needs),
+    ))
 }
 
 #[cfg(test)]
@@ -424,7 +469,18 @@ mod tests {
 
     #[test]
     fn test_scene_program_validates() {
-        validate(&MarksShader::new(gpui::marks_test_scene::RECTS)).unwrap();
+        let (_, storage) = validate(&MarksShader::new(gpui::marks_test_scene::RECTS)).unwrap();
+        assert_eq!(storage, vec![(0, 32)]);
+    }
+
+    #[test]
+    fn programs_take_at_most_256_bytes_of_uniforms() {
+        let big = "struct Big { values: array<vec4<f32>, 17> }
+@group(0) @binding(1) var<uniform> big: Big;
+fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex { return gpui_mark_vertex(big.values[0].xy); }
+fn mark_fragment(input: MarkFragment) -> vec4<f32> { return vec4<f32>(1.0); }";
+        let error = validate(&MarksShader::new(big)).unwrap_err().to_string();
+        assert!(error.contains("272"), "{error}");
     }
 
     #[test]
