@@ -6211,7 +6211,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                exact_scale: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -6370,6 +6370,7 @@ impl Window {
             tile,
             grayscale,
             transformation,
+            true,
         );
         Ok(())
     }
@@ -6406,6 +6407,7 @@ impl Window {
             tile,
             false,
             TransformationMatrix::unit(),
+            false,
         );
     }
 
@@ -6456,7 +6458,9 @@ impl Window {
     }
 
     /// The sprite for `tile` (an image's) drawn over `image_bounds`, clipped
-    /// to `visible_bounds`, which lies inside it.
+    /// to `visible_bounds`, which lies inside it. With `exact`, a tile drawn at a whole
+    /// number of device pixels per texel, with no rotation or scale, samples texel centres
+    /// (as browsers draw images at integer scales) instead of filtering between texels.
     fn paint_tile(
         &mut self,
         visible_bounds: Bounds<Pixels>,
@@ -6465,7 +6469,20 @@ impl Window {
         tile: AtlasTile,
         grayscale: bool,
         transformation: TransformationMatrix,
+        exact: bool,
     ) {
+        let transformation = self.device_element_transformation().compose(transformation);
+        let exact_scale = exact
+            && transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
+            && {
+                let scale_factor = self.scale_factor();
+                let whole = |drawn: Pixels, texels: DevicePixels| {
+                    let ratio = drawn.0 * scale_factor / texels.0 as f32;
+                    ratio >= 1. - 1e-3 && (ratio - ratio.round()).abs() < 1e-3
+                };
+                whole(image_bounds.size.width, tile.bounds.size.width)
+                    && whole(image_bounds.size.height, tile.bounds.size.height)
+            };
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
@@ -6516,14 +6533,14 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            exact_scale: exact_scale as u32,
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
             tile: sub_tile,
             opacity,
-            transformation: self.device_element_transformation().compose(transformation),
+            transformation,
         });
     }
 

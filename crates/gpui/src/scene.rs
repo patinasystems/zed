@@ -2443,7 +2443,10 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// Nonzero for an image drawn at a whole number of device pixels per texel with no
+    /// rotation or scale: the fragment shader samples texel centres, so the image's own hard
+    /// edges stay hard instead of blending into the neighbouring texel's color.
+    pub exact_scale: u32,
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
@@ -4246,7 +4249,7 @@ mod tests {
     ) -> PolychromeSprite {
         PolychromeSprite {
             order: 0,
-            pad: 0,
+            exact_scale: 0,
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,

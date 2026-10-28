@@ -1614,7 +1614,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 struct PolychromeSprite {
     order: u32,
-    pad: u32,
+    exact_scale: u32,
     tile: AtlasTile,
     grayscale: u32,
     opacity: f32,
@@ -1653,7 +1653,14 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sprite = load_poly_sprite(input.sprite_id);
     // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
     // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
-    let sample = textureSample(t_sprite, s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
+    var tile_position = clamp_to_tile(input.tile_position, sprite.tile);
+    // At a whole number of device pixels per texel, sample texel centres: the image's own
+    // hard edges stay hard, as browsers draw images at integer scales.
+    if (sprite.exact_scale != 0u) {
+        let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+        tile_position = (floor(tile_position * atlas_size) + vec2<f32>(0.5)) / atlas_size;
+    }
+    let sample = textureSample(t_sprite, s_sprite, tile_position);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);

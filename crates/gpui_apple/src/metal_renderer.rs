@@ -3065,7 +3065,7 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            exact_scale: 0,
             tile,
             grayscale: PaddedBool32::from(false),
             opacity: 1.,
@@ -3082,6 +3082,57 @@ mod tests {
             assert!(p[3] >= 254 && p[1] >= 126 && p[0] <= 1, "pixel ({x}, {y}) is {p:?}");
         }
         assert_eq!(image.get_pixel(2, 2).0[3], 0, "nothing outside the sprite");
+    }
+
+    #[test]
+    fn images_at_whole_scales_keep_their_hard_edges() {
+        // A 1x2 image (green over transparent) drawn 2x: with `exact_scale` each texel fills its
+        // 2x2 device pixels; without it, linear filtering bleeds a quarter of the green into the
+        // first transparent row.
+        use gpui::{
+            AtlasKey, Bounds, ContentMask, Corners, ImageId, PaddedBool32, PolychromeSprite,
+            RenderImageParams, ScaledPixels, TransformationMatrix,
+        };
+        let draw = |exact_scale: u32| {
+            let mut renderer = MetalHeadlessRenderer::new();
+            renderer.renderer.update_transparency(true);
+            let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+            // BGRA rows: opaque green, then transparent.
+            let pixels: [u8; 8] = [0, 128, 0, 255, 0, 0, 0, 0];
+            let tile = atlas
+                .get_or_insert_with(
+                    AtlasKey::Image(RenderImageParams { image_id: ImageId(2), frame_index: 0 }),
+                    &mut || Ok(Some((size(DevicePixels(1), DevicePixels(2)), std::borrow::Cow::Borrowed(&pixels[..])))),
+                )
+                .expect("insert")
+                .expect("tile");
+            let all = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(8.), ScaledPixels(8.)));
+            let mut scene = Scene::default();
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                exact_scale,
+                tile,
+                grayscale: PaddedBool32::from(false),
+                opacity: 1.,
+                bounds: Bounds::new(point(ScaledPixels(2.), ScaledPixels(2.)), size(ScaledPixels(2.), ScaledPixels(4.))),
+                content_mask: ContentMask::from(all),
+                corner_radii: Corners::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+            scene.finish();
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size(DevicePixels(8), DevicePixels(8)))
+                .expect("render")
+        };
+        let exact = draw(1);
+        for y in [2, 3] {
+            let p = exact.get_pixel(2, y).0;
+            assert!(p[3] >= 254 && p[1] >= 126, "green row at y {y}: {p:?}");
+        }
+        for y in [4, 5] {
+            assert_eq!(exact.get_pixel(2, y).0[3], 0, "transparent row at y {y}");
+        }
+        // Filtered, the device row just past the edge picks up green.
+        assert!(draw(0).get_pixel(2, 4).0[3] > 0, "linear filtering blends across the edge");
     }
 
     #[test]

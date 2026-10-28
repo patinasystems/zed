@@ -1349,7 +1349,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
 struct PolychromeSprite {
     uint order;
-    uint pad;
+    uint exact_scale;
     AtlasTile tile;
     uint grayscale;
     float opacity;
@@ -1402,7 +1402,15 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
     // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
-    float4 sample = t_sprite.Sample(s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
+    float2 tile_position = clamp_to_tile(input.tile_position, sprite.tile);
+    // At a whole number of device pixels per texel, sample texel centres: the image's own
+    // hard edges stay hard, as browsers draw images at integer scales.
+    if (sprite.exact_scale != 0u) {
+        float2 atlas_size;
+        t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+        tile_position = (floor(tile_position * atlas_size) + 0.5) / atlas_size;
+    }
+    float4 sample = t_sprite.Sample(s_sprite, tile_position);
     float distance = quad_sdf(input.sprite_position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
