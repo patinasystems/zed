@@ -642,6 +642,26 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let element_transformation = window.element_transformation();
 
+                // A cached view inside one drawing again draws again too (its parent may have
+                // changed it without notifying), unless it is isolated: an isolated view draws
+                // again only when notified. Not inside a deferred draw, nor while accessibility
+                // is on (a reused frame does not replay its accessibility nodes). Its element
+                // state's ranges are from the last frame that visited it; a frame that reused
+                // its ancestor moved it, and its record (which reuses carry) has where it is.
+                let kept_by_ancestor = !window.ancestor_drawn
+                    || (island.is_some()
+                        && !window.prepainting_deferred
+                        && !window.a11y.is_active()
+                        && window.rendered_island(global_id.unwrap(), entity_id).is_some());
+                let mut element_state = element_state;
+                if window.ancestor_drawn
+                    && kept_by_ancestor
+                    && let Some(state) = element_state.as_mut()
+                    && let Some((prepaint, paint)) = window.rendered_island(global_id.unwrap(), entity_id)
+                {
+                    state.prepaint_range = prepaint;
+                    state.paint_range = paint;
+                }
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
@@ -649,6 +669,7 @@ fn prepaint_view(
                     && element_state.cache_key.element_transformation == element_transformation
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && kept_by_ancestor
                 {
                     let prepaint_start = window.prepaint_index();
                     let splices = reuse_prepaint_around_islands(
@@ -664,7 +685,7 @@ fn prepaint_view(
                     return ((None, splices, prepaint_start..prepaint_end), element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                let ancestor_drawn = mem::replace(&mut window.ancestor_drawn, true);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -674,7 +695,7 @@ fn prepaint_view(
                 });
 
                 let prepaint_end = window.prepaint_index();
-                window.refreshing = refreshing;
+                window.ancestor_drawn = ancestor_drawn;
 
                 (
                     (
@@ -804,9 +825,9 @@ fn paint_view(
                     let paint_start = window.paint_index();
 
                     if let Some(element) = prepaint.element.as_mut() {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let ancestor_drawn = mem::replace(&mut window.ancestor_drawn, true);
                         element.paint(window, cx);
-                        window.refreshing = refreshing;
+                        window.ancestor_drawn = ancestor_drawn;
                     } else {
                         // Reused, with the isolated views drawn again in their places.
                         let mut at = element_state.paint_range.start.clone();
@@ -1279,6 +1300,122 @@ mod isolation_tests {
             cx.run_until_parked();
             assert_eq!((shell_renders.get(), pad_renders.get()), (s0, p0), "{name}: nothing draws");
         }
+    }
+
+    /// An isolated view of `count` lines of text and quads, drawn before the frame: it moves
+    /// what follows it in the frame's lists when it draws again.
+    struct Lines {
+        count: usize,
+    }
+
+    impl Render for Lines {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children((0..self.count).map(|i| div().h(px(10.)).bg(rgb(0x101010)).child(format!("line {i}"))))
+        }
+    }
+
+    /// An isolated leaf with text.
+    struct Leaf {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Leaf {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().id("leaf").debug_selector(|| "LEAF".into()).size_full().bg(rgb(0x0000ff)).child("leaf text")
+        }
+    }
+
+    /// An isolated view with an isolated leaf inside it.
+    struct Frame {
+        renders: Rc<Cell<usize>>,
+        color: Hsla,
+        leaf: Entity<Leaf>,
+    }
+
+    impl Render for Frame {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .id("frame")
+                .debug_selector(|| "FRAME".into())
+                .size_full()
+                .bg(self.color)
+                .child("frame text")
+                .child(div().size(px(100.)).child(self.leaf.clone().isolated(StyleRefinement::default().size_full())))
+                .child(div().id("frame-after").debug_selector(|| "FRAME_AFTER".into()).size(px(20.)).bg(rgb(0x00ff00)))
+        }
+    }
+
+    struct FrameShell {
+        renders: Rc<Cell<usize>>,
+        lines: Entity<Lines>,
+        frame: Entity<Frame>,
+    }
+
+    impl Render for FrameShell {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .child(div().w(px(100.)).h_full().child(self.lines.clone().isolated(StyleRefinement::default().size_full())))
+                .child(div().size(px(300.)).child(self.frame.clone().isolated(StyleRefinement::default().size_full())))
+        }
+    }
+
+    #[gpui::test]
+    fn an_isolated_view_inside_one_drawing_again_is_reused(cx: &mut TestAppContext) {
+        let (shell_renders, frame_renders, leaf_renders) =
+            (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let lines = cx.new(|_| Lines { count: 2 });
+            let leaf = cx.new(|_| Leaf { renders: leaf_renders.clone() });
+            let frame = cx.new(|_| Frame { renders: frame_renders.clone(), color: rgb(0x880000).into(), leaf });
+            FrameShell { renders: shell_renders.clone(), lines, frame }
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let (lines, frame) = shell.update(cx, |s, _| (s.lines.clone(), s.frame.clone()));
+        let leaf = frame.update(cx, |f, _| f.leaf.clone());
+        let before = (bounds(cx, "FRAME"), bounds(cx, "LEAF"), bounds(cx, "FRAME_AFTER"));
+        assert!(before.1.is_some());
+        let s0 = shell_renders.get();
+        let blue: Hsla = rgb(0x0000ff).into();
+        for (k, (color, count)) in [(0x111111u32, 7usize), (0x222222, 0), (0x333333, 12), (0x444444, 3)].into_iter().enumerate() {
+            // Text and quads before the frame grow or shrink: the frame and its leaf move in
+            // the frame's lists, reused around the lines.
+            lines.update(cx, |l, cx| {
+                l.count = count;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let (f0, l0) = (frame_renders.get(), leaf_renders.get());
+            frame.update(cx, |f, cx| {
+                f.color = rgb(color).into();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(frame_renders.get(), f0 + 1, "round {k}: the frame draws again");
+            assert_eq!(leaf_renders.get(), l0, "round {k}: the leaf inside it is reused");
+            assert_eq!(shell_renders.get(), s0, "round {k}: the shell is reused");
+            let colors = quad_colors(cx);
+            let (new, green): (Hsla, Hsla) = (rgb(color).into(), rgb(0x00ff00).into());
+            let at = |c: Hsla| colors.iter().position(|x| *x == c);
+            assert_eq!(colors.iter().filter(|c| **c == blue).count(), 1, "round {k}: the leaf, once: {colors:?}");
+            assert!(at(new) < at(blue) && at(blue) < at(green), "round {k}: paint order kept: {colors:?}");
+            assert_eq!((bounds(cx, "FRAME"), bounds(cx, "LEAF"), bounds(cx, "FRAME_AFTER")), before, "round {k}: same places");
+            // The leaf still redraws alone.
+            leaf.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!((leaf_renders.get(), frame_renders.get(), shell_renders.get()), (l0 + 1, f0 + 1, s0), "round {k}: the leaf alone");
+        }
+        // A refresh draws everything again.
+        let (f0, l0) = (frame_renders.get(), leaf_renders.get());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(frame_renders.get() > f0 && leaf_renders.get() > l0, "a refresh draws the isolated views again");
     }
 
     use crate as gpui;

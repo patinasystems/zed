@@ -1524,11 +1524,14 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// A cached view is drawing again: the cached views inside it draw again too, except
+    /// isolated ones that were not notified (see [`crate::ViewElement::isolated`]).
+    pub(crate) ancestor_drawn: bool,
     /// The root view is drawn cached (see [`Window::set_root_cached`]).
     root_cached: bool,
     /// Deferred draws are being prepainted: an isolated view drawn now is not
     /// drawn again alone (see [`Island::deferred`]).
-    prepainting_deferred: bool,
+    pub(crate) prepainting_deferred: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2438,6 +2441,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            ancestor_drawn: false,
             root_cached: false,
             prepainting_deferred: false,
             activation_observers: SubscriberSet::new(),
@@ -4038,6 +4042,7 @@ impl Window {
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
+        self.ancestor_drawn = false;
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
@@ -4801,6 +4806,20 @@ impl Window {
         parent: Option<DispatchNodeId>,
     ) {
         self.next_frame.dispatch_tree.close_until(cursor, parent);
+    }
+
+    /// Where the last frame drew the isolated view `view_id` mounted at `global_id` (its prepaint
+    /// and paint ranges in that frame), if it drew it.
+    pub(crate) fn rendered_island(
+        &self,
+        global_id: &GlobalElementId,
+        view_id: EntityId,
+    ) -> Option<(Range<PrepaintStateIndex>, Range<PaintIndex>)> {
+        self.rendered_frame
+            .islands
+            .iter()
+            .find(|i| &i.global_id == global_id && i.view_id == view_id && i.painted && !i.deferred)
+            .map(|i| (i.prepaint_range.clone(), i.paint_range.clone()))
     }
 
     /// Has this frame recorded the isolated view mounted at `global_id`?
