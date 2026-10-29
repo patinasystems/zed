@@ -302,8 +302,8 @@ impl WgpuRendererCore {
                 continue;
             };
             let Some(buffers) = wgpu_buffers(draw) else {
-                log::warn!(
-                    "marks: a buffer is not a STORAGE wgpu::Buffer or its offset is not 256-aligned"
+                draw.shader.report_skipped_draw(
+                    "a buffer is not a STORAGE wgpu::Buffer or its offset is not 256-aligned",
                 );
                 state.frame.push(None);
                 continue;
@@ -318,7 +318,8 @@ impl WgpuRendererCore {
                 .iter()
                 .any(|(buffer, offset)| binding_size(buffer, *offset) == 0)
             {
-                log::warn!("marks: a buffer has under 4 bytes past its offset");
+                draw.shader
+                    .report_skipped_draw("a buffer has under 4 bytes past its offset");
                 state.frame.push(None);
                 continue;
             }
@@ -328,9 +329,9 @@ impl WgpuRendererCore {
                     .is_none_or(|(buffer, offset)| binding_size(buffer, *offset) < *min)
             });
             if let Some((index, min)) = missing {
-                log::warn!(
-                    "marks: storage buffer {index} is missing or under the {min} bytes its program reads"
-                );
+                draw.shader.report_skipped_draw(format!(
+                    "storage buffer {index} is missing or under the {min} bytes its program reads"
+                ));
                 state.frame.push(None);
                 continue;
             }
@@ -431,7 +432,7 @@ fn build_pipeline(
     topology: gpui::MarksTopology,
 ) -> Option<(wgpu::RenderPipeline, Rc<StorageNeeds>)> {
     let (source, needs) = validate(shader)
-        .inspect_err(|error| log::error!("marks program: {error:#}"))
+        .inspect_err(|error| shader.report_compile_error(format!("{error:#}")))
         .ok()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("marks"),

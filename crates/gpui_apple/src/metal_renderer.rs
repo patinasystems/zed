@@ -1438,7 +1438,8 @@ impl MetalRenderer {
     }
 
     /// Draws marks into the open pass: no pass, upload or copy of their own.
-    /// Programs compile on first use; one that fails to compile draws nothing.
+    /// Programs compile on first use; one that fails to compile draws nothing,
+    /// and says so ([`gpui::MarksShader::report_compile_error`]).
     fn draw_marks(
         &mut self,
         draws: &[gpui::MarksDraw],
@@ -1458,7 +1459,7 @@ impl MetalRenderer {
                         &draw.shader,
                         MTLPixelFormat::BGRA8Unorm,
                     )
-                    .inspect_err(|error| log::error!("marks program: {error:#}"))
+                    .inspect_err(|error| draw.shader.report_compile_error(format!("{error:#}")))
                     .ok()
                 });
             let Some(pipeline) = pipeline.as_ref() else {
@@ -3783,6 +3784,35 @@ mod tests {
             MTLResourceOptions::StorageModeShared,
         );
         gpui::MarksBuffer::new(Arc::new(buffer))
+    }
+
+    /// A program Metal cannot build says so: [`gpui::MarksShader::compile_error`],
+    /// and a panic in debug builds. So does a draw bound to a buffer smaller
+    /// than its program reads.
+    #[test]
+    fn marks_failures_are_reported() {
+        use gpui::marks_test_scene as t;
+        let px = size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let buffer = marks_buffer(&renderer.renderer.device, &t::buffer_bytes());
+        let broken = t::broken("metal");
+        t::expect_report(|| {
+            let scene = t::one_draw(broken.clone(), buffer.clone());
+            let _ = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, px);
+        });
+        let error = broken.compile_error().expect("the failure is recorded");
+        assert!(error.contains("target"), "{error}");
+
+        let mut renderer = MetalHeadlessRenderer::new();
+        let small = marks_buffer(&renderer.renderer.device, &[0u8; 16]);
+        let rects = t::rects("metal small buffer");
+        t::expect_report(|| {
+            let scene = t::one_draw(rects.clone(), small);
+            let _ = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, px);
+        });
+        let (skipped, why) = rects.skipped_draws();
+        assert!(skipped >= 1 && why.as_deref().is_some_and(|w| w.contains("32 bytes")), "{skipped} {why:?}");
+        assert_eq!(t::rects("metal fine").compile_error(), None);
     }
 
     #[test]

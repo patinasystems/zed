@@ -257,7 +257,8 @@ pub(crate) fn encode(
         return true;
     };
     let Some(buffers) = metal_buffers(draw) else {
-        log::warn!("marks: a buffer is not a metal::Buffer or its offset is not 256-aligned");
+        draw.shader
+            .report_skipped_draw("a buffer is not a metal::Buffer or its offset is not 256-aligned");
         return false;
     };
     for &(index, min) in &pipeline.storage {
@@ -265,16 +266,18 @@ pub(crate) fn encode(
             .get(index)
             .is_some_and(|(buffer, offset)| buffer.length() - offset >= min);
         if !fits {
-            log::warn!(
-                "marks: storage buffer {index} is missing or under the {min} bytes its program reads"
-            );
+            draw.shader.report_skipped_draw(format!(
+                "storage buffer {index} is missing or under the {min} bytes its program reads"
+            ));
             return false;
         }
     }
     let mut sizes = [0u32; MAX_MARKS_BUFFERS];
     for (member, &index) in pipeline.sized_buffers.iter().enumerate() {
         let Some((buffer, offset)) = buffers.get(index) else {
-            log::warn!("marks: the program reads buffer {index}, which the draw does not bind");
+            draw.shader.report_skipped_draw(format!(
+                "the program reads buffer {index}, which the draw does not bind"
+            ));
             return false;
         };
         sizes[member] = (buffer.length() - offset).min(u64::from(u32::MAX)) as u32;

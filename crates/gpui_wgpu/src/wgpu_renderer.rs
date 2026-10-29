@@ -4572,6 +4572,51 @@ mod tests {
         Ok(())
     }
 
+    /// A program wgpu cannot build says so ([`gpui::MarksShader::compile_error`],
+    /// and a panic in debug builds), and so does a draw bound to a buffer
+    /// smaller than its program reads.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn marks_failures_are_reported() -> anyhow::Result<()> {
+        use gpui::marks_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        use wgpu::util::DeviceExt as _;
+        let px = Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) };
+        let new = || WgpuHeadlessRenderer::new();
+        let mut renderer = match new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let buffer = |renderer: &WgpuHeadlessRenderer, bytes: &[u8]| {
+            let buffer = renderer.context().device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("marks_test"),
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            gpui::MarksBuffer::new(std::sync::Arc::new(buffer))
+        };
+        let broken = t::broken("wgpu");
+        let full = buffer(&renderer, &t::buffer_bytes());
+        t::expect_report(|| {
+            let _ = renderer.render_scene_to_image(&t::one_draw(broken.clone(), full), px);
+        });
+        let error = broken.compile_error().expect("the failure is recorded");
+        assert!(error.contains("target"), "{error}");
+
+        let mut renderer = new()?;
+        let small = buffer(&renderer, &[0u8; 16]);
+        let rects = t::rects("wgpu small buffer");
+        t::expect_report(|| {
+            let _ = renderer.render_scene_to_image(&t::one_draw(rects.clone(), small), px);
+        });
+        let (skipped, why) = rects.skipped_draws();
+        assert!(skipped >= 1 && why.as_deref().is_some_and(|w| w.contains("32 bytes")), "{skipped} {why:?}");
+        Ok(())
+    }
+
     /// The shared transformed scene on the wgpu backend; it must also match Metal's
     /// rendering pixel for pixel within the probe tolerance.
     #[cfg(not(target_family = "wasm"))]

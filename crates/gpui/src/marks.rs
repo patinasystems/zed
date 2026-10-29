@@ -84,6 +84,64 @@ impl MarksShader {
     pub fn module_source(&self) -> String {
         format!("{MARKS_PRELUDE}\n{}", self.source)
     }
+
+    /// Why a renderer could not build this program, if one could not. A
+    /// program that fails to build draws nothing; hosts and tests read this
+    /// rather than a log.
+    pub fn compile_error(&self) -> Option<String> {
+        marks_reports().get(&self.id).and_then(|r| r.compile_error.clone())
+    }
+
+    /// How many draws of this program a renderer skipped (a buffer missing,
+    /// misaligned or too small for what the program reads), and why the last
+    /// one was.
+    pub fn skipped_draws(&self) -> (u64, Option<String>) {
+        marks_reports()
+            .get(&self.id)
+            .map_or((0, None), |r| (r.skipped, r.last_skip.clone()))
+    }
+
+    /// For renderers: this program failed to build. Recorded for
+    /// [`Self::compile_error`], logged as an error, and a panic in debug
+    /// builds, so a broken program cannot pass unnoticed.
+    pub fn report_compile_error(&self, error: impl std::fmt::Display) {
+        let error = error.to_string();
+        log::error!("marks program {:x} will not draw: {error}", self.id.0);
+        marks_reports().entry(self.id).or_default().compile_error = Some(error.clone());
+        debug_assert!(false, "marks program {:x} will not draw: {error}", self.id.0);
+    }
+
+    /// For renderers: a draw of this program was skipped because of how it
+    /// was bound. Counted for [`Self::skipped_draws`], logged as a warning,
+    /// and a panic in debug builds: the caller bound the draw wrongly.
+    pub fn report_skipped_draw(&self, reason: impl std::fmt::Display) {
+        let reason = reason.to_string();
+        log::warn!("marks program {:x}: draw skipped: {reason}", self.id.0);
+        {
+            let mut reports = marks_reports();
+            let report = reports.entry(self.id).or_default();
+            report.skipped += 1;
+            report.last_skip = Some(reason.clone());
+        }
+        debug_assert!(false, "marks program {:x}: draw skipped: {reason}", self.id.0);
+    }
+}
+
+/// What renderers reported about one program.
+#[derive(Default)]
+struct MarksReport {
+    compile_error: Option<String>,
+    skipped: u64,
+    last_skip: Option<String>,
+}
+
+/// Reports by program: renderers cache pipelines by [`MarksShaderId`], so a
+/// failure belongs to every [`MarksShader`] with that source. Touched only
+/// when something fails or a host asks.
+fn marks_reports() -> std::sync::MutexGuard<'static, collections::HashMap<MarksShaderId, MarksReport>> {
+    static REPORTS: std::sync::LazyLock<std::sync::Mutex<collections::HashMap<MarksShaderId, MarksReport>>> =
+        std::sync::LazyLock::new(Default::default);
+    REPORTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What a resource declared in a marks module is, for [`marks_binding_allowed`].
@@ -561,11 +619,67 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> {
         ];
         (scene, probes)
     }
+
+    /// A program no renderer builds: `target` is a reserved word in WGSL.
+    /// `tag` makes the source (and so its reports) unique to one test.
+    pub fn broken(tag: &str) -> MarksShader {
+        MarksShader::new(format!(
+            "// {tag}
+fn mark_vertex(vertex: u32, instance: u32) -> MarkVertex {{ let target = 1.0; return gpui_mark_vertex(vec2<f32>(target)); }}
+fn mark_fragment(input: MarkFragment) -> vec4<f32> {{ return input.color; }}"
+        ))
+    }
+
+    /// [`RECTS`] under a unique source (see [`broken`]).
+    pub fn rects(tag: &str) -> MarksShader {
+        MarksShader::new(format!("// {tag}\n{RECTS}"))
+    }
+
+    /// One draw of `shader` over instances 0..2, its buffer `buffer`.
+    pub fn one_draw(shader: MarksShader, buffer: MarksBuffer) -> Scene {
+        let full = bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32);
+        let mut scene = Scene::default();
+        scene.insert_primitive(MarksDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask::from(full),
+            shader,
+            bindings: MarksBindings::buffers([buffer]).uniforms(tint([1.; 4])),
+            paint: MarksPaint::new(0..2, 6, TransformationMatrix::unit()),
+            opacity: 1.,
+        });
+        scene.finish();
+        scene
+    }
+
+    /// Runs `render`, which must report a failure: a panic in debug builds
+    /// (the report's assert), nothing in release.
+    pub fn expect_report(render: impl FnOnce()) {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render));
+        assert_eq!(caught.is_err(), cfg!(debug_assertions), "a debug build panics on the report");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report reaches every shader with the same source, and a debug
+    /// build stops on it.
+    #[test]
+    fn reports_are_kept_by_program() {
+        use marks_test_scene as t;
+        let a = t::broken("reports_are_kept_by_program");
+        let b = t::broken("reports_are_kept_by_program");
+        assert_eq!(a.compile_error(), None);
+        t::expect_report(|| a.report_compile_error("no good"));
+        assert_eq!(b.compile_error().as_deref(), Some("no good"));
+        let r = t::rects("reports_are_kept_by_program");
+        t::expect_report(|| r.report_skipped_draw("one"));
+        t::expect_report(|| r.report_skipped_draw("two"));
+        assert_eq!(r.skipped_draws(), (2, Some("two".into())));
+        assert_eq!(t::rects("another").skipped_draws(), (0, None));
+    }
 
     #[test]
     fn uniforms_layout_matches_the_prelude() {
