@@ -3029,17 +3029,20 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                // A press or release changes nothing outside this element's view: that view
+                // draws again (alone, when it is isolated), not the whole window.
+                let current_view = window.current_view();
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
                     let has_aux_click_listeners = !aux_click_listeners.is_empty();
-                    move |event: &MouseDownEvent, phase, window, _cx| {
+                    move |event: &MouseDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble
                             && (event.button == MouseButton::Left || has_aux_click_listeners)
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
-                            window.refresh();
+                            cx.notify(current_view);
                         }
                     }
                 });
@@ -3173,7 +3176,7 @@ impl Interactivity {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                             if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
                                 captured_mouse_down = pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(current_view);
                             } else if pending_mouse_down.is_some() {
                                 // Clear the pending mouse down event (without firing click handlers)
                                 // if the hitbox is not being hovered.
@@ -3181,7 +3184,7 @@ impl Interactivity {
                                 // immediately after being clicked.
                                 // See https://github.com/zed-industries/zed/issues/24600 for more details
                                 pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(current_view);
                             }
                         }
                         // Fire click handlers during the bubble phase.
@@ -3319,12 +3322,19 @@ impl Interactivity {
                 .get_or_insert_with(Default::default)
                 .clone();
 
+            // Only an element with an active style looks different while pressed: its view draws
+            // again (alone, when it is isolated). Others keep the state without drawing.
+            let has_active_style =
+                self.active_style.is_some() || self.group_active_style.is_some();
+            let current_view = window.current_view();
             {
                 let active_state = active_state.clone();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
+                        if has_active_style {
+                            cx.notify(current_view);
+                        }
                     }
                 });
             }
@@ -3335,7 +3345,7 @@ impl Interactivity {
                     .as_ref()
                     .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
                 let hitbox = hitbox.clone();
-                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
                         let group_hovered = active_group_hitbox
                             .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
@@ -3345,7 +3355,9 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
-                            window.refresh();
+                            if has_active_style {
+                                cx.notify(current_view);
+                            }
                         }
                     }
                 });

@@ -1176,6 +1176,111 @@ mod isolation_tests {
         assert_eq!(clicks.get(), 1);
     }
 
+    /// A pad of buttons: one with an active style and a click listener, one with neither.
+    struct Pad {
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Pad {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            div()
+                .id("pad")
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .id("button")
+                        .debug_selector(|| "BUTTON".into())
+                        .size(px(40.))
+                        .bg(rgb(0x404040))
+                        .active(|s| s.bg(rgb(0xff0000)))
+                        .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                )
+                .child(
+                    div()
+                        .id("plain")
+                        .debug_selector(|| "PLAIN".into())
+                        .size(px(40.))
+                        .bg(rgb(0x00ff00)),
+                )
+        }
+    }
+
+    /// Chrome around the pad, with a plain element of its own.
+    struct PadShell {
+        renders: Rc<Cell<usize>>,
+        pad: Entity<Pad>,
+    }
+
+    impl Render for PadShell {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .id("shell")
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .id("shell-plain")
+                        .debug_selector(|| "SHELL_PLAIN".into())
+                        .size(px(40.))
+                        .bg(rgb(0x202020)),
+                )
+                .child(
+                    div()
+                        .size(px(200.))
+                        .child(self.pad.clone().isolated(StyleRefinement::default().size_full())),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn a_press_redraws_only_the_view_it_lands_in(cx: &mut TestAppContext) {
+        use crate::MouseButton;
+        let (shell_renders, pad_renders, clicks) =
+            (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (_shell, cx) = cx.add_window_view(|_, cx| {
+            let pad = cx.new(|_| Pad { renders: pad_renders.clone(), clicks: clicks.clone() });
+            PadShell { renders: shell_renders.clone(), pad }
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let button = bounds(cx, "BUTTON").unwrap().center();
+        let (red, gray): (Hsla, Hsla) = (rgb(0xff0000).into(), rgb(0x404040).into());
+        let m = Modifiers::default();
+        for k in 1..=3 {
+            let (s0, p0) = (shell_renders.get(), pad_renders.get());
+            cx.simulate_mouse_move(button, None, m);
+            cx.simulate_mouse_down(button, MouseButton::Left, m);
+            cx.run_until_parked();
+            assert_eq!(shell_renders.get(), s0, "round {k}: a press keeps the chrome");
+            assert!(pad_renders.get() > p0, "round {k}: the pad draws its active style");
+            let colors = quad_colors(cx);
+            assert!(colors.contains(&red) && !colors.contains(&gray), "round {k}: pressed: {colors:?}");
+            let p1 = pad_renders.get();
+            cx.simulate_mouse_up(button, MouseButton::Left, m);
+            cx.run_until_parked();
+            assert_eq!(shell_renders.get(), s0, "round {k}: a release keeps the chrome");
+            assert!(pad_renders.get() > p1, "round {k}: the pad draws without its active style");
+            let colors = quad_colors(cx);
+            assert!(colors.contains(&gray) && !colors.contains(&red), "round {k}: released: {colors:?}");
+            assert_eq!(clicks.get(), k, "round {k}: the click fires");
+        }
+        // A press and release on elements without an active style or click listener draw nothing.
+        for name in ["PLAIN", "SHELL_PLAIN"] {
+            let at = bounds(cx, name).unwrap().center();
+            let (s0, p0) = (shell_renders.get(), pad_renders.get());
+            cx.simulate_mouse_move(at, None, m);
+            cx.simulate_click(at, m);
+            cx.run_until_parked();
+            assert_eq!((shell_renders.get(), pad_renders.get()), (s0, p0), "{name}: nothing draws");
+        }
+    }
+
     use crate as gpui;
     gpui::actions!(isolation_test, [Ping]);
 
