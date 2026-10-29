@@ -1230,6 +1230,21 @@ pub(crate) struct PaintIndex {
 }
 
 impl PrepaintStateIndex {
+    /// Is `self` inside `range` (its ends included) in every list an island's extent covers?
+    fn inside(&self, range: &Range<Self>) -> bool {
+        let (a, b) = (self, range);
+        let at = |i: usize, s: usize, e: usize| s <= i && i <= e;
+        at(a.dispatch_tree_index, b.start.dispatch_tree_index, b.end.dispatch_tree_index)
+            && at(a.hitboxes_index, b.start.hitboxes_index, b.end.hitboxes_index)
+            && at(a.tooltips_index, b.start.tooltips_index, b.end.tooltips_index)
+            && at(a.deferred_draws_index, b.start.deferred_draws_index, b.end.deferred_draws_index)
+            && at(
+                a.accessed_element_states_index,
+                b.start.accessed_element_states_index,
+                b.end.accessed_element_states_index,
+            )
+    }
+
     /// `self`, an index inside a range of the previous frame that started at
     /// `from`, in the copy of that range that starts at `to`.
     pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
@@ -1250,6 +1265,22 @@ impl PrepaintStateIndex {
 }
 
 impl PaintIndex {
+    /// As [`PrepaintStateIndex::inside`], over the paint lists.
+    fn inside(&self, range: &Range<Self>) -> bool {
+        let (a, b) = (self, range);
+        let at = |i: usize, s: usize, e: usize| s <= i && i <= e;
+        at(a.scene_index, b.start.scene_index, b.end.scene_index)
+            && at(a.mouse_listeners_index, b.start.mouse_listeners_index, b.end.mouse_listeners_index)
+            && at(a.input_handlers_index, b.start.input_handlers_index, b.end.input_handlers_index)
+            && at(a.cursor_styles_index, b.start.cursor_styles_index, b.end.cursor_styles_index)
+            && at(
+                a.accessed_element_states_index,
+                b.start.accessed_element_states_index,
+                b.end.accessed_element_states_index,
+            )
+            && at(a.tab_handle_index, b.start.tab_handle_index, b.end.tab_handle_index)
+    }
+
     /// As [`PrepaintStateIndex::shifted`].
     pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
         Self {
@@ -4596,6 +4627,64 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+    }
+
+    /// The previous frame's isolated views around `spliced` (views drawn again alone inside a
+    /// reused `range`): no one segment holds them, so [`Self::reuse_prepaint_segment`] does not
+    /// carry them. Their records follow too, each end shifted with the segment it falls in
+    /// (`segments`: each reused range of the previous frame and where its copy starts), so a
+    /// later `notify` on one still redraws it alone.
+    pub(crate) fn carry_islands_around(
+        &mut self,
+        range: &Range<PrepaintStateIndex>,
+        spliced: &[Island],
+        segments: &[(Range<PrepaintStateIndex>, PrepaintStateIndex)],
+    ) {
+        let carried: Vec<Island> = self
+            .rendered_frame
+            .islands
+            .iter()
+            .filter(|outer| {
+                !outer.deferred
+                    && outer.within(range)
+                    && !spliced.iter().any(|s| s.global_id == outer.global_id)
+                    && spliced.iter().any(|s| s.within(&outer.prepaint_range))
+            })
+            .filter_map(|outer| {
+                let (start, end) = (&outer.prepaint_range.start, &outer.prepaint_range.end);
+                let (from, to) = segments.iter().find(|(r, _)| start.inside(r))?;
+                let start = start.shifted(&from.start, to);
+                let (from, to) = segments.iter().rev().find(|(r, _)| end.inside(r))?;
+                let end = end.shifted(&from.start, to);
+                Some(Island {
+                    prepaint_range: start..end,
+                    painted: false,
+                    ..outer.clone()
+                })
+            })
+            .collect();
+        self.next_frame.islands.extend(carried);
+    }
+
+    /// As [`Self::carry_islands_around`] for paint: the carried records around `spliced` take
+    /// their paint ranges from the paint segments reused around them.
+    pub(crate) fn carry_island_paints_around(
+        &mut self,
+        spliced: &[Island],
+        segments: &[(Range<PaintIndex>, PaintIndex)],
+    ) {
+        for island in self.next_frame.islands.iter_mut().filter(|i| !i.painted) {
+            let old = &island.paint_range;
+            if !spliced.iter().any(|s| s.global_id != island.global_id && s.painted_within(old)) {
+                continue;
+            }
+            let start = segments.iter().find(|(r, _)| old.start.inside(r));
+            let end = segments.iter().rev().find(|(r, _)| old.end.inside(r));
+            if let (Some((fs, ts)), Some((fe, te))) = (start, end) {
+                island.paint_range = old.start.shifted(&fs.start, ts)..old.end.shifted(&fe.start, te);
+                island.painted = true;
+            }
+        }
     }
 
     /// Close a segmented prepaint reuse.

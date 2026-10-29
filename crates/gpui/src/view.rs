@@ -730,8 +730,11 @@ fn reuse_prepaint_around_islands(
     let mut cursor = crate::key_dispatch::ReuseCursor::default();
     let mut at = range.start.clone();
     let mut splices = Vec::with_capacity(islands.len());
+    let mut segments = Vec::with_capacity(islands.len() + 1);
     for island in islands {
-        window.reuse_prepaint_segment(&mut cursor, at..island.prepaint_range.start.clone());
+        let segment = at..island.prepaint_range.start.clone();
+        segments.push((segment.clone(), window.prepaint_index()));
+        window.reuse_prepaint_segment(&mut cursor, segment);
         let old_node = window.island_parent_node(&island);
         window.reuse_close_until(&mut cursor, old_node);
         let node = old_node.map(|n| cursor.refresh_node_id(n));
@@ -756,7 +759,11 @@ fn reuse_prepaint_around_islands(
             element,
         });
     }
-    window.reuse_prepaint_segment(&mut cursor, at..range.end);
+    let segment = at..range.end.clone();
+    segments.push((segment.clone(), window.prepaint_index()));
+    window.reuse_prepaint_segment(&mut cursor, segment);
+    let spliced: Vec<crate::window::Island> = splices.iter().map(|s| s.island.clone()).collect();
+    window.carry_islands_around(&range, &spliced, &segments);
     window.finish_reuse_prepaint(cursor);
     splices
 }
@@ -803,8 +810,11 @@ fn paint_view(
                     } else {
                         // Reused, with the isolated views drawn again in their places.
                         let mut at = element_state.paint_range.start.clone();
+                        let mut segments = Vec::with_capacity(prepaint.splices.len() + 1);
                         for splice in prepaint.splices.iter_mut() {
-                            window.reuse_paint(at..splice.island.paint_range.start.clone());
+                            let segment = at..splice.island.paint_range.start.clone();
+                            segments.push((segment.clone(), window.paint_index()));
+                            window.reuse_paint(segment);
                             if let Some(node) = splice.node {
                                 window.next_frame.dispatch_tree.set_active_node(node);
                             }
@@ -827,7 +837,12 @@ fn paint_view(
                             });
                             at = splice.island.paint_range.end.clone();
                         }
-                        window.reuse_paint(at..element_state.paint_range.end.clone());
+                        let segment = at..element_state.paint_range.end.clone();
+                        segments.push((segment.clone(), window.paint_index()));
+                        window.reuse_paint(segment);
+                        let spliced: Vec<crate::window::Island> =
+                            prepaint.splices.iter().map(|s| s.island.clone()).collect();
+                        window.carry_island_paints_around(&spliced, &segments);
                     }
 
                     let paint_end = window.paint_index();
@@ -1055,6 +1070,110 @@ mod isolation_tests {
         assert!(quad_colors(cx).contains(&rgb(0x123456).into()));
         cx.simulate_click(overlay.center(), Modifiers::default());
         assert_eq!(clicks.get(), 2);
+    }
+
+    /// An isolated view with an isolated view inside it (a board canvas with a pulse layer):
+    /// the inner one redraws alone, and then the outer one still redraws alone: its record
+    /// survives a frame that reused it around the inner one.
+    struct Outer {
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+        color: Hsla,
+        inner: Entity<Canvas>,
+    }
+
+    impl Render for Outer {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            div()
+                .relative()
+                .size_full()
+                .child(div().size(px(20.)).bg(self.color).debug_selector(|| "OUTER".into()))
+                .child(
+                    div()
+                        .size(px(100.))
+                        .child(self.inner.clone().isolated(StyleRefinement::default().size_full())),
+                )
+                .child(
+                    div()
+                        .id("after-inner")
+                        .absolute()
+                        .top(px(150.))
+                        .left(px(0.))
+                        .size(px(30.))
+                        .bg(rgb(0x00ff00))
+                        .debug_selector(|| "AFTER".into())
+                        .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                )
+        }
+    }
+
+    struct Shell {
+        renders: Rc<Cell<usize>>,
+        outer: Entity<Outer>,
+    }
+
+    impl Render for Shell {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .child(div().w(px(50.)).h_full().bg(rgb(0x202020)))
+                .child(div().size(px(300.)).child(self.outer.clone().isolated(StyleRefinement::default().size_full())))
+        }
+    }
+
+    #[gpui::test]
+    fn an_isolated_view_around_one_drawn_alone_still_redraws_alone(cx: &mut TestAppContext) {
+        let (shell_renders, outer_renders, inner_renders, clicks) =
+            (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let inner = cx.new(|_| Canvas { renders: inner_renders.clone(), color: rgb(0x0000ff).into() });
+            let outer = cx.new(|_| Outer {
+                renders: outer_renders.clone(),
+                clicks: clicks.clone(),
+                color: rgb(0x880000).into(),
+                inner,
+            });
+            Shell { renders: shell_renders.clone(), outer }
+        });
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.update(|window, _| window.set_root_cached(true));
+        cx.run_until_parked();
+        let outer = shell.update(cx, |s, _| s.outer.clone());
+        let inner = outer.update(cx, |o, _| o.inner.clone());
+        let s0 = shell_renders.get();
+        let before = (bounds(cx, "OUTER"), bounds(cx, "CANVAS"), bounds(cx, "AFTER"));
+        for (k, (inner_color, outer_color)) in [(0xff0000u32, 0x111111u32), (0x00ffff, 0x222222), (0xffff00, 0x333333)].into_iter().enumerate() {
+            // The inner view alone: the outer one is reused around it.
+            let (o0, i0) = (outer_renders.get(), inner_renders.get());
+            inner.update(cx, |c, cx| {
+                c.color = rgb(inner_color).into();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!((shell_renders.get(), outer_renders.get(), inner_renders.get()), (s0, o0, i0 + 1), "round {k}: the inner view alone");
+            // Then the outer one: it redraws alone (with the inner one inside it), not the shell.
+            outer.update(cx, |o, cx| {
+                o.color = rgb(outer_color).into();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(shell_renders.get(), s0, "round {k}: the shell is reused");
+            assert_eq!(outer_renders.get(), o0 + 1, "round {k}: the outer view draws again");
+            let colors = quad_colors(cx);
+            let (new_outer, new_inner, green): (Hsla, Hsla, Hsla) = (rgb(outer_color).into(), rgb(inner_color).into(), rgb(0x00ff00).into());
+            let at = |c: Hsla| colors.iter().position(|x| *x == c);
+            assert_eq!(colors.iter().filter(|c| **c == new_outer).count(), 1, "round {k}: the outer color, once");
+            assert_eq!(colors.iter().filter(|c| **c == new_inner).count(), 1, "round {k}: the inner color, once");
+            assert!(at(new_outer) < at(new_inner) && at(new_inner) < at(green), "round {k}: paint order kept");
+            assert_eq!((bounds(cx, "OUTER"), bounds(cx, "CANVAS"), bounds(cx, "AFTER")), before, "round {k}: same places");
+        }
+        // The listener after the inner view, inside the outer one, still fires.
+        cx.simulate_click(before.2.unwrap().center(), Modifiers::default());
+        assert_eq!(clicks.get(), 1);
     }
 
     use crate as gpui;
