@@ -89,7 +89,7 @@ impl MarksShader {
     /// program that fails to build draws nothing; hosts and tests read this
     /// rather than a log.
     pub fn compile_error(&self) -> Option<String> {
-        marks_reports().get(&self.id).and_then(|r| r.compile_error.clone())
+        marks_reports().by_id.get(&self.id).and_then(|r| r.compile_error.clone())
     }
 
     /// How many draws of this program a renderer skipped (a buffer missing,
@@ -97,34 +97,46 @@ impl MarksShader {
     /// one was.
     pub fn skipped_draws(&self) -> (u64, Option<String>) {
         marks_reports()
+            .by_id
             .get(&self.id)
             .map_or((0, None), |r| (r.skipped, r.last_skip.clone()))
     }
 
     /// For renderers: this program failed to build. Recorded for
-    /// [`Self::compile_error`], logged as an error, and a panic in debug
-    /// builds, so a broken program cannot pass unnoticed.
+    /// [`Self::compile_error`] and logged as an error; the renderer's next
+    /// [`check_marks_reports`] panics in debug builds, so a broken program
+    /// cannot pass unnoticed.
     pub fn report_compile_error(&self, error: impl std::fmt::Display) {
-        let error = error.to_string();
-        log::error!("marks program {:x} will not draw: {error}", self.id.0);
-        marks_reports().entry(self.id).or_default().compile_error = Some(error.clone());
-        debug_assert!(false, "marks program {:x} will not draw: {error}", self.id.0);
+        let message = format!("marks program {:x} will not draw: {error}", self.id.0);
+        log::error!("{message}");
+        let mut reports = marks_reports();
+        reports.by_id.entry(self.id).or_default().compile_error = Some(error.to_string());
+        reports.unchecked.push(message);
     }
 
     /// For renderers: a draw of this program was skipped because of how it
-    /// was bound. Counted for [`Self::skipped_draws`], logged as a warning,
-    /// and a panic in debug builds: the caller bound the draw wrongly.
+    /// was bound (the caller's mistake). Counted for [`Self::skipped_draws`]
+    /// and logged as a warning; the renderer's next [`check_marks_reports`]
+    /// panics in debug builds.
     pub fn report_skipped_draw(&self, reason: impl std::fmt::Display) {
         let reason = reason.to_string();
-        log::warn!("marks program {:x}: draw skipped: {reason}", self.id.0);
-        {
-            let mut reports = marks_reports();
-            let report = reports.entry(self.id).or_default();
-            report.skipped += 1;
-            report.last_skip = Some(reason.clone());
-        }
-        debug_assert!(false, "marks program {:x}: draw skipped: {reason}", self.id.0);
+        let message = format!("marks program {:x}: draw skipped: {reason}", self.id.0);
+        log::warn!("{message}");
+        let mut reports = marks_reports();
+        let report = reports.by_id.entry(self.id).or_default();
+        report.skipped += 1;
+        report.last_skip = Some(reason);
+        reports.unchecked.push(message);
     }
+}
+
+/// For renderers, where unwinding is safe (no pass or encoder open; Metal
+/// aborts the process when an unwind drops an open encoder): panics in debug
+/// builds when a marks failure was reported since the last check, and clears
+/// the list either way.
+pub fn check_marks_reports() {
+    let unchecked = std::mem::take(&mut marks_reports().unchecked);
+    debug_assert!(unchecked.is_empty(), "{}", unchecked.join("\n"));
 }
 
 /// What renderers reported about one program.
@@ -138,8 +150,15 @@ struct MarksReport {
 /// Reports by program: renderers cache pipelines by [`MarksShaderId`], so a
 /// failure belongs to every [`MarksShader`] with that source. Touched only
 /// when something fails or a host asks.
-fn marks_reports() -> std::sync::MutexGuard<'static, collections::HashMap<MarksShaderId, MarksReport>> {
-    static REPORTS: std::sync::LazyLock<std::sync::Mutex<collections::HashMap<MarksShaderId, MarksReport>>> =
+#[derive(Default)]
+struct MarksReports {
+    by_id: collections::HashMap<MarksShaderId, MarksReport>,
+    /// Reported since the last [`check_marks_reports`].
+    unchecked: Vec<String>,
+}
+
+fn marks_reports() -> std::sync::MutexGuard<'static, MarksReports> {
+    static REPORTS: std::sync::LazyLock<std::sync::Mutex<MarksReports>> =
         std::sync::LazyLock::new(Default::default);
     REPORTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -672,11 +691,14 @@ mod tests {
         let a = t::broken("reports_are_kept_by_program");
         let b = t::broken("reports_are_kept_by_program");
         assert_eq!(a.compile_error(), None);
-        t::expect_report(|| a.report_compile_error("no good"));
+        a.report_compile_error("no good");
+        t::expect_report(check_marks_reports);
         assert_eq!(b.compile_error().as_deref(), Some("no good"));
         let r = t::rects("reports_are_kept_by_program");
-        t::expect_report(|| r.report_skipped_draw("one"));
-        t::expect_report(|| r.report_skipped_draw("two"));
+        r.report_skipped_draw("one");
+        r.report_skipped_draw("two");
+        t::expect_report(check_marks_reports);
+        check_marks_reports();
         assert_eq!(r.skipped_draws(), (2, Some("two".into())));
         assert_eq!(t::rects("another").skipped_draws(), (0, None));
     }

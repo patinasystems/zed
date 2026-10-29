@@ -1975,6 +1975,8 @@ impl WgpuRendererCore {
             .prepare_retained_shapes(&viewports)
             .context("retained shapes")?;
         self.prepare_marks(&viewports);
+        // No pass is open yet: a marks failure may panic here (debug).
+        gpui::check_marks_reports();
         let mut instance_offset = 0;
         // First, at offset 0: the WebGL texture transport indexes its texture
         // absolutely and quads index gradient records from 0.

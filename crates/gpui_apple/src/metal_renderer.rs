@@ -924,6 +924,8 @@ impl MetalRenderer {
         );
         // Keep the images and copies this frame used; free the rest.
         self.texture_pool.end_frame();
+        // Every encoder is closed: a marks failure may panic here (debug).
+        gpui::check_marks_reports();
         result?;
         Ok(command_buffer.to_owned())
     }
