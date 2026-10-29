@@ -1,5 +1,6 @@
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
+    ScaledPixels,
     SharedString, StrikethroughStyle, TextAlign, TransformationMatrix, UnderlineStyle, Window,
     WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
@@ -594,6 +595,19 @@ fn paint_line(
             bounds
         }
     };
+    // Where a glyph lands in the window, to test against the content mask (which is in window
+    // coordinates): the line's own transformation, then any enclosing element transformation.
+    let element_transformation = window.element_transformation();
+    let window_bounds = |bounds: Bounds<Pixels>| {
+        let bounds = transform_bounds(bounds);
+        if element_transformation == TransformationMatrix::unit() {
+            bounds
+        } else {
+            element_transformation
+                .transform_bounds(bounds.map(|value| ScaledPixels(value.0)))
+                .map(|value| px(value.0))
+        }
+    };
     window.paint_layer(transform_bounds(line_bounds), |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
@@ -785,7 +799,7 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if transform_bounds(max_glyph_bounds).intersects(&content_mask.bounds) {
+                if window_bounds(max_glyph_bounds).intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji_with_transformation(
