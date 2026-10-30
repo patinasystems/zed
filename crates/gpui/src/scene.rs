@@ -1388,11 +1388,15 @@ pub struct Shadow {
     pub order: DrawOrder,
     pub blur_radius: ScaledPixels,
     pub bounds: Bounds<ScaledPixels>,
+    /// Each corner's horizontal radius.
     pub corner_radii: Corners<ScaledPixels>,
+    /// Each corner's vertical radius (equal to `corner_radii` for a circular corner).
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
+    pub element_corner_radii_y: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
@@ -2829,10 +2833,12 @@ pub mod element_transformation_test_scene {
             blur_radius: ScaledPixels(0.),
             bounds: bounds(40., 40., 12., 12.),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             content_mask: full,
             color: color(1., 1., 0.),
             element_bounds: bounds(40., 40., 12., 12.),
             element_corner_radii: Corners::default(),
+            element_corner_radii_y: Corners::default(),
             inset: 0,
             pad: 0,
             transformation: about(46., 46., 45., 1.),
@@ -3512,10 +3518,12 @@ pub mod rounded_clip_test_scene {
             blur_radius: ScaledPixels(0.),
             bounds: over(&masks[1]),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             content_mask: masks[1],
             color: color(0., 1., 0.),
             element_bounds: over(&masks[1]),
             element_corner_radii: Corners::default(),
+            element_corner_radii_y: Corners::default(),
             inset: 0,
             pad: 0,
             transformation: TransformationMatrix::unit(),
@@ -3917,6 +3925,133 @@ pub mod elliptical_corner_test_scene {
         }
         scene.finish();
         (scene, probes)
+    }
+}
+
+/// A dashed border around an oval (rx 32, ry 18): its dashes follow the elliptical arc.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_dashes_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (80, 52);
+
+    /// The scene: a 64 x 36 oval at (8, 8) with a 3 px dashed black border.
+    pub fn scene() -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let color = |v: f32| -> Hsla { Rgba { r: v, g: v, b: v, a: 1. }.into() };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: color(1.).into(),
+            ..Default::default()
+        });
+        let b = ScaledPixels(3.);
+        scene.insert_primitive(Quad {
+            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            content_mask: full,
+            background: color(1.).into(),
+            border_color: color(0.),
+            border_style: BorderStyle::Dashed,
+            corner_radii: Corners::all(ScaledPixels(32.)),
+            corner_radii_y: Corners::all(ScaledPixels(18.)),
+            border_widths: Edges { top: b, right: b, bottom: b, left: b },
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    /// Ring pixels (on the oval's mid-border) that are inked and that are gaps: the dashes
+    /// alternate along the whole arc, so both counts are substantial and the gaps are not all on one side.
+    pub fn ink_and_gaps(pixel: impl Fn(u32, u32) -> [u8; 4]) -> (usize, usize, [usize; 4]) {
+        let (mut ink, mut gap, mut quadrant_gaps) = (0, 0, [0; 4]);
+        for step in 0..720 {
+            let a = step as f32 / 720. * std::f32::consts::TAU;
+            // The border's mid-line: the oval inset by 1.5 px.
+            let (x, y) = (40. + (32. - 1.5) * a.cos(), 26. + (18. - 1.5) * a.sin());
+            let p = pixel(x as u32, y as u32);
+            if p[0] < 100 {
+                ink += 1;
+            } else if p[0] > 200 {
+                gap += 1;
+                quadrant_gaps[(a / (std::f32::consts::TAU / 4.)) as usize % 4] += 1;
+            }
+        }
+        (ink, gap, quadrant_gaps)
+    }
+}
+
+/// Shadows of an oval (rx 32, ry 18): sharp, and blurred.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_shadow_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (80, 100);
+
+    /// A black shadow of a 64 x 36 oval at (8, 8) with no blur, and one at (8, 56) with a blur of 4.
+    pub fn scene() -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let white: Hsla = Rgba { r: 1., g: 1., b: 1., a: 1. }.into();
+        let black: Hsla = Rgba { r: 0., g: 0., b: 0., a: 1. }.into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: white.into(),
+            ..Default::default()
+        });
+        for (y, blur) in [(8., 0.), (56., 4.)] {
+            let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(y)), size(ScaledPixels(64.), ScaledPixels(36.)));
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(blur),
+                bounds,
+                corner_radii: Corners::all(ScaledPixels(32.)),
+                corner_radii_y: Corners::all(ScaledPixels(18.)),
+                content_mask: full,
+                color: black,
+                element_bounds: bounds,
+                element_corner_radii: Corners::all(ScaledPixels(32.)),
+                element_corner_radii_y: Corners::all(ScaledPixels(18.)),
+                inset: 0,
+                pad: 0,
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Checks the pixels: the sharp oval is black inside and white in its box's corners (a circle
+    /// of radius 18 would cover them), and the blurred oval's corner is lighter than its edge midpoint.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let at = |x: u32, y: u32| pixel(x, y)[0] as i32;
+        assert!(at(40, 26) < 20, "the oval's center is shadowed: {}", at(40, 26));
+        assert!(at(10, 10) > 235, "the oval's box corner stays clear: {}", at(10, 10));
+        // Where a circle of the smaller radius (18) would still shadow: (24, 9) is above the oval's
+        // arc there (y = 10.4 at x = 24) and inside that circle's.
+        assert!(at(24, 9) > 200, "the arc is elliptical, not the smaller circle: {}", at(24, 9));
+        // Along the long axis the oval is wide: (13, 26) is inside it (an ellipse reaches x = 8 + 32 - 32 * sqrt(1 - ((26 - 26) / 18)^2)).
+        assert!(at(12, 26) < 30, "the oval's left tip is shadowed: {}", at(12, 26));
+        // Blurred: the box corner is much lighter than the middle of an edge the same distance in.
+        let corner = at(12, 60);
+        let edge = at(40, 60);
+        assert!(corner > edge + 40, "blurred corner {corner} against center {edge}");
+        // A sharp circle of radius 32 would reach (40, 8 + 4): the oval's top edge at x = 40 is y = 8.
+        assert!(at(40, 10) < 60, "the oval's top edge is shadowed: {}", at(40, 10));
     }
 }
 

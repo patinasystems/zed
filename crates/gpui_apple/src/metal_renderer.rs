@@ -3753,6 +3753,24 @@ mod tests {
     }
 
     #[test]
+    fn elliptical_dashes_alternate_around_the_arc() {
+        use gpui::elliptical_dashes_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        let (ink, gap, quadrants) = t::ink_and_gaps(|x, y| image.get_pixel(x, y).0);
+        assert!(ink > 150 && gap > 150, "ink {ink}, gaps {gap}");
+        assert!(quadrants.iter().all(|g| *g > 20), "gaps per quadrant {quadrants:?}");
+    }
+
+    #[test]
+    fn elliptical_shadows_follow_the_oval() {
+        use gpui::elliptical_shadow_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0);
+    }
+
+    #[test]
     fn blend_modes_match_the_reference() {
         use gpui::blend_mode_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();

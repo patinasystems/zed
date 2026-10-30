@@ -386,8 +386,17 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
 }
 
 fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
-  let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+  return blur_along_x_xy(x, y, sigma, vec2<f32>(corner), half_size);
+}
+
+// `blur_along_x` for an elliptical corner of radii `corner` (rx, ry).
+fn blur_along_x_xy(x: f32, y: f32, sigma: f32, corner: vec2<f32>, half_size: vec2<f32>) -> f32 {
+  let delta = min(half_size.y - corner.y - abs(y), 0.0);
+  var curved = half_size.x - corner.x + sqrt(max(0.0, corner.x * corner.x - delta * delta));
+  if (corner.x != corner.y) {
+    // The ellipse's half-width at `delta` past the corner's center line.
+    curved = half_size.x - corner.x + corner.x * sqrt(max(0.0, 1.0 - (delta * delta) / max(corner.y * corner.y, 1e-6)));
+  }
   let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
 }
@@ -414,6 +423,16 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
 fn pick_corner_radii_xy(center_to_point: vec2<f32>, x: Corners, y: Corners) -> vec2<f32> {
     let r = vec2<f32>(pick_corner_radius(center_to_point, x), pick_corner_radius(center_to_point, y));
     return select(r, vec2<f32>(0.0), r.x <= 0.0 || r.y <= 0.0);
+}
+
+// A corner's (rx, ry), or (0, 0) when either is zero (a square corner).
+fn corner_pair(x: f32, y: f32) -> vec2<f32> {
+    return select(vec2<f32>(x, y), vec2<f32>(0.0), x <= 0.0 || y <= 0.0);
+}
+
+// The length of a quarter ellipse of radii `r` (Ramanujan's approximation; exact for a circle).
+fn quarter_arc_length(r: vec2<f32>) -> f32 {
+    return (M_PI_F / 4.0) * (3.0 * (r.x + r.y) - sqrt((3.0 * r.x + r.y) * (r.x + 3.0 * r.y)));
 }
 
 // Each corner's circle of the smaller radius: what dashed borders lay out around (an
@@ -481,6 +500,16 @@ fn shaped_corner_sdf(p: vec2<f32>, radii: vec2<f32>, k: f32) -> f32 {
         gradient = pow(v, vec2<f32>(m - 1.0)) * pow(s, 1.0 / m - 1.0);
     }
     return f / max(length(gradient / r), 1e-6);
+}
+
+// `quad_sdf` with elliptical corners (`radii_x`, `radii_y`); a circular corner takes the circular path.
+fn quad_sdf_xy(point: vec2<f32>, bounds: Bounds, radii_x: Corners, radii_y: Corners) -> f32 {
+    let half_size = bounds.size / 2.0;
+    let center = bounds.origin + half_size;
+    let center_to_point = point - center;
+    let radii = pick_corner_radii_xy(center_to_point, radii_x, radii_y);
+    let corner_to_point = abs(center_to_point) - half_size;
+    return quad_sdf_impl_xy(corner_to_point + radii, radii);
 }
 
 fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
@@ -1116,10 +1145,11 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 // When corners are rounded, the dashes are laid out clockwise
                 // around the whole perimeter.
 
-                let r_tr = dash_radii.top_right;
-                let r_br = dash_radii.bottom_right;
-                let r_bl = dash_radii.bottom_left;
-                let r_tl = dash_radii.top_left;
+                // Each corner's (rx, ry): an elliptical corner's dashes follow its arc.
+                let r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
+                let r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
+                let r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
+                let r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
 
                 let w_t = quad.border_widths.top;
                 let w_r = quad.border_widths.right;
@@ -1133,10 +1163,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let dv_l = select(dv_numerator / w_l, 0.0, w_l <= 0.0);
 
                 // Straight side lengths in dash space
-                let s_t = (size.x - r_tl - r_tr) * dv_t;
-                let s_r = (size.y - r_tr - r_br) * dv_r;
-                let s_b = (size.x - r_br - r_bl) * dv_b;
-                let s_l = (size.y - r_bl - r_tl) * dv_l;
+                let s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
+                let s_r = (size.y - r_tr.y - r_br.y) * dv_r;
+                let s_b = (size.x - r_br.x - r_bl.x) * dv_b;
+                let s_l = (size.y - r_bl.y - r_tl.y) * dv_l;
 
                 let corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
                 let corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
@@ -1144,10 +1174,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
 
                 // Corner lengths in dash space
-                let c_tr = r_tr * (M_PI_F / 2.0) * corner_dash_velocity_tr;
-                let c_br = r_br * (M_PI_F / 2.0) * corner_dash_velocity_br;
-                let c_bl = r_bl * (M_PI_F / 2.0) * corner_dash_velocity_bl;
-                let c_tl = r_tl * (M_PI_F / 2.0) * corner_dash_velocity_tl;
+                let c_tr = quarter_arc_length(r_tr) * corner_dash_velocity_tr;
+                let c_br = quarter_arc_length(r_br) * corner_dash_velocity_br;
+                let c_bl = quarter_arc_length(r_bl) * corner_dash_velocity_bl;
+                let c_tl = quarter_arc_length(r_tl) * corner_dash_velocity_tl;
 
                 // Cumulative dash space upto each segment
                 let upto_tr = s_t;
@@ -1160,9 +1190,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 max_t = upto_tl + c_tl;
 
                 if (is_near_rounded_corner) {
-                    let radians = atan2(corner_center_to_point.y,
-                                        corner_center_to_point.x);
-                    let corner_t = radians * corner_radius;
+                    // The angle in the corner's unit circle (an ellipse's parameter), spread over its arc.
+                    let radians = atan2(corner_center_to_point.y / max(corner_radii_xy.y, 1e-4),
+                                        corner_center_to_point.x / max(corner_radii_xy.x, 1e-4));
+                    let corner_t = select(radians * quarter_arc_length(corner_radii_xy) / (M_PI_F / 2.0),
+                                          radians * corner_radius,
+                                          corner_radii_xy.x == corner_radii_xy.y);
 
                     if (center_to_point.x >= 0.0) {
                         if (center_to_point.y < 0.0) {
@@ -1200,18 +1233,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     if (is_horizontal) {
                         if (center_to_point.y < 0.0) {
                             dash_velocity = dv_t;
-                            t = (point.x - r_tl) * dash_velocity;
+                            t = (point.x - r_tl.x) * dash_velocity;
                         } else {
                             dash_velocity = dv_b;
-                            t = upto_bl - (point.x - r_bl) * dash_velocity;
+                            t = upto_bl - (point.x - r_bl.x) * dash_velocity;
                         }
                     } else {
                         if (center_to_point.x < 0.0) {
                             dash_velocity = dv_l;
-                            t = upto_tl - (point.y - r_tl) * dash_velocity;
+                            t = upto_tl - (point.y - r_tl.y) * dash_velocity;
                         } else {
                             dash_velocity = dv_r;
-                            t = upto_r + (point.y - r_tr) * dash_velocity;
+                            t = upto_r + (point.y - r_tr.y) * dash_velocity;
                         }
                     }
                 }
@@ -1321,12 +1354,15 @@ struct Shadow {
     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
     bounds: Bounds,
     corner_radii: Corners,
+    // Each corner's vertical radius.
+    corner_radii_y: Corners,
     content_mask: ContentMask,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
     element_bounds: Bounds,
     element_corner_radii: Corners,
+    element_corner_radii_y: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
     pad: u32, // align to 8 bytes
@@ -1389,20 +1425,32 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         let uniform_scale = min(scale.x, scale.y);
         position = input.local_position * scale;
         shadow.bounds = scale_bounds(shadow.bounds, scale);
-        shadow.corner_radii = scale_corners(shadow.corner_radii, uniform_scale);
+        if (corners_equal(shadow.corner_radii, shadow.corner_radii_y)) {
+            shadow.corner_radii = scale_corners(shadow.corner_radii, uniform_scale);
+            shadow.corner_radii_y = shadow.corner_radii;
+        } else {
+            shadow.corner_radii = scale_corners(shadow.corner_radii, scale.x);
+            shadow.corner_radii_y = scale_corners(shadow.corner_radii_y, scale.y);
+        }
         shadow.blur_radius *= uniform_scale;
         shadow.element_bounds = scale_bounds(shadow.element_bounds, scale);
-        shadow.element_corner_radii = scale_corners(shadow.element_corner_radii, uniform_scale);
+        if (corners_equal(shadow.element_corner_radii, shadow.element_corner_radii_y)) {
+            shadow.element_corner_radii = scale_corners(shadow.element_corner_radii, uniform_scale);
+            shadow.element_corner_radii_y = shadow.element_corner_radii;
+        } else {
+            shadow.element_corner_radii = scale_corners(shadow.element_corner_radii, scale.x);
+            shadow.element_corner_radii_y = scale_corners(shadow.element_corner_radii_y, scale.y);
+        }
     }
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
     let center_to_point = position - center;
 
-    let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
+    let corner_radii_xy = pick_corner_radii_xy(center_to_point, shadow.corner_radii, shadow.corner_radii_y);
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(position, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf_xy(position, shadow.bounds, shadow.corner_radii, shadow.corner_radii_y);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1416,8 +1464,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         var y = start + step * 0.5;
         alpha = 0.0;
         for (var i = 0; i < 4; i += 1) {
-            let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                shadow.blur_radius, corner_radius, half_size);
+            let blur = blur_along_x_xy(center_to_point.x, center_to_point.y - y,
+                shadow.blur_radius, corner_radii_xy, half_size);
             alpha +=  blur * gaussian(y, shadow.blur_radius) * step;
             y += step;
         }
@@ -1427,8 +1475,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(position, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+        let element_distance = quad_sdf_xy(position, shadow.element_bounds,
+                                           shadow.element_corner_radii, shadow.element_corner_radii_y);
         alpha *= saturate(0.5 - element_distance);
     }
 

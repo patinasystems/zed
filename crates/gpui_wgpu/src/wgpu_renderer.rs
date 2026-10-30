@@ -4441,6 +4441,44 @@ mod tests {
         Ok(())
     }
 
+    /// A dashed border on an oval: dashes alternate with gaps around the whole elliptical arc, in every quadrant.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn elliptical_dashes_alternate_around_the_arc() -> anyhow::Result<()> {
+        use gpui::elliptical_dashes_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        let (ink, gap, quadrants) = t::ink_and_gaps(|x, y| image.get_pixel(x, y).0);
+        assert!(ink > 150 && gap > 150, "ink {ink}, gaps {gap}");
+        assert!(quadrants.iter().all(|g| *g > 20), "gaps per quadrant {quadrants:?}");
+        Ok(())
+    }
+
+    /// Shadows of an oval follow its elliptical corners, sharp and blurred.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn elliptical_shadows_follow_the_oval() -> anyhow::Result<()> {
+        use gpui::elliptical_shadow_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
     /// The shared group mask scene (alpha and luminance masks, a mask moving with an
     /// offscreen group, a smaller mask, an empty one) on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
@@ -4805,7 +4843,7 @@ mod tests {
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 46 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);

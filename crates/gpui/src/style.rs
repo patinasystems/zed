@@ -300,8 +300,8 @@ pub struct Style {
 
     /// The vertical radius of each corner (top left, top right, bottom right, bottom left) where it differs from the horizontal radius in
     /// `corner_radii` (CSS `border-radius: a / b`); `None` is circular. The background and the
-    /// border are elliptical; shadows, backdrop filters, gradients, shaders and overflow clips
-    /// still follow the smaller circle of each corner.
+    /// border, dashes and shadows are elliptical; backdrop filters, gradients, shaders and overflow
+    /// clips still follow the smaller circle of each corner.
     pub corner_radii_y: [Option<AbsoluteLength>; 4],
 
     /// Radii that are a percentage of the border box (CSS `border-radius: 50%`): per corner (top
@@ -836,7 +836,7 @@ impl Style {
     ) {
         let rem_size = window.rem_size();
         let corner_radii = quad_radii.circular();
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows(bounds, quad_radii, &self.box_shadow);
 
         if backdrop && let Some(backdrop) = self.backdrop_filter {
             window.paint_backdrop_filter(bounds, corner_radii, backdrop);
@@ -893,7 +893,7 @@ impl Style {
             );
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows(bounds, quad_radii, &self.box_shadow);
 
         continuation(window, cx);
 

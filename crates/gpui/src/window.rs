@@ -5594,16 +5594,19 @@ impl Window {
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
+        let corner_radii: Corners<Size<Pixels>> = corner_radii.into();
+        let (radii_x, radii_y) = (corner_radii.horizontal(), corner_radii.vertical());
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
-        let element_corner_radii = corner_radii.scale(scale_factor);
+        let element_corner_radii = radii_x.scale(scale_factor);
+        let element_corner_radii_y = radii_y.scale(scale_factor);
         let transformation = self.device_element_transformation();
         for shadow in shadows {
             if shadow.inset {
@@ -5615,10 +5618,12 @@ impl Window {
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: radii_x.scale(scale_factor),
+                corner_radii_y: radii_y.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
+                element_corner_radii_y,
                 inset: 0,
                 pad: 0,
                 transformation,
@@ -5632,16 +5637,19 @@ impl Window {
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
+        let corner_radii: Corners<Size<Pixels>> = corner_radii.into();
+        let (radii_x, radii_y) = (corner_radii.horizontal(), corner_radii.vertical());
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
-        let element_corner_radii = corner_radii.scale(scale_factor);
+        let element_corner_radii = radii_x.scale(scale_factor);
+        let element_corner_radii_y = radii_y.scale(scale_factor);
         let transformation = self.device_element_transformation();
         for shadow in shadows {
             if !shadow.inset {
@@ -5651,21 +5659,24 @@ impl Window {
             // Clamp at zero so a large spread can't produce negative radii, which would
             // break the SDF in the shader.
             let zero = Pixels::ZERO;
-            let hole_corner_radii = Corners {
-                top_left: (corner_radii.top_left - shadow.spread_radius).max(zero),
-                top_right: (corner_radii.top_right - shadow.spread_radius).max(zero),
-                bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
-                bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
+            let inset_radii = |r: Corners<Pixels>| Corners {
+                top_left: (r.top_left - shadow.spread_radius).max(zero),
+                top_right: (r.top_right - shadow.spread_radius).max(zero),
+                bottom_right: (r.bottom_right - shadow.spread_radius).max(zero),
+                bottom_left: (r.bottom_left - shadow.spread_radius).max(zero),
             };
+            let (hole_radii_x, hole_radii_y) = (inset_radii(radii_x), inset_radii(radii_y));
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
                 content_mask,
-                corner_radii: hole_corner_radii.scale(scale_factor),
+                corner_radii: hole_radii_x.scale(scale_factor),
+                corner_radii_y: hole_radii_y.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
+                element_corner_radii_y,
                 inset: 1,
                 pad: 0,
                 transformation,

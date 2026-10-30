@@ -943,12 +943,15 @@ struct Shadow {
     float blur_radius;
     Bounds bounds;
     Corners corner_radii;
+    // Each corner's vertical radius (`Shadow::corner_radii_y`): Direct3D draws circular corners.
+    Corners corner_radii_y;
     Bounds content_mask;
     // `ContentMask::corner_radii`: Direct3D clips square.
     Corners content_mask_radii;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
+    Corners element_corner_radii_y;
     uint inset;
     uint pad; // align to 8 bytes
     TransformationMatrix transformation;
