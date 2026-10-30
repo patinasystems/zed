@@ -920,9 +920,9 @@ impl Style {
         }
     }
 
-    /// The corners fitted to a box of `size`. Circular corners keep GPUI's per-radius clamp (half
+    /// The corners as [`Style::paint`] draws the background and the border, fitted to a box of `size`. Circular corners keep GPUI's per-radius clamp (half
     /// the shorter side); elliptical ones scale together (CSS Backgrounds 3 5.5).
-    fn fitted_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
+    pub fn fitted_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
         let radii = self.border_box_radii(rem_size);
         if radii.is_circular() {
             radii.horizontal().clamp_radii_for_quad_size(size).into()
