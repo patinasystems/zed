@@ -493,11 +493,7 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     // Elliptical corners (`border-radius: a / b`, a percentage) are fitted to the box;
                     // circular ones keep the per-radius clamp `paint_image` applies.
-                    let corner_radii: crate::Corners<crate::Size<crate::Pixels>> = if style.has_elliptical_radii() {
-                        style.fitted_radii(bounds.size, window.rem_size())
-                    } else {
-                        style.corner_radii.to_pixels(window.rem_size()).into()
-                    };
+                    let corner_radii = style.fitted_radii(bounds.size, window.rem_size());
                     window
                         .paint_image(
                             bounds,

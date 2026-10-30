@@ -9,7 +9,7 @@ use crate::{
     CompositingGroup, ContentMask, CornerShapes, Corners, CornersRefinement, CursorStyle,
     DefiniteLength, DevicePixels, Edges, EdgesRefinement, Filter, Font, FontFallbacks,
     FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    PointRefinement, Rems, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
     point, px, quad, rems, size,
 };
 use collections::HashSet;
@@ -185,6 +185,50 @@ pub struct Compositing {
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
+/// A corner radius on one axis: a length, or a percentage of the border box (50 is half the width
+/// for a horizontal radius, half the height for a vertical one).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum LengthOrPercent {
+    /// An absolute length.
+    Length(AbsoluteLength),
+    /// A percentage of the border box.
+    Percent(f32),
+}
+
+impl LengthOrPercent {
+    /// The radius in pixels, where a percentage is of `basis` (the box's width or height).
+    pub fn resolve(self, basis: Pixels, rem_size: Pixels) -> Pixels {
+        match self {
+            LengthOrPercent::Length(length) => length.to_pixels(rem_size),
+            LengthOrPercent::Percent(percent) => basis * (percent / 100.),
+        }
+    }
+}
+
+impl Default for LengthOrPercent {
+    fn default() -> Self {
+        LengthOrPercent::Length(AbsoluteLength::default())
+    }
+}
+
+impl From<AbsoluteLength> for LengthOrPercent {
+    fn from(length: AbsoluteLength) -> Self {
+        LengthOrPercent::Length(length)
+    }
+}
+
+impl From<Pixels> for LengthOrPercent {
+    fn from(pixels: Pixels) -> Self {
+        LengthOrPercent::Length(pixels.into())
+    }
+}
+
+impl From<Rems> for LengthOrPercent {
+    fn from(rems: Rems) -> Self {
+        LengthOrPercent::Length(rems.into())
+    }
+}
+
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Style {
@@ -294,24 +338,19 @@ pub struct Style {
     /// The border style of this element
     pub border_style: BorderStyle,
 
-    /// The radius of the corners of this element
+    /// The horizontal radius of each corner (top left, top right, bottom right, bottom left): a length
+    /// or a percentage of the border box's width (CSS `border-radius`). A refinement sets exactly the
+    /// corners it names.
     #[refineable]
-    pub corner_radii: Corners<AbsoluteLength>,
+    pub corner_radii: Corners<LengthOrPercent>,
 
-    /// The vertical radius of each corner (top left, top right, bottom right, bottom left) where it differs from the horizontal radius in
-    /// `corner_radii` (CSS `border-radius: a / b`); `None` is circular. The background and the
-    /// border, dashes and shadows are elliptical; backdrop filters, gradients, shaders and overflow
+    /// The vertical radius of each corner (CSS `border-radius: a / b`): a length or a percentage of
+    /// the border box's height. `None` follows the corner's horizontal radius (a circle). A refinement
+    /// sets exactly the corners it names, so it never disturbs another axis or corner. The background,
+    /// border, dashes, shadows, gradients, images, backdrop filters and shaders are elliptical; overflow
     /// clips still follow the smaller circle of each corner.
     #[refineable]
-    pub corner_radii_y: Corners<Option<AbsoluteLength>>,
-
-    /// Radii that are a percentage of the border box (CSS `border-radius: 50%`): per corner (top
-    /// left, top right, bottom right, bottom left), the percentage of the width (horizontal radius)
-    /// and of the height (vertical radius). A percentage replaces that axis' length in
-    /// `corner_radii` or `corner_radii_y`. Senders give both axes for `border-radius: 50%`; a corner
-    /// with only a horizontal percentage is circular, with that radius.
-    #[refineable]
-    pub corner_radii_percent: Corners<[Option<f32>; 2]>,
+    pub corner_radii_y: Corners<Option<LengthOrPercent>>,
 
     /// The shape of each rounded corner (CSS `corner-shape`): the background, a
     /// background gradient and the border follow it.
@@ -917,42 +956,31 @@ impl Style {
         }
     }
 
-    /// Whether the corners depend on more than `corner_radii`: a vertical radius that differs from the
-    /// horizontal one, or a percentage, is set, so they are elliptical or resolve against the box. A
-    /// vertical radius equal to the horizontal one is circular (senders give both radii of every
-    /// corner, so a state style replaces the whole pair).
+    /// Whether a corner is not a circle of a length: a percentage (it resolves against the box) or a vertical
+    /// radius that differs from the horizontal one. A vertical radius equal to the horizontal length is circular.
     pub fn has_elliptical_radii(&self) -> bool {
-        let x = &self.corner_radii;
-        let horizontal = [x.top_left, x.top_right, x.bottom_right, x.bottom_left];
-        let percent = &self.corner_radii_percent;
-        [percent.top_left, percent.top_right, percent.bottom_right, percent.bottom_left].iter().flatten().any(Option::is_some)
-            || {
-                let y = &self.corner_radii_y;
-                [y.top_left, y.top_right, y.bottom_right, y.bottom_left].iter().zip(horizontal).any(|(y, x)| y.is_some_and(|y| y != x))
-            }
+        let (x, y) = (&self.corner_radii, &self.corner_radii_y);
+        let x = [x.top_left, x.top_right, x.bottom_right, x.bottom_left];
+        let y = [y.top_left, y.top_right, y.bottom_right, y.bottom_left];
+        x.iter().zip(y).any(|(x, y)| {
+            matches!(x, LengthOrPercent::Percent(_)) || y.is_some_and(|y| y != *x)
+        })
     }
 
-    /// Each corner's horizontal and vertical radius in a box of `size`, before fitting them to it.
+    /// Each corner's horizontal and vertical radius in a box of `size`, before fitting them to it: a
+    /// percentage is of the width (horizontal) or the height (vertical), and a corner without a vertical
+    /// radius is a circle of its horizontal one.
     fn border_box_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
-        let x = self.corner_radii.to_pixels(rem_size);
-        let percent = &self.corner_radii_percent;
-        let percent = [percent.top_left, percent.top_right, percent.bottom_right, percent.bottom_left];
-        let y_radii = &self.corner_radii_y;
-        let y_radii = [y_radii.top_left, y_radii.top_right, y_radii.bottom_right, y_radii.bottom_left];
-        let one = |i: usize, x: Pixels| {
-            let [px_x, px_y] = percent[i];
-            let rx = px_x.map_or(x, |p| size.width * (p / 100.));
-            let ry = match px_y {
-                Some(p) => size.height * (p / 100.),
-                None => y_radii[i].map_or(rx, |l| l.to_pixels(rem_size)),
-            };
-            crate::size(rx, ry)
+        let (x, y) = (&self.corner_radii, &self.corner_radii_y);
+        let one = |x: LengthOrPercent, y: Option<LengthOrPercent>| {
+            let rx = x.resolve(size.width, rem_size);
+            crate::size(rx, y.map_or(rx, |y| y.resolve(size.height, rem_size)))
         };
         Corners {
-            top_left: one(0, x.top_left),
-            top_right: one(1, x.top_right),
-            bottom_right: one(2, x.bottom_right),
-            bottom_left: one(3, x.bottom_left),
+            top_left: one(x.top_left, y.top_left),
+            top_right: one(x.top_right, y.top_right),
+            bottom_right: one(x.bottom_right, y.bottom_right),
+            bottom_left: one(x.bottom_left, y.bottom_left),
         }
     }
 
@@ -1012,7 +1040,6 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             corner_radii_y: Corners::default(),
-            corner_radii_percent: Corners::default(),
             corner_shapes: CornerShapes::ROUND,
             box_shadow: Default::default(),
             backdrop_filter: None,
@@ -1758,19 +1785,25 @@ mod overflow_mask_tests {
     #[test]
     fn vertical_radii_equal_to_the_horizontal_ones_are_circular() {
         let mut style = Style::default();
-        let twenty = AbsoluteLength::Pixels(px(20.));
+        let twenty: LengthOrPercent = px(20.).into();
         style.corner_radii = Corners { top_left: twenty, top_right: twenty, bottom_right: twenty, bottom_left: twenty };
         style.corner_radii_y = Corners { top_left: Some(twenty), top_right: Some(twenty), bottom_right: Some(twenty), bottom_left: Some(twenty) };
         assert!(!style.has_elliptical_radii());
-        // A state style's pair replaces the base's whole: 40 / 15 then 20 / 20 is circular again.
-        style.corner_radii_y.top_left = Some(AbsoluteLength::Pixels(px(15.)));
+        style.corner_radii_y.top_left = Some(px(15.).into());
         assert!(style.has_elliptical_radii());
-        style.corner_radii_y = Corners::default();
-        let half = [Some(50.), Some(50.)];
-        style.corner_radii_percent = Corners { top_left: half, top_right: half, bottom_right: half, bottom_left: half };
+        let half = LengthOrPercent::Percent(50.);
+        style.corner_radii_y = Corners { top_left: Some(half), top_right: Some(half), bottom_right: Some(half), bottom_left: Some(half) };
+        style.corner_radii = Corners { top_left: half, top_right: half, bottom_right: half, bottom_left: half };
         assert!(style.has_elliptical_radii());
         let fitted = style.fitted_radii(size(px(160.), px(100.)), px(16.));
         assert_eq!(fitted.top_left, size(px(80.), px(50.)));
+        // A vertical-only percentage over a horizontal length: 10 px by 25% of 100.
+        style.corner_radii = Corners { top_left: px(10.).into(), top_right: px(10.).into(), bottom_right: px(10.).into(), bottom_left: px(10.).into() };
+        style.corner_radii_y = Corners::default();
+        style.corner_radii_y.top_left = Some(LengthOrPercent::Percent(25.));
+        let fitted = style.fitted_radii(size(px(160.), px(100.)), px(16.));
+        assert_eq!(fitted.top_left, size(px(10.), px(25.)));
+        assert_eq!(fitted.top_right, size(px(10.), px(10.)));
     }
 
     use super::*;
