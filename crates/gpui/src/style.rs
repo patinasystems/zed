@@ -302,14 +302,16 @@ pub struct Style {
     /// `corner_radii` (CSS `border-radius: a / b`); `None` is circular. The background and the
     /// border are elliptical; shadows, backdrop filters, gradients, shaders and overflow clips
     /// still follow the smaller circle of each corner.
-    pub corner_radii_y: [Option<AbsoluteLength>; 4],
+    #[refineable]
+    pub corner_radii_y: Corners<Option<AbsoluteLength>>,
 
     /// Radii that are a percentage of the border box (CSS `border-radius: 50%`): per corner (top
     /// left, top right, bottom right, bottom left), the percentage of the width (horizontal radius)
     /// and of the height (vertical radius). A percentage replaces that axis' length in
     /// `corner_radii` or `corner_radii_y`. Senders give both axes for `border-radius: 50%`; a corner
     /// with only a horizontal percentage is circular, with that radius.
-    pub corner_radii_percent: [[Option<f32>; 2]; 4],
+    #[refineable]
+    pub corner_radii_percent: Corners<[Option<f32>; 2]>,
 
     /// The shape of each rounded corner (CSS `corner-shape`): the background, a
     /// background gradient and the border follow it.
@@ -922,23 +924,27 @@ impl Style {
     pub fn has_elliptical_radii(&self) -> bool {
         let x = &self.corner_radii;
         let horizontal = [x.top_left, x.top_right, x.bottom_right, x.bottom_left];
-        self.corner_radii_percent.iter().flatten().any(Option::is_some)
-            || self
-                .corner_radii_y
-                .iter()
-                .zip(horizontal)
-                .any(|(y, x)| y.is_some_and(|y| y != x))
+        let percent = &self.corner_radii_percent;
+        [percent.top_left, percent.top_right, percent.bottom_right, percent.bottom_left].iter().flatten().any(Option::is_some)
+            || {
+                let y = &self.corner_radii_y;
+                [y.top_left, y.top_right, y.bottom_right, y.bottom_left].iter().zip(horizontal).any(|(y, x)| y.is_some_and(|y| y != x))
+            }
     }
 
     /// Each corner's horizontal and vertical radius in a box of `size`, before fitting them to it.
     fn border_box_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
         let x = self.corner_radii.to_pixels(rem_size);
+        let percent = &self.corner_radii_percent;
+        let percent = [percent.top_left, percent.top_right, percent.bottom_right, percent.bottom_left];
+        let y_radii = &self.corner_radii_y;
+        let y_radii = [y_radii.top_left, y_radii.top_right, y_radii.bottom_right, y_radii.bottom_left];
         let one = |i: usize, x: Pixels| {
-            let [px_x, px_y] = self.corner_radii_percent[i];
+            let [px_x, px_y] = percent[i];
             let rx = px_x.map_or(x, |p| size.width * (p / 100.));
             let ry = match px_y {
                 Some(p) => size.height * (p / 100.),
-                None => self.corner_radii_y[i].map_or(rx, |l| l.to_pixels(rem_size)),
+                None => y_radii[i].map_or(rx, |l| l.to_pixels(rem_size)),
             };
             crate::size(rx, ry)
         };
@@ -1005,8 +1011,8 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
-            corner_radii_y: [None; 4],
-            corner_radii_percent: [[None; 2]; 4],
+            corner_radii_y: Corners::default(),
+            corner_radii_percent: Corners::default(),
             corner_shapes: CornerShapes::ROUND,
             box_shadow: Default::default(),
             backdrop_filter: None,
@@ -1754,13 +1760,14 @@ mod overflow_mask_tests {
         let mut style = Style::default();
         let twenty = AbsoluteLength::Pixels(px(20.));
         style.corner_radii = Corners { top_left: twenty, top_right: twenty, bottom_right: twenty, bottom_left: twenty };
-        style.corner_radii_y = [Some(twenty); 4];
+        style.corner_radii_y = Corners { top_left: Some(twenty), top_right: Some(twenty), bottom_right: Some(twenty), bottom_left: Some(twenty) };
         assert!(!style.has_elliptical_radii());
         // A state style's pair replaces the base's whole: 40 / 15 then 20 / 20 is circular again.
-        style.corner_radii_y[0] = Some(AbsoluteLength::Pixels(px(15.)));
+        style.corner_radii_y.top_left = Some(AbsoluteLength::Pixels(px(15.)));
         assert!(style.has_elliptical_radii());
-        style.corner_radii_y = [None; 4];
-        style.corner_radii_percent = [[Some(50.), Some(50.)]; 4];
+        style.corner_radii_y = Corners::default();
+        let half = [Some(50.), Some(50.)];
+        style.corner_radii_percent = Corners { top_left: half, top_right: half, bottom_right: half, bottom_left: half };
         assert!(style.has_elliptical_radii());
         let fitted = style.fitted_radii(size(px(160.), px(100.)), px(16.));
         assert_eq!(fitted.top_left, size(px(80.), px(50.)));
