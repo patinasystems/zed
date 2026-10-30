@@ -915,11 +915,19 @@ impl Style {
         }
     }
 
-    /// Whether the corners depend on more than `corner_radii`: a vertical radius or a percentage
-    /// is set, so they are elliptical or resolve against the box.
+    /// Whether the corners depend on more than `corner_radii`: a vertical radius that differs from the
+    /// horizontal one, or a percentage, is set, so they are elliptical or resolve against the box. A
+    /// vertical radius equal to the horizontal one is circular (senders give both radii of every
+    /// corner, so a state style replaces the whole pair).
     pub fn has_elliptical_radii(&self) -> bool {
-        self.corner_radii_y.iter().any(Option::is_some)
-            || self.corner_radii_percent.iter().flatten().any(Option::is_some)
+        let x = &self.corner_radii;
+        let horizontal = [x.top_left, x.top_right, x.bottom_right, x.bottom_left];
+        self.corner_radii_percent.iter().flatten().any(Option::is_some)
+            || self
+                .corner_radii_y
+                .iter()
+                .zip(horizontal)
+                .any(|(y, x)| y.is_some_and(|y| y != x))
     }
 
     /// Each corner's horizontal and vertical radius in a box of `size`, before fitting them to it.
@@ -1741,6 +1749,23 @@ mod tests {
 
 #[cfg(test)]
 mod overflow_mask_tests {
+    #[test]
+    fn vertical_radii_equal_to_the_horizontal_ones_are_circular() {
+        let mut style = Style::default();
+        let twenty = AbsoluteLength::Pixels(px(20.));
+        style.corner_radii = Corners { top_left: twenty, top_right: twenty, bottom_right: twenty, bottom_left: twenty };
+        style.corner_radii_y = [Some(twenty); 4];
+        assert!(!style.has_elliptical_radii());
+        // A state style's pair replaces the base's whole: 40 / 15 then 20 / 20 is circular again.
+        style.corner_radii_y[0] = Some(AbsoluteLength::Pixels(px(15.)));
+        assert!(style.has_elliptical_radii());
+        style.corner_radii_y = [None; 4];
+        style.corner_radii_percent = [[Some(50.), Some(50.)]; 4];
+        assert!(style.has_elliptical_radii());
+        let fitted = style.fitted_radii(size(px(160.), px(100.)), px(16.));
+        assert_eq!(fitted.top_left, size(px(80.), px(50.)));
+    }
+
     use super::*;
     use crate::{px, rems, size};
 
