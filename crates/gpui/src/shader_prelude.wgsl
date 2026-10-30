@@ -6,8 +6,9 @@ struct GpuiShaderParams {
     bounds: vec4<f32>,
     // The content mask, as a box in device pixels.
     content_mask: vec4<f32>,
-    // Top left, top right, bottom right, bottom left, in device pixels.
+    // Top left, top right, bottom right, bottom left, in device pixels: horizontal radii, then vertical ones.
     corner_radii: vec4<f32>,
+    corner_radii_y: vec4<f32>,
     // Where the backdrop texture sits in the target, in device pixels.
     backdrop_region: vec4<f32>,
     viewport_size: vec2<f32>,
@@ -64,16 +65,32 @@ fn gpui_shader_coverage(position: vec2<f32>) -> f32 {
     let half_size = bounds.zw * 0.5;
     let center_to_point = position - (bounds.xy + half_size);
     let radii = gpui_shader.corner_radii;
-    var radius: f32;
+    let radii_y = gpui_shader.corner_radii_y;
+    var radius: vec2<f32>;
     if center_to_point.y < 0.0 {
-        radius = select(radii.x, radii.y, center_to_point.x >= 0.0);
+        radius = select(vec2<f32>(radii.x, radii_y.x), vec2<f32>(radii.y, radii_y.y), center_to_point.x >= 0.0);
     } else {
-        radius = select(radii.w, radii.z, center_to_point.x >= 0.0);
+        radius = select(vec2<f32>(radii.w, radii_y.w), vec2<f32>(radii.z, radii_y.z), center_to_point.x >= 0.0);
     }
-    let corner_to_point = abs(center_to_point) - half_size + vec2<f32>(radius);
-    let distance = length(max(corner_to_point, vec2<f32>(0.0)))
-        + min(max(corner_to_point.x, corner_to_point.y), 0.0)
-        - radius;
+    // A corner with a zero radius on either axis is square.
+    if radius.x <= 0.0 || radius.y <= 0.0 {
+        radius = vec2<f32>(0.0);
+    }
+    let corner_to_point = abs(center_to_point) - half_size + radius;
+    var distance: f32;
+    if radius.x == radius.y {
+        distance = length(max(corner_to_point, vec2<f32>(0.0)))
+            + min(max(corner_to_point.x, corner_to_point.y), 0.0)
+            - radius.x;
+    } else if corner_to_point.x > 0.0 && corner_to_point.y > 0.0 {
+        // The ellipse's gradient-normalized distance, `k0 (k0 - 1) / k1`.
+        let r = max(radius, vec2<f32>(0.001));
+        let k0 = length(corner_to_point / r);
+        let k1 = max(length(corner_to_point / (r * r)), 1e-9);
+        distance = k0 * (k0 - 1.0) / k1;
+    } else {
+        distance = max(corner_to_point.x - radius.x, corner_to_point.y - radius.y);
+    }
     return clamp(0.5 - distance, 0.0, 1.0);
 }
 

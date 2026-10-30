@@ -12,6 +12,7 @@ pub(crate) struct ShaderParams {
     pub bounds: [f32; 4],
     pub content_mask: [f32; 4],
     pub corner_radii: [f32; 4],
+    pub corner_radii_y: [f32; 4],
     pub backdrop_region: [f32; 4],
     pub viewport_size: [f32; 2],
     pub opacity: f32,
@@ -27,6 +28,7 @@ impl ShaderParams {
         let b = filter.bounds;
         let m = filter.content_mask.bounds;
         let r = filter.corner_radii;
+        let ry = filter.corner_radii_y;
         Self {
             bounds: [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0],
             content_mask: [m.origin.x.0, m.origin.y.0, m.size.width.0, m.size.height.0],
@@ -36,6 +38,7 @@ impl ShaderParams {
                 r.bottom_right.0,
                 r.bottom_left.0,
             ],
+            corner_radii_y: [ry.top_left.0, ry.top_right.0, ry.bottom_right.0, ry.bottom_left.0],
             backdrop_region,
             viewport_size,
             opacity: filter.opacity,

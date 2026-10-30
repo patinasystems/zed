@@ -1364,6 +1364,8 @@ struct PolychromeSprite {
     // `ContentMask::corner_radii`: Direct3D clips square.
     Corners content_mask_radii;
     Corners corner_radii;
+    // Each corner's vertical radius (`PolychromeSprite::corner_radii_y`): Direct3D draws circular corners.
+    Corners corner_radii_y;
     TransformationMatrix transformation;
 };
 

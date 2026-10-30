@@ -1423,7 +1423,10 @@ pub struct BackdropFilter {
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Each corner's horizontal radius.
     pub corner_radii: Corners<ScaledPixels>,
+    /// Each corner's vertical radius (equal to `corner_radii` for a circular corner).
+    pub corner_radii_y: Corners<ScaledPixels>,
     /// Gaussian standard deviation, in device pixels.
     pub blur_radius: ScaledPixels,
     /// 1 leaves colors as they are; 0 is grayscale.
@@ -1446,6 +1449,7 @@ impl Default for BackdropFilter {
             bounds: Bounds::default(),
             content_mask: ContentMask::default(),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             blur_radius: ScaledPixels(0.),
             saturate: 1.,
             brightness: 1.,
@@ -2506,7 +2510,10 @@ pub struct PolychromeSprite {
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Each corner's horizontal radius.
     pub corner_radii: Corners<ScaledPixels>,
+    /// Each corner's vertical radius (equal to `corner_radii` for a circular corner).
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub transformation: TransformationMatrix,
 }
 
@@ -2932,6 +2939,7 @@ pub mod backdrop_filter_test_scene {
             bounds: bounds(8., 4., 32., 32.),
             content_mask: full,
             corner_radii: Corners::all(ScaledPixels(10.)),
+            corner_radii_y: Corners::all(ScaledPixels(10.)),
             blur_radius: ScaledPixels(3.),
             opacity: 1.,
             saturate: 1.,
@@ -4055,6 +4063,153 @@ pub mod elliptical_shadow_test_scene {
     }
 }
 
+/// An image drawn inside an oval (rx 32, ry 18).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_image_test_scene {
+    use super::*;
+    use crate::size;
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (80, 52);
+
+    /// A sprite of `tile` (a solid opaque image) at (8, 8), 64 x 36, with oval corners.
+    pub fn scene(tile: AtlasTile) -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            exact_scale: 0,
+            tile,
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            content_mask: full,
+            corner_radii: Corners::all(ScaledPixels(32.)),
+            corner_radii_y: Corners::all(ScaledPixels(18.)),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        scene
+    }
+
+    /// The oval's centre is the image's color (`covered` says which pixels are); the box's corner and the point the smaller circle would still
+    /// cover ((24, 9): above the arc, which is at y = 10.4 there) are clear.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4], covered: impl Fn([u8; 4]) -> bool) {
+        let at = |x: u32, y: u32| covered(pixel(x, y));
+        assert!(at(40, 26), "centre {:?}", pixel(40, 26));
+        assert!(!at(10, 10), "box corner {:?}", pixel(10, 10));
+        assert!(!at(24, 9), "above the elliptical arc {:?}", pixel(24, 9));
+        assert!(at(12, 26), "left tip {:?}", pixel(12, 26));
+    }
+}
+
+/// A backdrop filter (contrast 0: mid gray where there is color) inside an oval (rx 32, ry 18) over red.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_backdrop_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (80, 52);
+
+    /// The scene: a red page, and the filter over a 64 x 36 oval at (8, 8).
+    pub fn scene() -> Scene {
+        let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.)));
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let red: Hsla = Rgba { r: 1., g: 0., b: 0., a: 1. }.into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: red.into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(BackdropFilter {
+            bounds,
+            content_mask: full,
+            corner_radii: Corners::all(ScaledPixels(32.)),
+            corner_radii_y: Corners::all(ScaledPixels(18.)),
+            blur_radius: ScaledPixels(0.),
+            opacity: 1.,
+            saturate: 1.,
+            brightness: 1.,
+            contrast: 0.,
+            order: 0,
+            shader: ShaderDraw::NONE,
+        });
+        scene.finish();
+        scene
+    }
+
+    /// Filtered (gray) in the oval's centre, red in the box corner and above the arc at (24, 9),
+    /// where a circle of the smaller radius would still filter.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let filtered = |p: [u8; 4]| p[0] < 200 && p[1] > 60;
+        assert!(filtered(pixel(40, 26)), "centre {:?}", pixel(40, 26));
+        assert!(!filtered(pixel(10, 10)), "box corner {:?}", pixel(10, 10));
+        assert!(!filtered(pixel(24, 9)), "above the elliptical arc {:?}", pixel(24, 9));
+        assert!(filtered(pixel(12, 26)), "left tip {:?}", pixel(12, 26));
+    }
+}
+
+/// A custom shader's box inside an oval (rx 32, ry 18).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_shader_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (80, 52);
+
+    /// A solid green shader over a white page, clipped to a 64 x 36 oval at (8, 8).
+    pub fn scene() -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let white: Hsla = Rgba { r: 1., g: 1., b: 1., a: 1. }.into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: white.into(),
+            ..Default::default()
+        });
+        let source = "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
+        let shader = scene.add_shader(&Shader::new(source), &[], false, 1.);
+        scene.insert_primitive(BackdropFilter {
+            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            content_mask: full,
+            corner_radii: Corners::all(ScaledPixels(32.)),
+            corner_radii_y: Corners::all(ScaledPixels(18.)),
+            opacity: 1.,
+            shader,
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    /// Green in the oval's centre and left tip; white in the box corner and above the arc at (24, 9),
+    /// where a circle of the smaller radius would still draw.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let green = |p: [u8; 4]| p[1] > 200 && p[0] < 80;
+        assert!(green(pixel(40, 26)), "centre {:?}", pixel(40, 26));
+        assert!(green(pixel(12, 26)), "left tip {:?}", pixel(12, 26));
+        assert!(!green(pixel(10, 10)), "box corner {:?}", pixel(10, 10));
+        assert!(!green(pixel(24, 9)), "above the elliptical arc {:?}", pixel(24, 9));
+    }
+}
+
 /// Scenes for cost measurements of compositing groups.
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 #[doc(hidden)]
@@ -4655,6 +4810,7 @@ mod tests {
             bounds,
             content_mask: ContentMask::from(content_mask),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             transformation,
         }
     }
@@ -5488,6 +5644,7 @@ fn shade(input: ShaderInput) -> vec4<f32> {
         scene.insert_primitive(BackdropFilter {
             bounds: at,
             content_mask: full,
+            corner_radii_y: Corners::all(ScaledPixels(radius)),
             corner_radii: Corners::all(ScaledPixels(radius)),
             opacity,
             shader,

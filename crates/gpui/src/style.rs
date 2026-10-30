@@ -806,7 +806,7 @@ impl Style {
                     blend_mode: compositing.blend_mode,
                     backdrop: self.backdrop_filter.map(|backdrop| crate::GroupBackdrop {
                         bounds,
-                        corner_radii,
+                        corner_radii: quad_radii,
                         backdrop,
                     }),
                 };
@@ -839,7 +839,7 @@ impl Style {
         window.paint_drop_shadows(bounds, quad_radii, &self.box_shadow);
 
         if backdrop && let Some(backdrop) = self.backdrop_filter {
-            window.paint_backdrop_filter(bounds, corner_radii, backdrop);
+            window.paint_backdrop_filter(bounds, quad_radii, backdrop);
         }
 
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -876,7 +876,7 @@ impl Style {
         if let Some(Fill::Gradient(gradient)) = &self.background {
             window.paint_gradient_with_corner_shapes(
                 bounds,
-                corner_radii,
+                quad_radii,
                 self.corner_shapes,
                 gradient,
             );
@@ -886,7 +886,7 @@ impl Style {
         if let Some(fill) = &self.shader {
             window.paint_shader(
                 bounds,
-                corner_radii,
+                quad_radii,
                 &fill.shader,
                 &fill.uniforms,
                 fill.input,

@@ -1738,6 +1738,7 @@ struct PolychromeSprite {
     bounds: Bounds,
     content_mask: ContentMask,
     corner_radii: Corners,
+    corner_radii_y: Corners,
     transformation: TransformationMatrix,
 }
 
@@ -1784,7 +1785,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
-    let distance = quad_sdf(input.sprite_position, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf_xy(input.sprite_position, sprite.bounds, sprite.corner_radii, sprite.corner_radii_y);
 
     var color = sample;
     if (sprite.grayscale != 0u) {

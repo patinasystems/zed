@@ -218,6 +218,7 @@ struct BackdropCompositeParams {
     bounds: [f32; 4],
     content_mask: [f32; 4],
     corner_radii: [f32; 4],
+    corner_radii_y: [f32; 4],
     region: [f32; 4],
     viewport_size: [f32; 2],
     saturate: f32,
@@ -2817,6 +2818,7 @@ impl WgpuRendererCore {
         let rect =
             |b: Bounds<ScaledPixels>| [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0];
         let radii = filter.corner_radii;
+        let radii_y = filter.corner_radii_y;
         let params = BackdropCompositeParams {
             bounds: rect(filter.bounds),
             content_mask: rect(filter.content_mask.bounds),
@@ -2825,6 +2827,12 @@ impl WgpuRendererCore {
                 radii.top_right.0,
                 radii.bottom_right.0,
                 radii.bottom_left.0,
+            ],
+            corner_radii_y: [
+                radii_y.top_left.0,
+                radii_y.top_right.0,
+                radii_y.bottom_right.0,
+                radii_y.bottom_left.0,
             ],
             region,
             viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
@@ -4479,6 +4487,68 @@ mod tests {
         Ok(())
     }
 
+    /// An image inside an oval follows its elliptical corners.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn images_follow_elliptical_corners() -> anyhow::Result<()> {
+        use gpui::elliptical_image_test_scene as t;
+        use gpui::{AtlasKey, DevicePixels, ImageId, PlatformHeadlessRenderer, RenderImageParams};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let atlas = renderer.sprite_atlas();
+        let pixel: [u8; 4] = [0, 128, 0, 255];
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(7), frame_index: 0 }),
+                &mut || Ok(Some((Size { width: DevicePixels(1), height: DevicePixels(1) }, std::borrow::Cow::Borrowed(&pixel[..])))),
+            )?
+            .expect("tile");
+        let image = renderer.render_scene_to_image(&t::scene(tile), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0, |p| p[1] > 100 && p[0] < 60 && p[2] < 60);
+        Ok(())
+    }
+
+    /// A backdrop filter inside an oval follows its elliptical corners.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn backdrop_filters_follow_elliptical_corners() -> anyhow::Result<()> {
+        use gpui::elliptical_backdrop_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
+    /// A custom shader's box inside an oval follows its elliptical corners.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn custom_shaders_follow_elliptical_corners() -> anyhow::Result<()> {
+        use gpui::elliptical_shader_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
     /// The shared group mask scene (alpha and luminance masks, a mask moving with an
     /// offscreen group, a smaller mask, an empty one) on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
@@ -4849,7 +4919,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
     }
 
     #[test]

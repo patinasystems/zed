@@ -5738,7 +5738,7 @@ impl Window {
     pub fn paint_gradient(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         gradient: &Gradient,
     ) {
         self.paint_gradient_with_corner_shapes(bounds, corner_radii, CornerShapes::ROUND, gradient)
@@ -5748,7 +5748,7 @@ impl Window {
     pub fn paint_gradient_with_corner_shapes(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         corner_shapes: CornerShapes,
         gradient: &Gradient,
     ) {
@@ -5874,9 +5874,10 @@ impl Window {
     pub fn paint_backdrop_filter(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         backdrop: Backdrop,
     ) {
+        let corner_radii = corner_radii.into();
         self.invalidator.debug_assert_paint();
         let filter = self.backdrop_filter(bounds, corner_radii, backdrop, self.element_opacity());
         self.next_frame.scene.insert_primitive(filter);
@@ -5885,7 +5886,7 @@ impl Window {
     fn backdrop_filter(
         &self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: Corners<Size<Pixels>>,
         backdrop: Backdrop,
         opacity: f32,
     ) -> BackdropFilter {
@@ -5894,14 +5895,19 @@ impl Window {
             Some(transformation) => transform_pixel_bounds(transformation, bounds),
             None => bounds,
         };
+        // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
+        let fitted: Corners<Size<Pixels>> = if corner_radii.is_circular() {
+            corner_radii.horizontal().clamp_radii_for_quad_size(bounds.size).into()
+        } else {
+            corner_radii.scale_to_fit(bounds.size)
+        };
         BackdropFilter {
             order: 0,
             opacity,
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
-            corner_radii: corner_radii
-                .clamp_radii_for_quad_size(bounds.size)
-                .scale(scale_factor),
+            corner_radii: fitted.horizontal().scale(scale_factor),
+            corner_radii_y: fitted.vertical().scale(scale_factor),
             blur_radius: backdrop.blur_radius.scale(scale_factor),
             saturate: backdrop.saturate,
             brightness: backdrop.brightness,
@@ -5921,18 +5927,25 @@ impl Window {
     pub fn paint_shader(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         shader: &crate::Shader,
         uniforms: &[u8],
         input: crate::ShaderInput,
     ) {
         self.invalidator.debug_assert_paint();
+        let corner_radii: Corners<Size<Pixels>> = corner_radii.into();
         debug_assert!(uniforms.len() <= 4096, "shader uniforms over 4096 bytes");
         let uniforms = &uniforms[..uniforms.len().min(4096)];
         let scale_factor = self.scale_factor();
         let bounds = match self.element_transformation_stack.last() {
             Some(transformation) => transform_pixel_bounds(transformation, bounds),
             None => bounds,
+        };
+        // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
+        let fitted: Corners<Size<Pixels>> = if corner_radii.is_circular() {
+            corner_radii.horizontal().clamp_radii_for_quad_size(bounds.size).into()
+        } else {
+            corner_radii.scale_to_fit(bounds.size)
         };
         let draw = self.next_frame.scene.add_shader(
             shader,
@@ -5945,9 +5958,8 @@ impl Window {
             opacity: self.element_opacity(),
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
-            corner_radii: corner_radii
-                .clamp_radii_for_quad_size(bounds.size)
-                .scale(scale_factor),
+            corner_radii: fitted.horizontal().scale(scale_factor),
+            corner_radii_y: fitted.vertical().scale(scale_factor),
             shader: draw,
             ..BackdropFilter::default()
         });
@@ -6377,6 +6389,7 @@ impl Window {
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
                 content_mask,
                 tile,
                 opacity,
@@ -6463,7 +6476,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -6491,7 +6504,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Corners<Size<Pixels>>>,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -6528,7 +6541,7 @@ impl Window {
         self.paint_tile(
             visible_bounds,
             image_bounds,
-            corner_radii,
+            corner_radii.into(),
             tile,
             grayscale,
             transformation,
@@ -6565,7 +6578,7 @@ impl Window {
         self.paint_tile(
             visible_bounds,
             image_bounds,
-            corner_radii,
+            corner_radii.into(),
             tile,
             false,
             TransformationMatrix::unit(),
@@ -6627,7 +6640,7 @@ impl Window {
         &mut self,
         visible_bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: Corners<Size<Pixels>>,
         tile: AtlasTile,
         grayscale: bool,
         transformation: TransformationMatrix,
@@ -6685,9 +6698,14 @@ impl Window {
                 &transformation,
             );
         let content_mask = self.snapped_content_mask();
-        let corner_radii = corner_radii
-            .clamp_radii_for_quad_size(visible_bounds.size)
-            .scale(self.scale_factor());
+        // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
+        let fitted = if corner_radii.is_circular() {
+            corner_radii.horizontal().clamp_radii_for_quad_size(visible_bounds.size).into()
+        } else {
+            corner_radii.scale_to_fit(visible_bounds.size)
+        };
+        let corner_radii_y = fitted.vertical().scale(self.scale_factor());
+        let corner_radii = fitted.horizontal().scale(self.scale_factor());
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -6697,6 +6715,7 @@ impl Window {
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
+            corner_radii_y,
             tile: sub_tile,
             opacity,
             transformation,
@@ -12937,8 +12956,8 @@ impl Default for CompositingGroup {
 pub struct GroupBackdrop {
     /// The element's bounds.
     pub bounds: Bounds<Pixels>,
-    /// Its corner radii.
-    pub corner_radii: Corners<Pixels>,
+    /// Its corner radii: each corner's horizontal and vertical radius.
+    pub corner_radii: Corners<Size<Pixels>>,
     /// The filter.
     pub backdrop: Backdrop,
 }

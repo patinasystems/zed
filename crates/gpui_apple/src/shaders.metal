@@ -928,7 +928,7 @@ fragment float4 polychrome_sprite_fragment(
   }
   float4 sample = atlas_texture.sample(atlas_texture_sampler, tile_position);
   float distance =
-      quad_sdf(input.sprite_position, sprite.bounds, sprite.corner_radii);
+      quad_sdf_xy(input.sprite_position, sprite.bounds, sprite.corner_radii, sprite.corner_radii_y);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -2177,7 +2177,7 @@ float4 backdrop_filtered(float2 position, constant BackdropFilter *filter, float
   rgb = saturate(saturate_matrix * rgb);
   rgb = saturate(rgb * filter->brightness);
   rgb = saturate((rgb - 0.5) * filter->contrast + 0.5);
-  float distance = quad_sdf(position, filter->bounds, filter->corner_radii);
+  float distance = quad_sdf_xy(position, filter->bounds, filter->corner_radii, filter->corner_radii_y);
   coverage = saturate(0.5 - distance) * filter->opacity;
   return float4(rgb, color.a);
 }

@@ -3137,6 +3137,7 @@ mod tests {
             bounds: Bounds::new(point(ScaledPixels(4.), ScaledPixels(4.)), size(ScaledPixels(40.), ScaledPixels(40.))),
             content_mask: ContentMask::from(all),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             transformation: TransformationMatrix::unit(),
         });
         scene.finish();
@@ -3182,6 +3183,7 @@ mod tests {
                 bounds: Bounds::new(point(ScaledPixels(2.), ScaledPixels(2.)), size(ScaledPixels(2.), ScaledPixels(4.))),
                 content_mask: ContentMask::from(all),
                 corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
                 transformation: TransformationMatrix::unit(),
             });
             scene.finish();
@@ -3214,6 +3216,7 @@ mod tests {
             bounds,
             content_mask: ContentMask::from(bounds),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
             blur_radius: ScaledPixels(2.),
             opacity: 1.,
             saturate: 1.,
@@ -3765,6 +3768,41 @@ mod tests {
     #[test]
     fn elliptical_shadows_follow_the_oval() {
         use gpui::elliptical_shadow_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0);
+    }
+
+    #[test]
+    fn images_follow_elliptical_corners() {
+        use gpui::{AtlasKey, ImageId, RenderImageParams};
+        use gpui::elliptical_image_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.update_transparency(true);
+        let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+        let pixel: [u8; 4] = [0, 128, 0, 255];
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(7), frame_index: 0 }),
+                &mut || Ok(Some((size(DevicePixels(1), DevicePixels(1)), std::borrow::Cow::Borrowed(&pixel[..])))),
+            )
+            .expect("insert")
+            .expect("tile");
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(tile), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, |p| p[3] > 128);
+    }
+
+    #[test]
+    fn backdrop_filters_follow_elliptical_corners() {
+        use gpui::elliptical_backdrop_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0);
+    }
+
+    #[test]
+    fn custom_shaders_follow_elliptical_corners() {
+        use gpui::elliptical_shader_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
         t::check(|x, y| image.get_pixel(x, y).0);

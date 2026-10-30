@@ -53,8 +53,9 @@ struct CompositeParams {
     // The filter's bounds and content mask, origin and size, device pixels.
     bounds: vec4<f32>,
     content_mask: vec4<f32>,
-    // Top left, top right, bottom right, bottom left.
+    // Top left, top right, bottom right, bottom left: horizontal radii, then vertical ones.
     corner_radii: vec4<f32>,
+    corner_radii_y: vec4<f32>,
     // Where the filtered texture sits in the target: origin and size.
     region: vec4<f32>,
     viewport_size: vec2<f32>,
@@ -86,17 +87,32 @@ fn vs_backdrop_composite(@builtin(vertex_index) vertex_id: u32) -> CompositeVary
     return out;
 }
 
-fn backdrop_corner_radius(center_to_point: vec2<f32>) -> f32 {
+fn backdrop_corner_radius(center_to_point: vec2<f32>) -> vec2<f32> {
+    var r: vec2<f32>;
     if (center_to_point.x < 0.0) {
         if (center_to_point.y < 0.0) {
-            return composite.corner_radii.x;
+            r = vec2<f32>(composite.corner_radii.x, composite.corner_radii_y.x);
+        } else {
+            r = vec2<f32>(composite.corner_radii.w, composite.corner_radii_y.w);
         }
-        return composite.corner_radii.w;
+    } else if (center_to_point.y < 0.0) {
+        r = vec2<f32>(composite.corner_radii.y, composite.corner_radii_y.y);
+    } else {
+        r = vec2<f32>(composite.corner_radii.z, composite.corner_radii_y.z);
     }
-    if (center_to_point.y < 0.0) {
-        return composite.corner_radii.y;
+    // A corner with a zero radius on either axis is square.
+    return select(r, vec2<f32>(0.0), r.x <= 0.0 || r.y <= 0.0);
+}
+
+// Signed distance to a quarter ellipse (positive outside): `k0 (k0 - 1) / k1`.
+fn backdrop_ellipse_sdf(p: vec2<f32>, r: vec2<f32>) -> f32 {
+    let radii = max(r, vec2<f32>(0.001));
+    let k0 = length(p / radii);
+    let k1 = length(p / (radii * radii));
+    if (k1 < 1e-9) {
+        return -min(radii.x, radii.y);
     }
-    return composite.corner_radii.z;
+    return k0 * (k0 - 1.0) / k1;
 }
 
 struct Filtered {
@@ -128,8 +144,15 @@ fn backdrop_filtered(position: vec2<f32>) -> Filtered {
     let center_to_point = position - (composite.bounds.xy + half_size);
     let radius = backdrop_corner_radius(center_to_point);
     let corner_to_point = abs(center_to_point) - half_size + radius;
-    let distance = length(max(vec2<f32>(0.0), corner_to_point))
-        + min(0.0, max(corner_to_point.x, corner_to_point.y)) - radius;
+    var distance: f32;
+    if (radius.x == radius.y) {
+        distance = length(max(vec2<f32>(0.0), corner_to_point))
+            + min(0.0, max(corner_to_point.x, corner_to_point.y)) - radius.x;
+    } else if (corner_to_point.x > 0.0 && corner_to_point.y > 0.0) {
+        distance = backdrop_ellipse_sdf(corner_to_point, radius);
+    } else {
+        distance = max(corner_to_point.x - radius.x, corner_to_point.y - radius.y);
+    }
     var out: Filtered;
     out.color = vec4<f32>(rgb, color.a);
     out.coverage = saturate(0.5 - distance) * composite.opacity;
