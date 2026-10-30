@@ -3733,6 +3733,26 @@ mod tests {
     }
 
     #[test]
+    fn elliptical_corners_render() {
+        use gpui::elliptical_corner_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        assert!(probes.len() > 300, "{} probes", probes.len());
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("elliptical_corners_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+    }
+
+    #[test]
     fn blend_modes_match_the_reference() {
         use gpui::blend_mode_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();

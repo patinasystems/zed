@@ -5674,12 +5674,15 @@ impl Window {
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
+        // A corner reaches `radii_y` into its top or bottom edge's band and `radii` into its left or
+        // right edge's band.
         let radii = &quad.corner_radii;
+        let radii_y = &quad.corner_radii_y;
         let widths = &quad.border_widths;
         let edge_radii = Edges {
-            top: radii.top_left.max(radii.top_right),
+            top: radii_y.top_left.max(radii_y.top_right),
             right: radii.top_right.max(radii.bottom_right),
-            bottom: radii.bottom_left.max(radii.bottom_right),
+            bottom: radii_y.bottom_left.max(radii_y.bottom_right),
             left: radii.top_left.max(radii.bottom_left),
         };
 
@@ -5753,7 +5756,7 @@ impl Window {
         self.paint_quad_with_corner_shapes(
             PaintQuad {
                 bounds,
-                corner_radii,
+                corner_radii: corner_radii.into(),
                 background: Background::painted_gradient(start, gradient.first_color()),
                 border_widths: Edges::default(),
                 border_color: transparent_black(),
@@ -5791,7 +5794,8 @@ impl Window {
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            corner_radii: quad.corner_radii.horizontal().scale(self.scale_factor()),
+            corner_radii_y: quad.corner_radii.vertical().scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
             transformation: self.device_element_transformation(),
@@ -9390,8 +9394,10 @@ impl From<[u8; 20]> for ElementId {
 pub struct PaintQuad {
     /// The bounds of the quad within the window.
     pub bounds: Bounds<Pixels>,
-    /// The radii of the quad's corners.
-    pub corner_radii: Corners<Pixels>,
+    /// The radii of the quad's corners: each corner's horizontal (`Size::width`) and vertical
+    /// (`Size::height`) radius, which fit the bounds ([`Corners::scale_to_fit`]). A corner with a
+    /// zero radius on either axis is square. Circular radii convert with `Into`.
+    pub corner_radii: Corners<Size<Pixels>>,
     /// The background color of the quad.
     pub background: Background,
     /// The widths of the quad's borders.
@@ -9404,7 +9410,7 @@ pub struct PaintQuad {
 
 impl PaintQuad {
     /// Sets the corner radii of the quad.
-    pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
+    pub fn corner_radii(self, corner_radii: impl Into<Corners<Size<Pixels>>>) -> Self {
         PaintQuad {
             corner_radii: corner_radii.into(),
             ..self
@@ -9439,7 +9445,7 @@ impl PaintQuad {
 /// Creates a quad with the given parameters.
 pub fn quad(
     bounds: Bounds<Pixels>,
-    corner_radii: impl Into<Corners<Pixels>>,
+    corner_radii: impl Into<Corners<Size<Pixels>>>,
     background: impl Into<Background>,
     border_widths: impl Into<Edges<Pixels>>,
     border_color: impl Into<Hsla>,

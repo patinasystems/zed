@@ -2465,6 +2465,106 @@ impl Corners<Pixels> {
     }
 }
 
+impl Corners<Size<Pixels>> {
+    /// Corners with a horizontal radius (`Size::width`) and a vertical radius (`Size::height`) each,
+    /// from the two sets of radii.
+    #[must_use]
+    pub fn from_axes(x: Corners<Pixels>, y: Corners<Pixels>) -> Self {
+        Corners {
+            top_left: size(x.top_left, y.top_left),
+            top_right: size(x.top_right, y.top_right),
+            bottom_right: size(x.bottom_right, y.bottom_right),
+            bottom_left: size(x.bottom_left, y.bottom_left),
+        }
+    }
+
+    /// Each corner's horizontal radius.
+    #[must_use]
+    pub fn horizontal(&self) -> Corners<Pixels> {
+        self.map(|s| s.width)
+    }
+
+    /// Each corner's vertical radius.
+    #[must_use]
+    pub fn vertical(&self) -> Corners<Pixels> {
+        self.map(|s| s.height)
+    }
+
+    /// The smaller radius of each corner: the circular corner to draw where elliptical ones are not
+    /// supported.
+    #[must_use]
+    pub fn circular(&self) -> Corners<Pixels> {
+        self.map(|s| s.width.min(s.height))
+    }
+
+    /// Whether every corner is circular.
+    #[must_use]
+    pub fn is_circular(&self) -> bool {
+        self.horizontal() == self.vertical()
+    }
+
+    /// Fits the corners to a box of `size` (CSS Backgrounds 3 5.5 "Overlapping curves"). When two
+    /// adjacent radii would overlap along a side, every radius (both axes of all four corners) is
+    /// scaled by the same factor `min(side / (r_a + r_b))`, so the corners keep their proportions. A
+    /// corner with a zero radius on either axis is square, as in CSS.
+    #[must_use]
+    pub fn scale_to_fit(self, size: Size<Pixels>) -> Self {
+        let square = |c: Size<Pixels>| {
+            if c.width <= Pixels::ZERO || c.height <= Pixels::ZERO {
+                Size::default()
+            } else {
+                c
+            }
+        };
+        let c = Corners {
+            top_left: square(self.top_left),
+            top_right: square(self.top_right),
+            bottom_right: square(self.bottom_right),
+            bottom_left: square(self.bottom_left),
+        };
+        let mut f = 1f32;
+        for (side, a, b) in [
+            (size.width, c.top_left.width, c.top_right.width),
+            (size.width, c.bottom_left.width, c.bottom_right.width),
+            (size.height, c.top_left.height, c.bottom_left.height),
+            (size.height, c.top_right.height, c.bottom_right.height),
+        ] {
+            let sum = f32::from(a) + f32::from(b);
+            if sum > f32::from(side) && sum > 0. {
+                f = f.min(f32::from(side) / sum);
+            }
+        }
+        if f < 1. {
+            c.map(|s| size_scaled(*s, f))
+        } else {
+            c
+        }
+    }
+}
+
+fn size_scaled(s: Size<Pixels>, f: f32) -> Size<Pixels> {
+    size(s.width * f, s.height * f)
+}
+
+/// Circular corners: each vertical radius is the horizontal one.
+impl From<Corners<Pixels>> for Corners<Size<Pixels>> {
+    fn from(c: Corners<Pixels>) -> Self {
+        Corners::from_axes(c, c)
+    }
+}
+
+impl From<Pixels> for Corners<Size<Pixels>> {
+    fn from(val: Pixels) -> Self {
+        Corners::<Pixels>::from(val).into()
+    }
+}
+
+impl From<f32> for Corners<Size<Pixels>> {
+    fn from(val: f32) -> Self {
+        Corners::<Pixels>::from(val).into()
+    }
+}
+
 impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corners<T> {
     /// Clamps corner radii to be less than or equal to half the shortest side of a quad.
     ///
@@ -3982,6 +4082,42 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn elliptical_corners_fit_the_box_by_the_tightest_side() {
+        let c = |tl: (f32, f32), tr: (f32, f32), br: (f32, f32), bl: (f32, f32)| Corners {
+            top_left: size(px(tl.0), px(tl.1)),
+            top_right: size(px(tr.0), px(tr.1)),
+            bottom_right: size(px(br.0), px(br.1)),
+            bottom_left: size(px(bl.0), px(bl.1)),
+        };
+        // 50% of 160 x 100: the sides are met exactly, so nothing scales.
+        let oval = c((80., 50.), (80., 50.), (80., 50.), (80., 50.));
+        assert_eq!(oval.scale_to_fit(size(px(160.), px(100.))), oval);
+        // Top side 70 + 50 = 120 > 100: every radius scales by 100 / 120.
+        let uneven = c((70., 20.), (50., 20.), (10., 10.), (10., 10.));
+        let f = 100. / 120.;
+        assert_eq!(
+            uneven.scale_to_fit(size(px(100.), px(60.))).top_left,
+            size(px(70. * f), px(20. * f))
+        );
+        // A radius that is zero on either axis is a square corner.
+        let flat = c((30., 0.), (0., 30.), (10., 10.), (10., 10.));
+        let fitted = flat.scale_to_fit(size(px(200.), px(200.)));
+        assert_eq!(fitted.top_left, size(px(0.), px(0.)));
+        assert_eq!(fitted.top_right, size(px(0.), px(0.)));
+        assert_eq!(fitted.bottom_right, size(px(10.), px(10.)));
+    }
+
+    #[test]
+    fn circular_radii_convert_with_the_vertical_radius_equal() {
+        let c: Corners<Size<Pixels>> = Corners::<Pixels>::from(px(6.)).into();
+        assert!(c.is_circular());
+        assert_eq!(c.horizontal(), c.vertical());
+        let e = Corners::from_axes(Corners::from(px(8.)), Corners::from(px(4.)));
+        assert!(!e.is_circular());
+        assert_eq!(e.circular(), Corners::from(px(4.)));
+    }
     use super::*;
 
     #[test]

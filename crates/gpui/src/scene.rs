@@ -1269,7 +1269,11 @@ pub struct Quad {
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Background,
     pub border_color: Hsla,
+    /// Each corner's horizontal radius.
     pub corner_radii: Corners<ScaledPixels>,
+    /// Each corner's vertical radius: equal to `corner_radii` for a circular corner. A corner with
+    /// a zero radius on either axis is square (CSS Backgrounds 3 5.5).
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     /// Applied to the quad after layout, in device pixels (see [`Window::with_element_transformation`]).
     pub transformation: TransformationMatrix,
@@ -3659,6 +3663,7 @@ pub mod corner_shape_test_scene {
                 content_mask: full,
                 background: color(1., 0., 0.).into(),
                 corner_radii: Corners::all(ScaledPixels(RADIUS)),
+                corner_radii_y: Corners::all(ScaledPixels(RADIUS)),
                 corner_shapes: CornerShapes {
                     top_left: tl,
                     top_right: tr,
@@ -3712,6 +3717,192 @@ pub mod corner_shape_test_scene {
                         },
                     });
                 }
+            }
+        }
+        scene.finish();
+        (scene, probes)
+    }
+}
+
+/// Quads with elliptical corners (CSS `border-radius: a / b`), with probes every renderer must hit.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod elliptical_corner_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, check};
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (72, 136);
+
+    /// One quad: bounds `[x, y, w, h]`, each corner's horizontal and vertical radius (top left, top
+    /// right, bottom right, bottom left), the border width, and the fill and border colors.
+    pub struct Spec {
+        pub bounds: [f32; 4],
+        pub rx: [f32; 4],
+        pub ry: [f32; 4],
+        pub border: f32,
+        pub fill: [u8; 3],
+        pub border_color: [u8; 3],
+    }
+
+    /// An oval, an oval with a border, and four unlike corners (one square: a zero vertical radius).
+    pub const SPECS: [Spec; 3] = [
+        Spec {
+            bounds: [4., 4., 64., 36.],
+            rx: [32.; 4],
+            ry: [18.; 4],
+            border: 0.,
+            fill: [255, 0, 0],
+            border_color: [0, 0, 0],
+        },
+        Spec {
+            bounds: [4., 48., 64., 36.],
+            rx: [32.; 4],
+            ry: [18.; 4],
+            border: 4.,
+            fill: [255, 255, 0],
+            border_color: [0, 0, 255],
+        },
+        Spec {
+            bounds: [4., 92., 64., 36.],
+            rx: [24., 8., 20., 28.],
+            ry: [8., 20., 0., 14.],
+            border: 0.,
+            fill: [255, 0, 0],
+            border_color: [0, 0, 0],
+        },
+    ];
+
+    /// What a point of a quad shows: 0 outside, 1 border, 2 fill. `p` is relative to the quad's
+    /// top left corner.
+    pub fn class(spec: &Spec, p: [f32; 2]) -> u8 {
+        let [_, _, w, h] = spec.bounds;
+        let inside = |inset: f32| {
+            let [x, y] = [p[0], p[1]];
+            if x < inset || y < inset || x > w - inset || y > h - inset {
+                return false;
+            }
+            // The nearest corner: its ellipse, inset by `inset` on both axes.
+            let right = x > w / 2.;
+            let bottom = y > h / 2.;
+            let i = match (right, bottom) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+                (false, true) => 3,
+            };
+            let (rx, ry) = (spec.rx[i], spec.ry[i]);
+            if rx <= 0. || ry <= 0. {
+                return true;
+            }
+            let (rx, ry) = ((rx - inset).max(0.), (ry - inset).max(0.));
+            let cx = if right { w - inset - rx } else { inset + rx };
+            let cy = if bottom { h - inset - ry } else { inset + ry };
+            let (dx, dy) = (x - cx, y - cy);
+            let in_box = (right && dx > 0. || !right && dx < 0.) && (bottom && dy > 0. || !bottom && dy < 0.);
+            if !in_box || rx == 0. || ry == 0. {
+                return true;
+            }
+            (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.
+        };
+        if !inside(0.) {
+            0
+        } else if spec.border > 0. && !inside(spec.border) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let color = |c: [u8; 3]| -> Hsla {
+            Rgba {
+                r: c[0] as f32 / 255.,
+                g: c[1] as f32 / 255.,
+                b: c[2] as f32 / 255.,
+                a: 1.,
+            }
+            .into()
+        };
+        let corners = |v: [f32; 4]| Corners {
+            top_left: ScaledPixels(v[0]),
+            top_right: ScaledPixels(v[1]),
+            bottom_right: ScaledPixels(v[2]),
+            bottom_left: ScaledPixels(v[3]),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: color([255, 255, 255]).into(),
+            ..Default::default()
+        });
+        let mut probes = Vec::new();
+        for spec in &SPECS {
+            let [x, y, w, h] = spec.bounds;
+            let b = ScaledPixels(spec.border);
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(x), ScaledPixels(y)),
+                    size(ScaledPixels(w), ScaledPixels(h)),
+                ),
+                content_mask: full,
+                background: color(spec.fill).into(),
+                border_color: color(spec.border_color),
+                corner_radii: corners(spec.rx),
+                corner_radii_y: corners(spec.ry),
+                border_widths: Edges {
+                    top: b,
+                    right: b,
+                    bottom: b,
+                    left: b,
+                },
+                ..Default::default()
+            });
+            // A grid over the quad; keep a pixel only when it and points 1.2 px away on each axis
+            // agree (clear of the antialiased edge).
+            let mut py = y.floor() as i32 - 2;
+            while (py as f32) < y + h + 2. {
+                let mut px = x.floor() as i32 - 2;
+                while (px as f32) < x + w + 2. {
+                    let at = |dx: f32, dy: f32| {
+                        class(spec, [px as f32 + 0.5 + dx - x, py as f32 + 0.5 + dy - y])
+                    };
+                    let here = at(0., 0.);
+                    let steady = [(-1.2, 0.), (1.2, 0.), (0., -1.2), (0., 1.2)]
+                        .iter()
+                        .all(|(dx, dy)| at(*dx, *dy) == here);
+                    if steady && (px + py) % 3 == 0 {
+                        probes.push(Probe {
+                            what: match here {
+                                0 => "outside an elliptical corner",
+                                1 => "in an elliptical border",
+                                _ => "inside an elliptical fill",
+                            },
+                            x: px as u32,
+                            y: py as u32,
+                            rgba: match here {
+                                0 => [255, 255, 255, 255],
+                                1 => {
+                                    let c = spec.border_color;
+                                    [c[0], c[1], c[2], 255]
+                                }
+                                _ => {
+                                    let c = spec.fill;
+                                    [c[0], c[1], c[2], 255]
+                                }
+                            },
+                        });
+                    }
+                    px += 1;
+                }
+                py += 1;
             }
         }
         scene.finish();

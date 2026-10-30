@@ -6174,7 +6174,7 @@ impl EditorElement {
                 window.paint_layer(hitbox.bounds, |window| {
                     window.paint_quad(quad(
                         hitbox.bounds,
-                        Corners::default(),
+                        Corners::<Pixels>::default(),
                         cx.theme().colors().scrollbar_track_background,
                         scrollbar_edges,
                         cx.theme().colors().scrollbar_track_border,
@@ -6210,7 +6210,7 @@ impl EditorElement {
                         };
                         window.paint_quad(quad(
                             thumb_bounds,
-                            Corners::default(),
+                            Corners::<Pixels>::default(),
                             scrollbar_thumb_color,
                             scrollbar_edges,
                             cx.theme().colors().scrollbar_thumb_border,
@@ -6748,7 +6748,7 @@ impl EditorElement {
                         window.paint_layer(minimap_hitbox.bounds, |window| {
                             window.paint_quad(quad(
                                 thumb_bounds,
-                                Corners::default(),
+                                Corners::<Pixels>::default(),
                                 minimap_thumb_color,
                                 minimap_thumb_border,
                                 cx.theme().colors().minimap_thumb_border,
@@ -10695,7 +10695,7 @@ impl ScrollbarLayout {
             );
             quads.push(quad(
                 bounds,
-                Corners::default(),
+                Corners::<Pixels>::default(),
                 pixel_range.color,
                 Edges::default(),
                 Hsla::transparent_black(),

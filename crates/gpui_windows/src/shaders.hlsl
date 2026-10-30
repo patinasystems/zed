@@ -557,6 +557,9 @@ struct Quad {
     Background background;
     Hsla border_color;
     Corners corner_radii;
+    // Each corner's vertical radius (`Quad::corner_radii_y`). Direct3D draws circular corners:
+    // the shader reads `corner_radii` only, so this field keeps the layout in step with Rust.
+    Corners corner_radii_y;
     Edges border_widths;
     TransformationMatrix transformation;
     uint2 pad;

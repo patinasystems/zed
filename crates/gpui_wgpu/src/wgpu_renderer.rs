@@ -4412,6 +4412,35 @@ mod tests {
         Ok(())
     }
 
+    /// The shared elliptical-corner scene (CSS `border-radius: a / b`) on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn elliptical_corners_render() -> anyhow::Result<()> {
+        use gpui::elliptical_corner_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        assert!(probes.len() > 300, "{} probes", probes.len());
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("elliptical_corners_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        Ok(())
+    }
+
     /// The shared group mask scene (alpha and luminance masks, a mask moving with an
     /// offscreen group, a smaller mask, an empty one) on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
@@ -4775,7 +4804,7 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 52 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
@@ -4852,6 +4881,12 @@ mod tests {
                 bottom_right: 28.0.into(),
                 bottom_left: 29.0.into(),
             },
+            corner_radii_y: Corners {
+                top_left: 40.0.into(),
+                top_right: 41.0.into(),
+                bottom_right: 42.0.into(),
+                bottom_left: 43.0.into(),
+            },
             border_widths: Edges {
                 top: 30.0.into(),
                 right: 31.0.into(),
@@ -4910,6 +4945,10 @@ mod tests {
                 27.0_f32.to_bits(),
                 28.0_f32.to_bits(),
                 29.0_f32.to_bits(),
+                40.0_f32.to_bits(),
+                41.0_f32.to_bits(),
+                42.0_f32.to_bits(),
+                43.0_f32.to_bits(),
                 30.0_f32.to_bits(),
                 31.0_f32.to_bits(),
                 32.0_f32.to_bits(),

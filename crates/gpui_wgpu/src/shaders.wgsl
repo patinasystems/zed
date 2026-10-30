@@ -252,6 +252,11 @@ fn scale_corners(corners: Corners, scale: f32) -> Corners {
     );
 }
 
+fn corners_equal(a: Corners, b: Corners) -> bool {
+    return a.top_left == b.top_left && a.top_right == b.top_right &&
+        a.bottom_right == b.bottom_right && a.bottom_left == b.bottom_left;
+}
+
 fn bounds_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec2<f32> {
     return unit_vertex * bounds.size + bounds.origin;
 }
@@ -404,6 +409,24 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
     }
 }
 
+// The nearest corner's horizontal and vertical radius. A corner with a zero radius on either
+// axis is square (CSS Backgrounds 3 5.5).
+fn pick_corner_radii_xy(center_to_point: vec2<f32>, x: Corners, y: Corners) -> vec2<f32> {
+    let r = vec2<f32>(pick_corner_radius(center_to_point, x), pick_corner_radius(center_to_point, y));
+    return select(r, vec2<f32>(0.0), r.x <= 0.0 || r.y <= 0.0);
+}
+
+// Each corner's circle of the smaller radius: what dashed borders lay out around (an
+// elliptical corner's dashes follow its smaller circle).
+fn min_corners(x: Corners, y: Corners) -> Corners {
+    return Corners(
+        min(x.top_left, y.top_left),
+        min(x.top_right, y.top_right),
+        min(x.bottom_right, y.bottom_right),
+        min(x.bottom_left, y.bottom_left),
+    );
+}
+
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 //
@@ -468,6 +491,20 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
     return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+// `quad_sdf_impl` for an elliptical corner of radii `radii`. A circular corner takes the
+// circular path, so its pixels do not change.
+fn quad_sdf_impl_xy(corner_center_to_point: vec2<f32>, radii: vec2<f32>) -> f32 {
+    if (radii.x == radii.y) {
+        return quad_sdf_impl(corner_center_to_point, radii.x);
+    }
+    if (corner_center_to_point.x > 0.0 && corner_center_to_point.y > 0.0) {
+        // Outside the corner's center in both axes: the quarter ellipse (positive inside).
+        return -quarter_ellipse_sdf(corner_center_to_point, radii);
+    }
+    // Along a straight edge: the larger of the distances past each edge.
+    return max(corner_center_to_point.x - radii.x, corner_center_to_point.y - radii.y);
 }
 
 fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
@@ -749,7 +786,9 @@ struct Quad {
     content_mask: ContentMask,
     background: Background,
     border_color: Hsla,
+    // Each corner's horizontal and vertical radius.
     corner_radii: Corners,
+    corner_radii_y: Corners,
     border_widths: Edges,
     transformation: TransformationMatrix,
     // `gpui::CornerShapes::gpu`.
@@ -833,11 +872,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     if (transformed) {
         // Shade in the quad's own frame, scaled to device pixels so that edges
         // antialias over about one pixel.
-        // Corners stay circular: they take the smaller axis scale.
+        // Circular corners stay circular: they take the smaller axis scale. Elliptical ones scale
+        // each radius by its own axis.
         let scale = transformation_scale(quad.transformation);
         position = input.local_position * scale;
         quad.bounds = scale_bounds(quad.bounds, scale);
-        quad.corner_radii = scale_corners(quad.corner_radii, min(scale.x, scale.y));
+        if (corners_equal(quad.corner_radii, quad.corner_radii_y)) {
+            quad.corner_radii = scale_corners(quad.corner_radii, min(scale.x, scale.y));
+            quad.corner_radii_y = quad.corner_radii;
+        } else {
+            quad.corner_radii = scale_corners(quad.corner_radii, scale.x);
+            quad.corner_radii_y = scale_corners(quad.corner_radii_y, scale.y);
+        }
         quad.border_widths.top *= scale.y;
         quad.border_widths.right *= scale.x;
         quad.border_widths.bottom *= scale.y;
@@ -849,10 +895,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             input.background_solid, input.background_color0, input.background_color1);
     }
 
-    let unrounded = quad.corner_radii.top_left == 0.0 &&
-        quad.corner_radii.bottom_left == 0.0 &&
-        quad.corner_radii.top_right == 0.0 &&
-        quad.corner_radii.bottom_right == 0.0;
+    // Dashed borders lay out around each corner's smaller circle.
+    let dash_radii = min_corners(quad.corner_radii, quad.corner_radii_y);
+    let unrounded = dash_radii.top_left <= 0.0 &&
+        dash_radii.bottom_left <= 0.0 &&
+        dash_radii.top_right <= 0.0 &&
+        dash_radii.bottom_right <= 0.0;
 
     // Fast path when the quad is not rounded and doesn't have any border.
     // Transformed quads antialias their edges below.
@@ -873,8 +921,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // minimum distance between the center of the pixel and the edge.
     let antialias_threshold = 0.5;
 
-    // Radius of the nearest corner
-    let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    // Radii of the nearest corner: horizontal and vertical, both zero for a square corner.
+    let corner_radii_xy = pick_corner_radii_xy(center_to_point, quad.corner_radii, quad.corner_radii_y);
+    // The smaller of the two: what dashes and the shaped-corner test use.
+    let corner_radius = min(corner_radii_xy.x, corner_radii_xy.y);
 
     // Width of the nearest borders
     let border = vec2<f32>(
@@ -899,7 +949,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Vector from the point to the center of the rounded corner's circle, also
     // mirrored into bottom right quadrant.
-    let corner_center_to_point = corner_to_point + corner_radius;
+    let corner_center_to_point = corner_to_point + corner_radii_xy;
 
     // Whether the nearest point on the border is rounded
     let is_near_rounded_corner =
@@ -941,9 +991,9 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    var outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    var outer_sdf = quad_sdf_impl_xy(corner_center_to_point, corner_radii_xy);
     if (shaped) {
-        outer_sdf = max(shaped_corner_sdf(corner_center_to_point, vec2<f32>(corner_radius), corner_shape),
+        outer_sdf = max(shaped_corner_sdf(corner_center_to_point, corner_radii_xy, corner_shape),
                         max(corner_to_point.x, corner_to_point.y));
     }
 
@@ -966,17 +1016,17 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         if (reduced_border.x == reduced_border.y) {
             inner_sdf = -(outer_sdf + reduced_border.x);
         } else {
-            let inner_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
+            let inner_radii = max(vec2<f32>(0.0), corner_radii_xy - reduced_border);
             inner_sdf = -shaped_corner_sdf(corner_center_to_point, inner_radii, corner_shape);
         }
     } else if (is_beyond_inner_straight_border) {
         // Fast path for points that must be outside the inner edge.
         inner_sdf = -1.0;
-    } else if (reduced_border.x == reduced_border.y) {
+    } else if (reduced_border.x == reduced_border.y && corner_radii_xy.x == corner_radii_xy.y) {
         // Fast path for circular inner edge.
         inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
-        let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
+        let ellipse_radii = max(vec2<f32>(0.0), corner_radii_xy - reduced_border);
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
     }
 
@@ -1047,10 +1097,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 // When corners are rounded, the dashes are laid out clockwise
                 // around the whole perimeter.
 
-                let r_tr = quad.corner_radii.top_right;
-                let r_br = quad.corner_radii.bottom_right;
-                let r_bl = quad.corner_radii.bottom_left;
-                let r_tl = quad.corner_radii.top_left;
+                let r_tr = dash_radii.top_right;
+                let r_br = dash_radii.bottom_right;
+                let r_bl = dash_radii.bottom_left;
+                let r_tl = dash_radii.top_left;
 
                 let w_t = quad.border_widths.top;
                 let w_r = quad.border_widths.right;

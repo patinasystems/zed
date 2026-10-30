@@ -298,6 +298,12 @@ pub struct Style {
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// The vertical radius of each corner (top left, top right, bottom right, bottom left) where it differs from the horizontal radius in
+    /// `corner_radii` (CSS `border-radius: a / b`); `None` is circular. The background and the
+    /// border are elliptical; shadows, backdrop filters, gradients, shaders and overflow clips
+    /// still follow the smaller circle of each corner.
+    pub corner_radii_y: [Option<AbsoluteLength>; 4],
+
     /// The shape of each rounded corner (CSS `corner-shape`): the background, a
     /// background gradient and the border follow it.
     pub corner_shapes: CornerShapes,
@@ -728,7 +734,7 @@ impl Style {
                 let corner_radii = if self.overflow.x != Overflow::Visible
                     && self.overflow.y != Overflow::Visible
                 {
-                    let outer = self.corner_radii.to_pixels(rem_size);
+                    let outer = self.border_box_radii(rem_size).circular();
                     let inset = |r: Pixels, a: Pixels, b: Pixels| (r - a.max(b)).max(Pixels::ZERO);
                     let edges = self.border_widths.to_pixels(rem_size);
                     let bordered = self
@@ -777,10 +783,10 @@ impl Style {
         }
 
         let rem_size = window.rem_size();
-        let corner_radii = self
-            .corner_radii
-            .to_pixels(rem_size)
-            .clamp_radii_for_quad_size(bounds.size);
+        // The corners as drawn: elliptical for the background and the border, and the smaller
+        // circle of each for what has no elliptical form yet.
+        let quad_radii = self.fitted_radii(bounds.size, rem_size);
+        let corner_radii = quad_radii.circular();
 
         match &self.compositing {
             Some(compositing) => {
@@ -798,10 +804,10 @@ impl Style {
                     }),
                 };
                 window.with_compositing_group(&group, |window| {
-                    self.paint_box(bounds, corner_radii, false, window, cx, continuation)
+                    self.paint_box(bounds, quad_radii, false, window, cx, continuation)
                 });
             }
-            None => self.paint_box(bounds, corner_radii, true, window, cx, continuation),
+            None => self.paint_box(bounds, quad_radii, true, window, cx, continuation),
         }
 
         #[cfg(debug_assertions)]
@@ -815,13 +821,14 @@ impl Style {
     fn paint_box(
         &self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        quad_radii: Corners<Size<Pixels>>,
         backdrop: bool,
         window: &mut Window,
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
         let rem_size = window.rem_size();
+        let corner_radii = quad_radii.circular();
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
         if backdrop && let Some(backdrop) = self.backdrop_filter {
@@ -849,7 +856,7 @@ impl Style {
             window.paint_quad_with_corner_shapes(
                 quad(
                     bounds,
-                    corner_radii,
+                    quad_radii,
                     background_color.unwrap_or_default(),
                     Edges::default(),
                     border_color,
@@ -890,7 +897,7 @@ impl Style {
             window.paint_quad_with_corner_shapes(
                 quad(
                     bounds,
-                    corner_radii,
+                    quad_radii,
                     background,
                     border_widths,
                     self.border_color.unwrap_or_default(),
@@ -898,6 +905,29 @@ impl Style {
                 ),
                 self.corner_shapes,
             );
+        }
+    }
+
+    /// Each corner's horizontal and vertical radius, before fitting them to the box.
+    fn border_box_radii(&self, rem_size: Pixels) -> Corners<Size<Pixels>> {
+        let x = self.corner_radii.to_pixels(rem_size);
+        let y = |own: Option<AbsoluteLength>, x: Pixels| own.map_or(x, |l| l.to_pixels(rem_size));
+        Corners {
+            top_left: size(x.top_left, y(self.corner_radii_y[0], x.top_left)),
+            top_right: size(x.top_right, y(self.corner_radii_y[1], x.top_right)),
+            bottom_right: size(x.bottom_right, y(self.corner_radii_y[2], x.bottom_right)),
+            bottom_left: size(x.bottom_left, y(self.corner_radii_y[3], x.bottom_left)),
+        }
+    }
+
+    /// The corners fitted to a box of `size`. Circular corners keep GPUI's per-radius clamp (half
+    /// the shorter side); elliptical ones scale together (CSS Backgrounds 3 5.5).
+    fn fitted_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
+        let radii = self.border_box_radii(rem_size);
+        if radii.is_circular() {
+            radii.horizontal().clamp_radii_for_quad_size(size).into()
+        } else {
+            radii.scale_to_fit(size)
         }
     }
 
@@ -945,6 +975,7 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_radii_y: [None; 4],
             corner_shapes: CornerShapes::ROUND,
             box_shadow: Default::default(),
             backdrop_filter: None,

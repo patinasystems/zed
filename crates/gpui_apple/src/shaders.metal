@@ -32,6 +32,10 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
+float2 pick_corner_radii_xy(float2 center_to_point, Corners_ScaledPixels x, Corners_ScaledPixels y);
+Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y);
+bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b);
+float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii);
 float pick_corner_shape(float2 center_to_point, uint2 shapes);
 float shaped_corner_sdf(float2 p, float2 radii, float k);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
@@ -170,11 +174,18 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   if (transformed) {
     // Shade in the quad's own frame, scaled to device pixels so that edges
     // antialias over about one pixel.
-    // Corners stay circular: they take the smaller axis scale.
+    // Circular corners stay circular: they take the smaller axis scale. Elliptical ones scale
+    // each radius by its own axis.
     float2 scale = transformation_scale(quad.transformation);
     position = input.local_position * scale;
     quad.bounds = scale_bounds(quad.bounds, scale);
-    quad.corner_radii = scale_corners(quad.corner_radii, min(scale.x, scale.y));
+    if (corners_equal(quad.corner_radii, quad.corner_radii_y)) {
+      quad.corner_radii = scale_corners(quad.corner_radii, min(scale.x, scale.y));
+      quad.corner_radii_y = quad.corner_radii;
+    } else {
+      quad.corner_radii = scale_corners(quad.corner_radii, scale.x);
+      quad.corner_radii_y = scale_corners(quad.corner_radii_y, scale.y);
+    }
     quad.border_widths.top *= scale.y;
     quad.border_widths.right *= scale.x;
     quad.border_widths.bottom *= scale.y;
@@ -185,10 +196,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       input.background_solid, input.background_color0, input.background_color1);
   }
 
-  bool unrounded = quad.corner_radii.top_left == 0.0 &&
-    quad.corner_radii.bottom_left == 0.0 &&
-    quad.corner_radii.top_right == 0.0 &&
-    quad.corner_radii.bottom_right == 0.0;
+  // Dashed borders lay out around each corner's smaller circle.
+  Corners_ScaledPixels dash_radii = min_corners(quad.corner_radii, quad.corner_radii_y);
+  bool unrounded = dash_radii.top_left <= 0.0 &&
+    dash_radii.bottom_left <= 0.0 &&
+    dash_radii.top_right <= 0.0 &&
+    dash_radii.bottom_right <= 0.0;
 
   // Fast path when the quad is not rounded and doesn't have any border.
   // Transformed quads antialias their edges below.
@@ -209,8 +222,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // minimum distance between the center of the pixel and the edge.
   const float antialias_threshold = 0.5;
 
-  // Radius of the nearest corner
-  float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+  // Radii of the nearest corner: horizontal and vertical, both zero for a square corner.
+  float2 corner_radii_xy = pick_corner_radii_xy(center_to_point, quad.corner_radii, quad.corner_radii_y);
+  // The smaller of the two: what dashes and the shaped-corner test use.
+  float corner_radius = min(corner_radii_xy.x, corner_radii_xy.y);
 
   // Width of the nearest borders
   float2 border = float2(
@@ -230,7 +245,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Vector from the point to the center of the rounded corner's circle, also
   // mirrored into bottom right quadrant.
-  float2 corner_center_to_point = corner_to_point + corner_radius;
+  float2 corner_center_to_point = corner_to_point + corner_radii_xy;
 
   // Whether the nearest point on the border is rounded
   bool is_near_rounded_corner =
@@ -270,9 +285,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl_xy(corner_center_to_point, corner_radii_xy);
   if (shaped) {
-    outer_sdf = max(shaped_corner_sdf(corner_center_to_point, float2(corner_radius), corner_shape),
+    outer_sdf = max(shaped_corner_sdf(corner_center_to_point, corner_radii_xy, corner_shape),
                     max(corner_to_point.x, corner_to_point.y));
   }
 
@@ -295,17 +310,17 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     if (reduced_border.x == reduced_border.y) {
       inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
-      float2 inner_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
+      float2 inner_radii = max(float2(0.0), corner_radii_xy - reduced_border);
       inner_sdf = -shaped_corner_sdf(corner_center_to_point, inner_radii, corner_shape);
     }
   } else if (is_beyond_inner_straight_border) {
     // Fast path for points that must be outside the inner edge
     inner_sdf = -1.0;
-  } else if (reduced_border.x == reduced_border.y) {
+  } else if (reduced_border.x == reduced_border.y && corner_radii_xy.x == corner_radii_xy.y) {
     // Fast path for circular inner edge.
     inner_sdf = -(outer_sdf + reduced_border.x);
   } else {
-    float2 ellipse_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
+    float2 ellipse_radii = max(float2(0.0), corner_radii_xy - reduced_border);
     inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
   }
 
@@ -367,10 +382,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
         // When corners are rounded, the dashes are laid out clockwise
         // around the whole perimeter.
 
-        float r_tr = quad.corner_radii.top_right;
-        float r_br = quad.corner_radii.bottom_right;
-        float r_bl = quad.corner_radii.bottom_left;
-        float r_tl = quad.corner_radii.top_left;
+        float r_tr = dash_radii.top_right;
+        float r_br = dash_radii.bottom_right;
+        float r_bl = dash_radii.bottom_left;
+        float r_tl = dash_radii.top_left;
 
         float w_t = quad.border_widths.top;
         float w_r = quad.border_widths.right;
@@ -1300,6 +1315,39 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
 }
 
 // Implementation of quad signed distance field
+float2 pick_corner_radii_xy(float2 center_to_point, Corners_ScaledPixels x, Corners_ScaledPixels y) {
+  float2 r = float2(pick_corner_radius(center_to_point, x), pick_corner_radius(center_to_point, y));
+  return (r.x <= 0.0 || r.y <= 0.0) ? float2(0.0) : r;
+}
+
+Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y) {
+  return Corners_ScaledPixels{
+    min(x.top_left, y.top_left),
+    min(x.top_right, y.top_right),
+    min(x.bottom_right, y.bottom_right),
+    min(x.bottom_left, y.bottom_left),
+  };
+}
+
+bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b) {
+  return a.top_left == b.top_left && a.top_right == b.top_right &&
+    a.bottom_right == b.bottom_right && a.bottom_left == b.bottom_left;
+}
+
+// `quad_sdf_impl` for an elliptical corner of radii `radii`. A circular corner takes the
+// circular path, so its pixels do not change.
+float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii) {
+  if (radii.x == radii.y) {
+    return quad_sdf_impl(corner_center_to_point, radii.x);
+  }
+  if (corner_center_to_point.x > 0.0 && corner_center_to_point.y > 0.0) {
+    // Past the corner's center in both axes: the quarter ellipse (positive inside).
+    return -quarter_ellipse_sdf(corner_center_to_point, radii);
+  }
+  // Along a straight edge: the larger of the distances past each edge.
+  return max(corner_center_to_point.x - radii.x, corner_center_to_point.y - radii.y);
+}
+
 float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners

@@ -1091,6 +1091,7 @@ pub mod gradient_test_scene {
                 content_mask: mask,
                 background,
                 corner_radii: Corners::all(ScaledPixels(12.)),
+                corner_radii_y: Corners::all(ScaledPixels(12.)),
                 ..Default::default()
             });
         }
@@ -1136,6 +1137,7 @@ pub mod gradient_test_scene {
                 content_mask: full(),
                 background: Background::painted_gradient(start, gradient.first_color()),
                 corner_radii: Corners::all(ScaledPixels(radius)),
+                corner_radii_y: Corners::all(ScaledPixels(radius)),
                 transformation,
                 ..Default::default()
             });

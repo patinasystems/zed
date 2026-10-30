@@ -1580,7 +1580,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                         if has_border {
                             window.paint_quad(quad(
                                 *track_bounds,
-                                Corners::default(),
+                                Corners::<Pixels>::default(),
                                 Hsla::transparent_black(),
                                 match axis {
                                     ScrollbarAxis::Horizontal => Edges {
