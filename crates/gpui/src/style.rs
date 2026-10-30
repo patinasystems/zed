@@ -304,6 +304,13 @@ pub struct Style {
     /// still follow the smaller circle of each corner.
     pub corner_radii_y: [Option<AbsoluteLength>; 4],
 
+    /// Radii that are a percentage of the border box (CSS `border-radius: 50%`): per corner (top
+    /// left, top right, bottom right, bottom left), the percentage of the width (horizontal radius)
+    /// and of the height (vertical radius). A percentage replaces that axis' length in
+    /// `corner_radii` or `corner_radii_y`. Senders give both axes for `border-radius: 50%`; a corner
+    /// with only a horizontal percentage is circular, with that radius.
+    pub corner_radii_percent: [[Option<f32>; 2]; 4],
+
     /// The shape of each rounded corner (CSS `corner-shape`): the background, a
     /// background gradient and the border follow it.
     pub corner_shapes: CornerShapes,
@@ -734,7 +741,7 @@ impl Style {
                 let corner_radii = if self.overflow.x != Overflow::Visible
                     && self.overflow.y != Overflow::Visible
                 {
-                    let outer = self.border_box_radii(rem_size).circular();
+                    let outer = self.border_box_radii(bounds.size, rem_size).circular();
                     let inset = |r: Pixels, a: Pixels, b: Pixels| (r - a.max(b)).max(Pixels::ZERO);
                     let edges = self.border_widths.to_pixels(rem_size);
                     let bordered = self
@@ -908,22 +915,37 @@ impl Style {
         }
     }
 
-    /// Each corner's horizontal and vertical radius, before fitting them to the box.
-    fn border_box_radii(&self, rem_size: Pixels) -> Corners<Size<Pixels>> {
+    /// Whether the corners depend on more than `corner_radii`: a vertical radius or a percentage
+    /// is set, so they are elliptical or resolve against the box.
+    pub fn has_elliptical_radii(&self) -> bool {
+        self.corner_radii_y.iter().any(Option::is_some)
+            || self.corner_radii_percent.iter().flatten().any(Option::is_some)
+    }
+
+    /// Each corner's horizontal and vertical radius in a box of `size`, before fitting them to it.
+    fn border_box_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
         let x = self.corner_radii.to_pixels(rem_size);
-        let y = |own: Option<AbsoluteLength>, x: Pixels| own.map_or(x, |l| l.to_pixels(rem_size));
+        let one = |i: usize, x: Pixels| {
+            let [px_x, px_y] = self.corner_radii_percent[i];
+            let rx = px_x.map_or(x, |p| size.width * (p / 100.));
+            let ry = match px_y {
+                Some(p) => size.height * (p / 100.),
+                None => self.corner_radii_y[i].map_or(rx, |l| l.to_pixels(rem_size)),
+            };
+            crate::size(rx, ry)
+        };
         Corners {
-            top_left: size(x.top_left, y(self.corner_radii_y[0], x.top_left)),
-            top_right: size(x.top_right, y(self.corner_radii_y[1], x.top_right)),
-            bottom_right: size(x.bottom_right, y(self.corner_radii_y[2], x.bottom_right)),
-            bottom_left: size(x.bottom_left, y(self.corner_radii_y[3], x.bottom_left)),
+            top_left: one(0, x.top_left),
+            top_right: one(1, x.top_right),
+            bottom_right: one(2, x.bottom_right),
+            bottom_left: one(3, x.bottom_left),
         }
     }
 
     /// The corners as [`Style::paint`] draws the background and the border, fitted to a box of `size`. Circular corners keep GPUI's per-radius clamp (half
     /// the shorter side); elliptical ones scale together (CSS Backgrounds 3 5.5).
     pub fn fitted_radii(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Size<Pixels>> {
-        let radii = self.border_box_radii(rem_size);
+        let radii = self.border_box_radii(size, rem_size);
         if radii.is_circular() {
             radii.horizontal().clamp_radii_for_quad_size(size).into()
         } else {
@@ -976,6 +998,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             corner_radii_y: [None; 4],
+            corner_radii_percent: [[None; 2]; 4],
             corner_shapes: CornerShapes::ROUND,
             box_shadow: Default::default(),
             backdrop_filter: None,

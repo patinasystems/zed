@@ -3733,7 +3733,7 @@ pub mod elliptical_corner_test_scene {
     use crate::{Rgba, size};
 
     /// The scene's size in device pixels.
-    pub const SIZE: (i32, i32) = (72, 136);
+    pub const SIZE: (i32, i32) = (72, 180);
 
     /// One quad: bounds `[x, y, w, h]`, each corner's horizontal and vertical radius (top left, top
     /// right, bottom right, bottom left), the border width, and the fill and border colors.
@@ -3746,8 +3746,9 @@ pub mod elliptical_corner_test_scene {
         pub border_color: [u8; 3],
     }
 
-    /// An oval, an oval with a border, and four unlike corners (one square: a zero vertical radius).
-    pub const SPECS: [Spec; 3] = [
+    /// An oval, an oval with a border, four unlike corners (one square: a zero vertical radius) and an
+    /// eccentric oval with a border.
+    pub const SPECS: [Spec; 4] = [
         Spec {
             bounds: [4., 4., 64., 36.],
             rx: [32.; 4],
@@ -3771,6 +3772,15 @@ pub mod elliptical_corner_test_scene {
             border: 0.,
             fill: [255, 0, 0],
             border_color: [0, 0, 0],
+        },
+        // Eccentric (32 : 8) with a border.
+        Spec {
+            bounds: [4., 136., 64., 32.],
+            rx: [32.; 4],
+            ry: [8.; 4],
+            border: 2.,
+            fill: [255, 255, 0],
+            border_color: [0, 0, 255],
         },
     ];
 

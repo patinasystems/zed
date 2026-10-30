@@ -493,6 +493,20 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
+// Signed distance from `p` (components >= 0, from the corner's center) to the quarter ellipse of radii
+// `r`, positive outside: the gradient-normalized implicit function `k0 (k0 - 1) / k1` with
+// `k0 = |p / r|` and `k1 = |p / r^2|`, which stays within about a pixel of the true distance for
+// the eccentric ellipses CSS `border-radius: a / b` makes.
+fn ellipse_sdf(p: vec2<f32>, r: vec2<f32>) -> f32 {
+    let radii = max(r, vec2<f32>(0.001));
+    let k0 = length(p / radii);
+    let k1 = length(p / (radii * radii));
+    if (k1 < 1e-9) {
+        return -min(radii.x, radii.y);
+    }
+    return k0 * (k0 - 1.0) / k1;
+}
+
 // `quad_sdf_impl` for an elliptical corner of radii `radii`. A circular corner takes the
 // circular path, so its pixels do not change.
 fn quad_sdf_impl_xy(corner_center_to_point: vec2<f32>, radii: vec2<f32>) -> f32 {
@@ -501,7 +515,7 @@ fn quad_sdf_impl_xy(corner_center_to_point: vec2<f32>, radii: vec2<f32>) -> f32 
     }
     if (corner_center_to_point.x > 0.0 && corner_center_to_point.y > 0.0) {
         // Outside the corner's center in both axes: the quarter ellipse (positive inside).
-        return -quarter_ellipse_sdf(corner_center_to_point, radii);
+        return ellipse_sdf(corner_center_to_point, radii);
     }
     // Along a straight edge: the larger of the distances past each edge.
     return max(corner_center_to_point.x - radii.x, corner_center_to_point.y - radii.y);
@@ -1027,7 +1041,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         inner_sdf = -(outer_sdf + reduced_border.x);
     } else {
         let ellipse_radii = max(vec2<f32>(0.0), corner_radii_xy - reduced_border);
-        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        if (corner_radii_xy.x == corner_radii_xy.y) {
+            inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        } else {
+            // The inner edge of an elliptical corner: its ellipse inset by the border.
+            inner_sdf = -ellipse_sdf(corner_center_to_point, ellipse_radii);
+        }
     }
 
     // Negative when inside the border

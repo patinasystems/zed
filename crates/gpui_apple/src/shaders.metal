@@ -36,6 +36,7 @@ float2 pick_corner_radii_xy(float2 center_to_point, Corners_ScaledPixels x, Corn
 Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y);
 bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b);
 float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii);
+float ellipse_sdf(float2 p, float2 r);
 float pick_corner_shape(float2 center_to_point, uint2 shapes);
 float shaped_corner_sdf(float2 p, float2 radii, float k);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
@@ -321,7 +322,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     inner_sdf = -(outer_sdf + reduced_border.x);
   } else {
     float2 ellipse_radii = max(float2(0.0), corner_radii_xy - reduced_border);
-    inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    if (corner_radii_xy.x == corner_radii_xy.y) {
+      inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    } else {
+      // The inner edge of an elliptical corner: its ellipse inset by the border.
+      inner_sdf = -ellipse_sdf(corner_center_to_point, ellipse_radii);
+    }
   }
 
   // Negative when inside the border
@@ -1334,6 +1340,20 @@ bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b) {
     a.bottom_right == b.bottom_right && a.bottom_left == b.bottom_left;
 }
 
+// Signed distance from `p` (components >= 0, from the corner's center) to the quarter ellipse of radii
+// `r`, positive outside: the gradient-normalized implicit function `k0 (k0 - 1) / k1` with
+// `k0 = |p / r|` and `k1 = |p / r^2|`, which stays within about a pixel of the true distance for
+// the eccentric ellipses CSS `border-radius: a / b` makes.
+float ellipse_sdf(float2 p, float2 r) {
+  float2 radii = max(r, float2(0.001));
+  float k0 = length(p / radii);
+  float k1 = length(p / (radii * radii));
+  if (k1 < 1e-9) {
+    return -min(radii.x, radii.y);
+  }
+  return k0 * (k0 - 1.0) / k1;
+}
+
 // `quad_sdf_impl` for an elliptical corner of radii `radii`. A circular corner takes the
 // circular path, so its pixels do not change.
 float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii) {
@@ -1342,7 +1362,7 @@ float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii) {
   }
   if (corner_center_to_point.x > 0.0 && corner_center_to_point.y > 0.0) {
     // Past the corner's center in both axes: the quarter ellipse (positive inside).
-    return -quarter_ellipse_sdf(corner_center_to_point, radii);
+    return ellipse_sdf(corner_center_to_point, radii);
   }
   // Along a straight edge: the larger of the distances past each edge.
   return max(corner_center_to_point.x - radii.x, corner_center_to_point.y - radii.y);
