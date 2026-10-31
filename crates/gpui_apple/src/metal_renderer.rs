@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
 pub use crate::metal_pipeline_cache::set_pipeline_cache_dir;
-use crate::metal_pipeline_cache::PipelineCache;
+use crate::metal_pipeline_cache::{Pipeline, PipelineCache};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -174,23 +174,23 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
-    path_sprites_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
-    retained_shapes_pipeline_state: metal::RenderPipelineState,
-    backdrop_copy_pipeline_state: metal::RenderPipelineState,
-    backdrop_blur_pipeline_state: metal::RenderPipelineState,
-    backdrop_composite_pipeline_state: metal::RenderPipelineState,
+    paths_rasterization_pipeline_state: Pipeline,
+    path_sprites_pipeline_state: Pipeline,
+    shadows_pipeline_state: Pipeline,
+    quads_pipeline_state: Pipeline,
+    underlines_pipeline_state: Pipeline,
+    monochrome_sprites_pipeline_state: Pipeline,
+    polychrome_sprites_pipeline_state: Pipeline,
+    surfaces_pipeline_state: Pipeline,
+    retained_shapes_pipeline_state: Pipeline,
+    backdrop_copy_pipeline_state: Pipeline,
+    backdrop_blur_pipeline_state: Pipeline,
+    backdrop_composite_pipeline_state: Pipeline,
     /// Composite a group's image over the target, adding to it (plus-lighter) and
     /// replacing it (plus-darker).
     group_composite_pipeline_states: GroupCompositePipelines,
     /// Draws a group's backdrop into its (transparent) image.
-    backdrop_group_pipeline_state: metal::RenderPipelineState,
+    backdrop_group_pipeline_state: Pipeline,
     /// Group images and their blur and backdrop copies, reused across frames and
     /// freed when a frame does not use them.
     texture_pool: TexturePool,
@@ -1168,7 +1168,7 @@ impl MetalRenderer {
             let encoder =
                 new_command_encoder_for_texture(command_buffer, &image, size, clear.take());
             self.draw_backdrop_with(
-                &self.backdrop_group_pipeline_state,
+                self.backdrop_group_pipeline_state.state(),
                 &filter,
                 &filtered,
                 region,
@@ -1414,7 +1414,7 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
-        command_encoder.set_render_pipeline_state(&self.retained_shapes_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.retained_shapes_pipeline_state.state());
         command_encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
         for draw in draws {
             let Some(gpu) = self.retained_shapes.get(&draw.shapes.id()) else {
@@ -1556,7 +1556,7 @@ impl MetalRenderer {
             znear: 0.0,
             zfar: 1.0,
         });
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.paths_rasterization_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&vertex_instance_bindings.buffer),
@@ -1593,7 +1593,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.shadows_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1635,7 +1635,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.quads_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1769,14 +1769,14 @@ impl MetalRenderer {
             );
             match blur {
                 Some(params) => {
-                    encoder.set_render_pipeline_state(&self.backdrop_blur_pipeline_state);
+                    encoder.set_render_pipeline_state(self.backdrop_blur_pipeline_state.state());
                     encoder.set_fragment_bytes(
                         0,
                         mem::size_of::<BackdropBlurParams>() as u64,
                         &params as *const BackdropBlurParams as *const _,
                     );
                 }
-                None => encoder.set_render_pipeline_state(&self.backdrop_copy_pipeline_state),
+                None => encoder.set_render_pipeline_state(self.backdrop_copy_pipeline_state.state()),
             }
             encoder.set_fragment_texture(0, Some(source));
             encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
@@ -1871,7 +1871,7 @@ impl MetalRenderer {
         encoder: &metal::RenderCommandEncoderRef,
     ) {
         self.draw_backdrop_with(
-            &self.backdrop_composite_pipeline_state,
+            self.backdrop_composite_pipeline_state.state(),
             filter,
             filtered,
             region,
@@ -1924,7 +1924,7 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.path_sprites_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1976,7 +1976,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.underlines_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.underlines_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2026,7 +2026,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.monochrome_sprites_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2082,7 +2082,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.polychrome_sprites_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2136,7 +2136,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        command_encoder.set_render_pipeline_state(self.surfaces_pipeline_state.state());
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2310,7 +2310,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
         .expect("error locating vertex function");
@@ -2343,7 +2343,7 @@ fn build_opaque_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
         .expect("error locating vertex function");
@@ -2366,7 +2366,7 @@ fn build_backdrop_composite_pipeline_state(
     pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label("backdrop_composite");
     let vertex_fn = library
@@ -2474,11 +2474,11 @@ impl TexturePool {
 /// The group composite pipelines, one per kind of hardware blending.
 struct GroupCompositePipelines {
     /// Premultiplied source over: normal and the blend modes, which read the backdrop.
-    over: metal::RenderPipelineState,
+    over: Pipeline,
     /// Adds (plus-lighter).
-    add: metal::RenderPipelineState,
+    add: Pipeline,
     /// Replaces the target with the shader's result (plus-darker).
-    replace: metal::RenderPipelineState,
+    replace: Pipeline,
 }
 
 impl GroupCompositePipelines {
@@ -2525,11 +2525,11 @@ impl GroupCompositePipelines {
 
     fn for_blend_mode(&self, blend_mode: gpui::BlendMode) -> &metal::RenderPipelineStateRef {
         match blend_mode {
-            gpui::BlendMode::PlusLighter => &self.add,
+            gpui::BlendMode::PlusLighter => self.add.state(),
             gpui::BlendMode::PlusDarker
             | gpui::BlendMode::ColorDodge
-            | gpui::BlendMode::ColorBurn => &self.replace,
-            _ => &self.over,
+            | gpui::BlendMode::ColorBurn => self.replace.state(),
+            _ => self.over.state(),
         }
     }
 }
@@ -2539,7 +2539,7 @@ fn build_backdrop_group_pipeline_state(
     pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label("backdrop_group");
     let vertex_fn = library
@@ -2577,7 +2577,7 @@ fn build_path_sprite_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
         .expect("error locating vertex function");
@@ -2610,7 +2610,7 @@ fn build_path_rasterization_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
     path_sample_count: u32,
-) -> metal::RenderPipelineState {
+) -> Pipeline {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
         .expect("error locating vertex function");

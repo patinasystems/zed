@@ -8,12 +8,18 @@
 //! from an archive there, and writes the archive again when any pipeline was missing from it: on
 //! the first launch, and after an OS or GPU driver update (Metal keys archived code by both, so
 //! stale code is a miss, never a wrong pipeline).
+//!
+//! With an archive to read, a renderer makes each pipeline the first time it draws with it
+//! ([`Pipeline::state`]): a page that draws quads and glyphs never makes the other pipelines,
+//! which cost about 40 KB each even from the archive. Without one, it compiles them all at once,
+//! as the archive is written from them.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     ptr,
+    rc::Rc,
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -34,8 +40,13 @@ pub fn set_pipeline_cache_dir(dir: PathBuf) -> bool {
 }
 
 /// One renderer's pipelines while it builds them: [`Self::build`] each, then [`Self::finish`].
-pub(crate) struct PipelineCache<'a> {
-    device: &'a metal::DeviceRef,
+pub(crate) struct PipelineCache {
+    shared: Rc<Shared>,
+}
+
+/// What a renderer's pipelines share: the device, the archive and every pipeline's descriptor.
+struct Shared {
+    device: metal::Device,
     /// The archive file, when a cache folder is set.
     path: Option<PathBuf>,
     /// The archive read from `path`, when it exists and Metal accepts it.
@@ -43,17 +54,58 @@ pub(crate) struct PipelineCache<'a> {
     /// Every pipeline built, to write a new archive from.
     descriptors: RefCell<Vec<RenderPipelineDescriptor>>,
     missed: Cell<bool>,
+    /// A pipeline made after construction missed the archive, and the archive was written again.
+    rewritten: Cell<bool>,
 }
 
-impl<'a> PipelineCache<'a> {
+/// A renderer's pipeline: made when built ([`PipelineCache::build`]) without an archive to read,
+/// else when first drawn with ([`Self::state`]).
+pub(crate) struct Pipeline {
+    state: OnceCell<metal::RenderPipelineState>,
+    /// The descriptor to make it from, until it is made.
+    descriptor: Option<RenderPipelineDescriptor>,
+    shared: Rc<Shared>,
+}
+
+impl Pipeline {
+    /// The pipeline state, made from the archive the first time (compiled on a miss, which writes
+    /// the archive again).
+    pub(crate) fn state(&self) -> &metal::RenderPipelineState {
+        self.state.get_or_init(|| {
+            let descriptor = self.descriptor.as_deref().expect("a deferred pipeline keeps its descriptor");
+            let shared = &self.shared;
+            if let Some(state) = shared.archived(descriptor) {
+                return state;
+            }
+            let state = shared.compile(descriptor);
+            if !shared.rewritten.replace(true) {
+                shared.write();
+            }
+            state
+        })
+    }
+
+    /// Whether the pipeline state was made (tests).
+    #[cfg(test)]
+    pub(crate) fn is_made(&self) -> bool {
+        self.state.get().is_some()
+    }
+}
+
+impl PipelineCache {
     /// The cache for pipelines built from a library made from `library` (its bytes or source).
-    pub(crate) fn new(device: &'a metal::DeviceRef, library: &[u8]) -> Self {
+    pub(crate) fn new(device: &metal::DeviceRef, library: &[u8]) -> Self {
         let path = CACHE_DIR.get().map(|dir| {
             let mut hasher = DefaultHasher::new();
             library.hash(&mut hasher);
             device.name().hash(&mut hasher);
             dir.join(format!("gpui-pipelines-{:016x}.metalar", hasher.finish()))
         });
+        Self::at(device, path)
+    }
+
+    /// The cache whose archive is the file at `path` (`None`: no archive).
+    fn at(device: &metal::DeviceRef, path: Option<PathBuf>) -> Self {
         let archive = path
             .as_deref()
             .filter(|path| path.is_file())
@@ -72,44 +124,62 @@ impl<'a> PipelineCache<'a> {
                     .ok()
             });
         Self {
-            device,
-            path,
-            archive,
-            descriptors: RefCell::default(),
-            missed: Cell::new(false),
+            shared: Rc::new(Shared {
+                device: device.to_owned(),
+                path,
+                archive,
+                descriptors: RefCell::default(),
+                missed: Cell::new(false),
+                rewritten: Cell::new(false),
+            }),
         }
     }
 
-    /// The pipeline for `descriptor`: from the archive when it has the pipeline's code, else
-    /// compiled.
-    pub(crate) fn build(
-        &self,
-        descriptor: &RenderPipelineDescriptorRef,
-    ) -> metal::RenderPipelineState {
-        if self.path.is_some() {
-            self.descriptors.borrow_mut().push(descriptor.to_owned());
+    /// The pipeline for `descriptor`: deferred to its first use when there is an archive to read
+    /// it from, else compiled now.
+    pub(crate) fn build(&self, descriptor: &RenderPipelineDescriptorRef) -> Pipeline {
+        let shared = &self.shared;
+        if shared.path.is_some() {
+            shared.descriptors.borrow_mut().push(descriptor.to_owned());
         }
-        if let Some(archive) = &self.archive {
-            descriptor.set_binary_archives(&[archive]);
-            let found = archived_pipeline(self.device, descriptor);
-            descriptor.set_binary_archives(&[]);
-            if let Some(state) = found {
-                return state;
-            }
+        let pipeline = Pipeline { state: OnceCell::new(), descriptor: None, shared: shared.clone() };
+        if shared.archive.is_some() {
+            return Pipeline { descriptor: Some(descriptor.to_owned()), ..pipeline };
         }
-        self.missed.set(true);
-        self.device
-            .new_render_pipeline_state(descriptor)
-            .expect("could not create render pipeline state")
+        shared.missed.set(true);
+        let _ = pipeline.state.set(shared.compile(descriptor));
+        pipeline
     }
 
     /// Writes the archive when a pipeline was missing from it. Failures are logged: the next
     /// launch compiles again.
     pub(crate) fn finish(self) {
-        let Some(path) = self.path.filter(|_| self.missed.get()) else {
-            return;
-        };
-        if let Err(error) = write_archive(self.device, &self.descriptors.into_inner(), &path) {
+        if self.shared.missed.get() {
+            self.shared.write();
+        }
+    }
+}
+
+impl Shared {
+    /// The pipeline from the archive, when it holds the pipeline's code.
+    fn archived(&self, descriptor: &RenderPipelineDescriptorRef) -> Option<metal::RenderPipelineState> {
+        let archive = self.archive.as_ref()?;
+        descriptor.set_binary_archives(&[archive]);
+        let found = archived_pipeline(&self.device, descriptor);
+        descriptor.set_binary_archives(&[]);
+        found
+    }
+
+    fn compile(&self, descriptor: &RenderPipelineDescriptorRef) -> metal::RenderPipelineState {
+        self.device
+            .new_render_pipeline_state(descriptor)
+            .expect("could not create render pipeline state")
+    }
+
+    /// Writes the archive from every pipeline's descriptor. Failures are logged.
+    fn write(&self) {
+        let Some(path) = &self.path else { return };
+        if let Err(error) = write_archive(&self.device, &self.descriptors.borrow(), path) {
             log::warn!("writing the pipeline archive {}: {error}", path.display());
         }
     }
@@ -169,4 +239,68 @@ fn write_archive(
 
 fn file_url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHADERS: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        vertex float4 v(uint id [[vertex_id]]) { return float4(float(id), 0.0, 0.0, 1.0); }
+        fragment float4 red() { return float4(1.0, 0.0, 0.0, 1.0); }
+        fragment float4 blue() { return float4(0.0, 0.0, 1.0, 1.0); }
+    "#;
+
+    fn descriptor(library: &metal::LibraryRef, fragment: &str) -> RenderPipelineDescriptor {
+        let descriptor = RenderPipelineDescriptor::new();
+        descriptor.set_vertex_function(Some(&library.get_function("v", None).unwrap()));
+        descriptor.set_fragment_function(Some(&library.get_function(fragment, None).unwrap()));
+        descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor
+    }
+
+    #[test]
+    fn pipelines_in_the_archive_are_made_on_first_use() {
+        let Some(device) = metal::Device::system_default() else { return };
+        let library = device
+            .new_library_with_source(SHADERS, &metal::CompileOptions::new())
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("gpui-pipelines-test-{}", std::process::id()));
+        let path = dir.join("test.metalar");
+        let _ = std::fs::remove_file(&path);
+
+        // No archive yet: compiled at once, and the archive written from them.
+        let first = PipelineCache::at(&device, Some(path.clone()));
+        let red = first.build(&descriptor(&library, "red"));
+        assert!(red.is_made());
+        first.finish();
+        assert!(path.is_file());
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // With the archive: made when first drawn with, from the archive (no rewrite).
+        let second = PipelineCache::at(&device, Some(path.clone()));
+        let red = second.build(&descriptor(&library, "red"));
+        assert!(!red.is_made());
+        let _ = red.state();
+        assert!(red.is_made());
+        assert!(!second.shared.rewritten.get());
+
+        // A pipeline the archive lacks compiles on first use and writes the archive again.
+        let blue = second.build(&descriptor(&library, "blue"));
+        assert!(!blue.is_made());
+        let _ = blue.state();
+        assert!(second.shared.rewritten.get());
+        second.finish();
+        assert!(std::fs::metadata(&path).unwrap().modified().unwrap() >= written);
+        let third = PipelineCache::at(&device, Some(path.clone()));
+        let blue = third.build(&descriptor(&library, "blue"));
+        assert!(third.shared.archived(blue.descriptor.as_deref().unwrap()).is_some(), "the rewritten archive holds it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
