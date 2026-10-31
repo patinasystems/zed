@@ -632,9 +632,7 @@ impl AppleTextSystemState {
         // Measure the glyph with a font at the size `rasterize_glyph` draws it at. Fonts with
         // optical sizes, such as the system font, change their outlines with the point size, so
         // bounds measured at another size and scaled can be too small and clip the glyph.
-        let font = self.fonts[params.font_id.0]
-            .native_font()
-            .clone_with_font_size(f32::from(params.font_size) as CGFloat);
+        let font = font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size));
         let rect = font.get_bounding_rects_for_glyphs(
             kCTFontOrientationDefault,
             &[params.glyph_id.0 as CGGlyph],
@@ -732,9 +730,7 @@ impl AppleTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            self.fonts[params.font_id.0]
-                .native_font()
-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
+            font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size))
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
                     &[CGPoint::new(
@@ -793,7 +789,7 @@ impl AppleTextSystemState {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
+                        &font_at_size(font, font_size.into()),
                     );
                 }
                 break_ligature = !break_ligature;
@@ -907,6 +903,14 @@ impl<'a> StringIndexConverter<'a> {
         }
         self.utf8_ix = self.text.len();
     }
+}
+
+/// `font` at `size` points, with its optical size (`opsz`) at `size`, as Core Text sets it for a
+/// font made at that size (and as WebKit draws). GPUI's fonts are made from a `CGFont` at another
+/// size, and `clone_with_font_size` keeps that optical size: the system font at 28 pt kept its
+/// 12 pt outlines and advances ('H' 0.7 pt further right and 1.4 pt wider than at 28 pt).
+fn font_at_size(font: &FontKitFont, size: f32) -> CTFont {
+    core_text::font::new_from_CGFont(&font.native_font().copy_to_CGFont(), size as f64)
 }
 
 fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
@@ -1439,6 +1443,58 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_glyphs_draw_and_shape_at_their_optical_size() {
+        use core_text::font::{kCTFontSystemFontType, new_ui_font_for_language};
+        use core_text::font_descriptor::kCTFontOrientationDefault;
+        let fonts = AppleTextSystem::new();
+        let font_id = fonts.font_id(&font(".SystemUIFont")).unwrap();
+        let glyph_id = fonts.glyph_for_char(font_id, 'H').unwrap();
+        for font_size in [12., 20., 28., 40., 96.] {
+            // Core Text's own system font at this size has its optical size at this size.
+            let reference = new_ui_font_for_language(kCTFontSystemFontType, font_size as f64, None);
+            let glyph = glyph_id.0 as core_graphics::base::CGGlyph;
+            let rect = reference.get_bounding_rects_for_glyphs(kCTFontOrientationDefault, &[glyph]);
+            let scale_factor = 8.;
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: px(font_size),
+                subpixel_variant: point(0, 0),
+                scale_factor,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+                font_smoothing: FontSmoothing::Platform,
+            };
+            let bounds = fonts.glyph_raster_bounds(&params).unwrap();
+            // Raster bounds are the ink box at the scale, rounded out and dilated by 1 px.
+            let left = (rect.origin.x * scale_factor as f64).floor() as i32 - 1;
+            let right = ((rect.origin.x + rect.size.width) * scale_factor as f64).ceil() as i32 + 1;
+            assert_eq!(
+                (bounds.origin.x.0, bounds.origin.x.0 + bounds.size.width.0),
+                (left, right),
+                "'H' at {font_size}pt"
+            );
+            let advance = unsafe {
+                reference.get_advances_for_glyphs(
+                    kCTFontOrientationDefault,
+                    &glyph,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            };
+            let layout = fonts.layout_line("H", px(font_size), &[FontRun::new(1, font_id)]);
+            // Within 0.1% (shaping differs from the glyph advance by up to 0.07%); at another
+            // optical size the advance is several percent off (21.9 pt for 20.0 pt at 28 pt).
+            assert!(
+                (f32::from(layout.width) - advance as f32).abs() < advance as f32 * 1e-3,
+                "'H' at {font_size}pt: advance {} vs Core Text {advance}",
+                f32::from(layout.width)
+            );
         }
     }
 
