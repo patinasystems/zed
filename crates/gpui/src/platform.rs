@@ -1560,6 +1560,16 @@ pub trait PlatformTextSystem: Send + Sync {
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
     /// Get the advance width for a glyph.
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
+    /// The advance of a glyph at `font_size`, in pixels, for a text system whose advances are
+    /// not [`Self::advance`] scaled linearly (fonts with optical sizes). `None`: scale it.
+    fn advance_at_size(
+        &self,
+        _font_id: FontId,
+        _glyph_id: GlyphId,
+        _font_size: Pixels,
+    ) -> Result<Option<Size<f32>>> {
+        Ok(None)
+    }
     /// Get the glyph ID for a character.
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
     /// Get raster bounds for a glyph.

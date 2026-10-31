@@ -415,6 +415,12 @@ impl TextSystem {
             .platform_text_system
             .glyph_for_char(font_id, ch)
             .with_context(|| format!("glyph not found for character '{ch}'"))?;
+        if let Some(advance) = self
+            .platform_text_system
+            .advance_at_size(font_id, glyph_id, font_size)?
+        {
+            return Ok(advance.map(px));
+        }
         let result = self.platform_text_system.advance(font_id, glyph_id)?
             / self.units_per_em(font_id) as f32;
 

@@ -221,6 +221,15 @@ impl PlatformTextSystem for AppleTextSystem {
         self.0.read().advance(font_id, glyph_id)
     }
 
+    fn advance_at_size(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+    ) -> Result<Option<Size<f32>>> {
+        self.0.read().advance_at_size(font_id, glyph_id, font_size)
+    }
+
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         self.0.read().glyph_for_char(font_id, ch)
     }
@@ -265,6 +274,13 @@ impl PlatformTextSystem for AppleTextSystem {
 }
 
 unsafe extern "C" {
+    static kCTFontVariationAxisIdentifierKey: core_foundation::string::CFStringRef;
+    fn CTFontCreateCopyWithAttributes(
+        font: core_text::font::CTFontRef,
+        size: CGFloat,
+        matrix: *const core_graphics::geometry::CGAffineTransform,
+        attributes: core_text::font_descriptor::CTFontDescriptorRef,
+    ) -> core_text::font::CTFontRef;
     fn CTFontCopyDefaultCascadeListForLanguages(
         font: core_text::font::CTFontRef,
         language_pref_list: core_foundation::array::CFArrayRef,
@@ -552,6 +568,25 @@ impl AppleTextSystemState {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
         ))
+    }
+
+    /// The advance at the font's optical size for `font_size` (`font_at_size`); `None` for a
+    /// font without optical sizes, whose advances scale linearly.
+    fn advance_at_size(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+    ) -> Result<Option<Size<f32>>> {
+        let font = &self.fonts[font_id.0];
+        if !has_opsz(&font.native_font()) {
+            return Ok(None);
+        }
+        let font = font_at_size(font, f32::from(font_size));
+        let glyph = glyph_id.0 as CGGlyph;
+        let mut advance = core_graphics::geometry::CGSize::new(0., 0.);
+        unsafe { font.get_advances_for_glyphs(kCTFontOrientationDefault, &glyph, &mut advance, 1) };
+        Ok(Some(size(advance.width as f32, advance.height as f32)))
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
@@ -905,12 +940,46 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
+/// The `opsz` variation axis tag.
+const OPSZ: i64 = 0x6f70_737a;
+
+/// Whether the font has an optical size axis.
+fn has_opsz(font: &CTFont) -> bool {
+    font.get_variation_axes().is_some_and(|axes| {
+        axes.iter().any(|axis| {
+            axis.find(unsafe { kCTFontVariationAxisIdentifierKey })
+                .and_then(|id| id.downcast::<CFNumber>())
+                .and_then(|id| id.to_i64())
+                == Some(OPSZ)
+        })
+    })
+}
+
 /// `font` at `size` points, with its optical size (`opsz`) at `size`, as Core Text sets it for a
 /// font made at that size (and as WebKit draws). GPUI's fonts are made from a `CGFont` at another
 /// size, and `clone_with_font_size` keeps that optical size: the system font at 28 pt kept its
-/// 12 pt outlines and advances ('H' 0.7 pt further right and 1.4 pt wider than at 28 pt).
+/// 12 pt outlines and advances ('H' 0.7 pt further right and 1.4 pt wider than at 28 pt). The copy
+/// keeps the font's descriptor (OpenType features and the fallback cascade list).
 fn font_at_size(font: &FontKitFont, size: f32) -> CTFont {
-    core_text::font::new_from_CGFont(&font.native_font().copy_to_CGFont(), size as f64)
+    let native = font.native_font();
+    if !has_opsz(&native) {
+        return native.clone_with_font_size(size as CGFloat);
+    }
+    unsafe {
+        let descriptor = CTFontDescriptor::wrap_under_create_rule(
+            core_text::font_descriptor::CTFontDescriptorCreateCopyWithVariation(
+                native.copy_descriptor().as_concrete_TypeRef(),
+                CFNumber::from(OPSZ).as_concrete_TypeRef(),
+                size as CGFloat,
+            ),
+        );
+        CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+            native.as_concrete_TypeRef(),
+            size as CGFloat,
+            std::ptr::null(),
+            descriptor.as_concrete_TypeRef(),
+        ))
+    }
 }
 
 fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
@@ -1487,6 +1556,12 @@ mod tests {
                     1,
                 )
             };
+            let at_size = fonts.advance_at_size(font_id, glyph_id, px(font_size)).unwrap().unwrap();
+            assert!(
+                (at_size.width - advance as f32).abs() < 1e-3,
+                "'H' at {font_size}pt: advance_at_size {} vs Core Text {advance}",
+                at_size.width
+            );
             let layout = fonts.layout_line("H", px(font_size), &[FontRun::new(1, font_id)]);
             // Within 0.1% (shaping differs from the glyph advance by up to 0.07%); at another
             // optical size the advance is several percent off (21.9 pt for 20.0 pt at 28 pt).
@@ -1496,6 +1571,23 @@ mod tests {
                 f32::from(layout.width)
             );
         }
+    }
+
+    #[test]
+    fn test_sized_fonts_keep_their_features() {
+        // `font_at_size` keeps the descriptor `apply_features_and_fallbacks` installs: tabular
+        // figures stay tabular at a size other than the one the font was made at.
+        let fonts = AppleTextSystem::new();
+        let mut tabular = font(".SystemUIFont");
+        tabular.features = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
+        let mut proportional = font(".SystemUIFont");
+        proportional.features = FontFeatures(Arc::new(vec![("pnum".into(), 1)]));
+        let width = |f: &gpui::Font| {
+            let id = fonts.font_id(f).unwrap();
+            f32::from(fonts.layout_line("1111", px(28.), &[FontRun::new(4, id)]).width)
+        };
+        let (t, p) = (width(&tabular), width(&proportional));
+        assert!(t - p > 1., "tabular {t} vs proportional {p}");
     }
 
     #[test]
