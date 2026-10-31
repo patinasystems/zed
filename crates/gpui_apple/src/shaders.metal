@@ -710,6 +710,12 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     float element_distance = quad_sdf_xy(position, shadow.element_bounds,
                                          shadow.element_corner_radii, shadow.element_corner_radii_y);
     alpha *= saturate(0.5 - element_distance);
+  } else {
+    // A drop shadow paints only outside the element's border box (CSS Backgrounds 3 §7.1.1):
+    // a transparent or translucent element shows what is behind it, never its own shadow.
+    float element_distance = quad_sdf_xy(position, shadow.element_bounds,
+                                         shadow.element_corner_radii, shadow.element_corner_radii_y);
+    alpha *= saturate(0.5 + element_distance);
   }
 
   return clip_alpha_straight(input.color * float4(1., 1., 1., alpha), clip_alpha);
