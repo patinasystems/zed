@@ -5613,13 +5613,17 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let (shadow_radii_x, shadow_radii_y) = (
+                spread_corner_radii(radii_x, shadow.spread_radius),
+                spread_corner_radii(radii_y, shadow.spread_radius),
+            );
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: radii_x.scale(scale_factor),
-                corner_radii_y: radii_y.scale(scale_factor),
+                corner_radii: shadow_radii_x.scale(scale_factor),
+                corner_radii_y: shadow_radii_y.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
@@ -13020,5 +13024,48 @@ fn transform_pixel_bounds(
     Bounds {
         origin: transformed.origin.map(|c| Pixels(c.0)),
         size: transformed.size.map(|c| Pixels(c.0)),
+    }
+}
+
+/// A drop shadow's corner radii for `spread` (CSS Backgrounds 3 §7.2): a positive spread grows each
+/// non-zero radius by the spread, scaled by `1 + (r / spread - 1)^3` while the radius is under the
+/// spread, so a sharp corner stays sharp and a small radius grows smoothly; a negative spread
+/// shrinks each radius by it, down to zero.
+fn spread_corner_radii(radii: Corners<Pixels>, spread: Pixels) -> Corners<Pixels> {
+    let spread = spread.0;
+    let one = |r: Pixels| {
+        let r = r.0;
+        px(if spread >= 0. {
+            if r >= spread || spread == 0. {
+                r + spread
+            } else {
+                r + spread * (1. + (r / spread - 1.).powi(3))
+            }
+        } else {
+            (r + spread).max(0.)
+        })
+    };
+    Corners {
+        top_left: one(radii.top_left),
+        top_right: one(radii.top_right),
+        bottom_right: one(radii.bottom_right),
+        bottom_left: one(radii.bottom_left),
+    }
+}
+
+#[cfg(test)]
+mod spread_corner_radii_tests {
+    use super::*;
+
+    #[test]
+    fn spread_grows_radii_as_css_does() {
+        let r = |v: f32, spread: f32| spread_corner_radii(Corners::all(px(v)), px(spread)).top_left.0;
+        assert_eq!(r(14., 2.), 16.);
+        assert_eq!(r(0., 6.), 0.);
+        // r / spread = 0.5: the spread scales by 1 + (-0.5)^3 = 0.875.
+        assert_eq!(r(3., 6.), 3. + 6. * 0.875);
+        assert_eq!(r(4., -6.), 0.);
+        assert_eq!(r(10., -6.), 4.);
+        assert_eq!(r(5., 0.), 5.);
     }
 }
