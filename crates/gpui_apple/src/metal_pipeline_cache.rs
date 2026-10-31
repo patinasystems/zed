@@ -49,8 +49,9 @@ struct Shared {
     device: metal::Device,
     /// The archive file, when a cache folder is set.
     path: Option<PathBuf>,
-    /// The archive read from `path`, when it exists and Metal accepts it.
-    archive: Option<metal::BinaryArchive>,
+    /// The archive read from `path`, when it exists and Metal accepts it; read again after a
+    /// deferred pipeline's miss rewrites it.
+    archive: RefCell<Option<metal::BinaryArchive>>,
     /// Every pipeline built, to write a new archive from.
     descriptors: RefCell<Vec<RenderPipelineDescriptor>>,
     missed: Cell<bool>,
@@ -79,7 +80,11 @@ impl Pipeline {
             }
             let state = shared.compile(descriptor);
             if !shared.rewritten.replace(true) {
+                // The new archive holds every pipeline's code: the others read it, not the stale one.
                 shared.write();
+                if let Some(path) = &shared.path {
+                    *shared.archive.borrow_mut() = open_archive(&shared.device, path);
+                }
             }
             state
         })
@@ -106,28 +111,12 @@ impl PipelineCache {
 
     /// The cache whose archive is the file at `path` (`None`: no archive).
     fn at(device: &metal::DeviceRef, path: Option<PathBuf>) -> Self {
-        let archive = path
-            .as_deref()
-            .filter(|path| path.is_file())
-            .and_then(|path| {
-                let descriptor = metal::BinaryArchiveDescriptor::new();
-                let url = file_url(path);
-                // SAFETY: an NSURL is what `setUrl:` takes; `url` outlives the call.
-                descriptor.set_url(unsafe {
-                    metal::URLRef::from_ptr(Retained::as_ptr(&url).cast_mut().cast())
-                });
-                device
-                    .new_binary_archive_with_descriptor(&descriptor)
-                    .map_err(|error| {
-                        log::warn!("reading the pipeline archive {}: {error}", path.display())
-                    })
-                    .ok()
-            });
+        let archive = path.as_deref().and_then(|path| open_archive(device, path));
         Self {
             shared: Rc::new(Shared {
                 device: device.to_owned(),
                 path,
-                archive,
+                archive: RefCell::new(archive),
                 descriptors: RefCell::default(),
                 missed: Cell::new(false),
                 rewritten: Cell::new(false),
@@ -143,7 +132,7 @@ impl PipelineCache {
             shared.descriptors.borrow_mut().push(descriptor.to_owned());
         }
         let pipeline = Pipeline { state: OnceCell::new(), descriptor: None, shared: shared.clone() };
-        if shared.archive.is_some() {
+        if shared.archive.borrow().is_some() {
             return Pipeline { descriptor: Some(descriptor.to_owned()), ..pipeline };
         }
         shared.missed.set(true);
@@ -163,7 +152,8 @@ impl PipelineCache {
 impl Shared {
     /// The pipeline from the archive, when it holds the pipeline's code.
     fn archived(&self, descriptor: &RenderPipelineDescriptorRef) -> Option<metal::RenderPipelineState> {
-        let archive = self.archive.as_ref()?;
+        let archive = self.archive.borrow();
+        let archive = archive.as_ref()?;
         descriptor.set_binary_archives(&[archive]);
         let found = archived_pipeline(&self.device, descriptor);
         descriptor.set_binary_archives(&[]);
@@ -183,6 +173,21 @@ impl Shared {
             log::warn!("writing the pipeline archive {}: {error}", path.display());
         }
     }
+}
+
+/// The archive at `path`, when the file exists and Metal accepts it.
+fn open_archive(device: &metal::DeviceRef, path: &Path) -> Option<metal::BinaryArchive> {
+    if !path.is_file() {
+        return None;
+    }
+    let descriptor = metal::BinaryArchiveDescriptor::new();
+    let url = file_url(path);
+    // SAFETY: an NSURL is what `setUrl:` takes; `url` outlives the call.
+    descriptor.set_url(unsafe { metal::URLRef::from_ptr(Retained::as_ptr(&url).cast_mut().cast()) });
+    device
+        .new_binary_archive_with_descriptor(&descriptor)
+        .map_err(|error| log::warn!("reading the pipeline archive {}: {error}", path.display()))
+        .ok()
 }
 
 /// The pipeline for `descriptor` only if its binary archives hold its code.
@@ -296,6 +301,9 @@ mod tests {
         assert!(!blue.is_made());
         let _ = blue.state();
         assert!(second.shared.rewritten.get());
+        // The rewritten archive answers the rest of this renderer's pipelines.
+        let blue_again = second.build(&descriptor(&library, "blue"));
+        assert!(second.shared.archived(blue_again.descriptor.as_deref().unwrap()).is_some());
         second.finish();
         assert!(std::fs::metadata(&path).unwrap().modified().unwrap() >= written);
         let third = PipelineCache::at(&device, Some(path.clone()));
