@@ -3,7 +3,8 @@ use collections::{HashMap, HashSet};
 use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
-    base::{CFRange, TCFType},
+    base::{CFRange, CFType, TCFType},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::CFString,
 };
@@ -17,8 +18,9 @@ use core_text::{
     font::CTFont,
     font_collection::CTFontCollectionRef,
     font_descriptor::{
-        CTFontDescriptor, kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait,
-        kCTFontWeightTrait, kCTFontWidthTrait,
+        CTFontDescriptor, kCTFontCascadeListAttribute, kCTFontFeatureSettingsAttribute,
+        kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
+        kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -48,7 +50,6 @@ use std::{borrow::Cow, char, convert::TryFrom, sync::Arc};
 
 #[cfg(target_os = "macos")]
 use {
-    core_foundation::base::CFType,
     gpui::{Hsla, Rgba},
     std::sync::OnceLock,
 };
@@ -765,15 +766,14 @@ impl AppleTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size))
-                .draw_glyphs(
-                    &[params.glyph_id.0 as CGGlyph],
-                    &[CGPoint::new(
-                        (subpixel_shift.x / params.scale_factor) as CGFloat,
-                        (subpixel_shift.y / params.scale_factor) as CGFloat,
-                    )],
-                    cx,
-                );
+            font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size)).draw_glyphs(
+                &[params.glyph_id.0 as CGGlyph],
+                &[CGPoint::new(
+                    (subpixel_shift.x / params.scale_factor) as CGFloat,
+                    (subpixel_shift.y / params.scale_factor) as CGFloat,
+                )],
+                cx,
+            );
 
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
@@ -958,26 +958,41 @@ fn has_opsz(font: &CTFont) -> bool {
 /// `font` at `size` points, with its optical size (`opsz`) at `size`, as Core Text sets it for a
 /// font made at that size (and as WebKit draws). GPUI's fonts are made from a `CGFont` at another
 /// size, and `clone_with_font_size` keeps that optical size: the system font at 28 pt kept its
-/// 12 pt outlines and advances ('H' 0.7 pt further right and 1.4 pt wider than at 28 pt). The copy
-/// keeps the font's descriptor (OpenType features and the fallback cascade list).
+/// 12 pt outlines and advances ('H' 0.7 pt further right and 1.4 pt wider than at 28 pt).
+///
+/// The font is made from its own `CGFont` at `size`, which keeps the face (a named instance such
+/// as `.SFNS-Bold` stays that instance) and sets the optical size. The OpenType features and
+/// fallback cascade `apply_features_and_fallbacks` installed are then copied onto it; the copy
+/// keeps the face and its optical size. Copying the font's whole descriptor with an `opsz`
+/// variation instead resolves the descriptor again, and a named instance can come back as
+/// another face whose glyph ids differ, so bold text drew the wrong glyphs.
 fn font_at_size(font: &FontKitFont, size: f32) -> CTFont {
     let native = font.native_font();
     if !has_opsz(&native) {
         return native.clone_with_font_size(size as CGFloat);
     }
+    let sized = core_text::font::new_from_CGFont(&native.copy_to_CGFont(), size as f64);
+    let attributes = native.copy_descriptor().attributes();
+    let pairs: Vec<(CFString, CFType)> =
+        unsafe { [kCTFontFeatureSettingsAttribute, kCTFontCascadeListAttribute] }
+            .into_iter()
+            .filter_map(|key| {
+                let key = unsafe { CFString::wrap_under_get_rule(key) };
+                let value = attributes.find(&key)?.clone();
+                Some((key, value))
+            })
+            .collect();
+    if pairs.is_empty() {
+        return sized;
+    }
+    let attributes =
+        core_text::font_descriptor::new_from_attributes(&CFDictionary::from_CFType_pairs(&pairs));
     unsafe {
-        let descriptor = CTFontDescriptor::wrap_under_create_rule(
-            core_text::font_descriptor::CTFontDescriptorCreateCopyWithVariation(
-                native.copy_descriptor().as_concrete_TypeRef(),
-                CFNumber::from(OPSZ).as_concrete_TypeRef(),
-                size as CGFloat,
-            ),
-        );
         CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
-            native.as_concrete_TypeRef(),
-            size as CGFloat,
+            sized.as_concrete_TypeRef(),
+            0.0,
             std::ptr::null(),
-            descriptor.as_concrete_TypeRef(),
+            attributes.as_concrete_TypeRef(),
         ))
     }
 }
@@ -1128,8 +1143,8 @@ mod lenient_font_attributes {
 mod tests {
     use crate::AppleTextSystem;
     use gpui::{
-        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, FontSmoothing, GlyphId, PlatformTextSystem,
-        RenderGlyphParams, font, point, px,
+        Bounds, DevicePixels, FontFallbacks, FontFeatures, FontRun, FontSmoothing, GlyphId,
+        PlatformTextSystem, RenderGlyphParams, font, point, px,
     };
     use std::sync::Arc;
 
@@ -1556,7 +1571,10 @@ mod tests {
                     1,
                 )
             };
-            let at_size = fonts.advance_at_size(font_id, glyph_id, px(font_size)).unwrap().unwrap();
+            let at_size = fonts
+                .advance_at_size(font_id, glyph_id, px(font_size))
+                .unwrap()
+                .unwrap();
             assert!(
                 (at_size.width - advance as f32).abs() < 1e-3,
                 "'H' at {font_size}pt: advance_at_size {} vs Core Text {advance}",
@@ -1573,6 +1591,103 @@ mod tests {
         }
     }
 
+    /// The system UI font's file with its names changed (".SFNS" to ".XFNS", ".SF NS" to
+    /// ".XF NS"): a variable font with an optical size axis that Core Text cannot find by name,
+    /// like a web font added with `add_fonts`.
+    fn renamed_system_font() -> Vec<u8> {
+        let mut bytes = std::fs::read("/System/Library/Fonts/SFNS.ttf").unwrap();
+        let u16_at = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        let u32_at =
+            |b: &[u8], i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+        let (start, end) = (0..u16_at(&bytes, 4))
+            .map(|t| 12 + 16 * t)
+            .find(|&r| &bytes[r..r + 4] == b"name")
+            .map(|r| {
+                (
+                    u32_at(&bytes, r + 8),
+                    u32_at(&bytes, r + 8) + u32_at(&bytes, r + 12),
+                )
+            })
+            .unwrap();
+        let utf16 = |s: &str| {
+            s.encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<u8>>()
+        };
+        for (from, to) in [(".SFNS", ".XFNS"), (".SF NS", ".XF NS")] {
+            for (from, to) in [
+                (from.as_bytes().to_vec(), to.as_bytes().to_vec()),
+                (utf16(from), utf16(to)),
+            ] {
+                let mut i = start;
+                while i + from.len() <= end {
+                    if bytes[i..i + from.len()] == from[..] {
+                        bytes[i..i + from.len()].copy_from_slice(&to);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_sized_fonts_keep_their_face() {
+        // A font at another size is the same face: the same glyph ids for the same characters,
+        // and its PostScript name is the face's (plus the variation Core Text names). Resolving
+        // the font's descriptor again with an `opsz` variation found another face by name: a
+        // font Core Text cannot find by name came back as a fallback font, and with SF Pro
+        // installed `.SFNS-Bold` came back as an SF Pro face, so bold text drew that face's
+        // glyphs for the system font's glyph ids.
+        let fonts = AppleTextSystem::new();
+        fonts
+            .add_fonts(vec![std::borrow::Cow::Owned(renamed_system_font())])
+            .unwrap();
+        let mut ids: Vec<_> = [
+            ".SFNS-Regular",
+            ".SFNS-Bold",
+            ".SFNS-Semibold",
+            ".SFNS-RegularItalic",
+        ]
+        .into_iter()
+        .map(|name| fonts.font_id_for_postscript_name(name).unwrap())
+        .collect();
+        ids.push(
+            fonts
+                .font_id(&gpui::Font {
+                    weight: gpui::FontWeight::BOLD,
+                    ..font(".SystemUIFont")
+                })
+                .unwrap(),
+        );
+        ids.push(fonts.font_id_for_postscript_name(".XFNS-Regular").unwrap());
+        let state = fonts.0.read();
+        for id in ids {
+            let face = &state.fonts[id.0];
+            let own = face.native_font().postscript_name();
+            assert!(
+                super::has_opsz(&face.native_font()),
+                "{own} has an optical size axis"
+            );
+            let stem = own.split('-').next().unwrap().to_string();
+            for size in [12., 28., 72.] {
+                let sized = super::font_at_size(face, size);
+                let name = sized.postscript_name();
+                assert!(name.starts_with(&stem), "{own} at {size}pt is {name}");
+                for c in "AÒs".chars() {
+                    let mut glyph = 0;
+                    let ch = c as u16;
+                    unsafe { sized.get_glyphs_for_characters(&ch, &mut glyph, 1) };
+                    assert_eq!(
+                        Some(glyph as u32),
+                        face.glyph_for_char(c),
+                        "{own} {c:?} at {size}pt ({name})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_sized_fonts_keep_their_features() {
         // `font_at_size` keeps the descriptor `apply_features_and_fallbacks` installs: tabular
@@ -1584,7 +1699,11 @@ mod tests {
         proportional.features = FontFeatures(Arc::new(vec![("pnum".into(), 1)]));
         let width = |f: &gpui::Font| {
             let id = fonts.font_id(f).unwrap();
-            f32::from(fonts.layout_line("1111", px(28.), &[FontRun::new(4, id)]).width)
+            f32::from(
+                fonts
+                    .layout_line("1111", px(28.), &[FontRun::new(4, id)])
+                    .width,
+            )
         };
         let (t, p) = (width(&tabular), width(&proportional));
         assert!(t - p > 1., "tabular {t} vs proportional {p}");
