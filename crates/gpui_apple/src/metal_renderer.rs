@@ -29,6 +29,9 @@ use parking_lot::Mutex;
 
 use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
+pub use crate::metal_pipeline_cache::set_pipeline_cache_dir;
+use crate::metal_pipeline_cache::PipelineCache;
+
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
@@ -342,6 +345,10 @@ impl MetalRenderer {
         let library = device
             .new_library_with_data(SHADERS_METALLIB)
             .expect("error building metal library");
+        #[cfg(feature = "runtime_shaders")]
+        let pipelines = PipelineCache::new(&device, SHADERS_SOURCE_FILE.as_bytes());
+        #[cfg(not(feature = "runtime_shaders"))]
+        let pipelines = PipelineCache::new(&device, SHADERS_METALLIB);
 
         fn to_float2_bits(point: PointF) -> u64 {
             let mut output = point.y.to_bits() as u64;
@@ -411,7 +418,7 @@ impl MetalRenderer {
             texture
         };
         let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "paths_rasterization",
             "path_rasterization_vertex",
@@ -420,7 +427,7 @@ impl MetalRenderer {
             PATH_SAMPLE_COUNT,
         );
         let backdrop_copy_pipeline_state = build_opaque_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "backdrop_copy",
             "backdrop_fullscreen_vertex",
@@ -428,21 +435,24 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let backdrop_blur_pipeline_state = build_opaque_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "backdrop_blur",
             "backdrop_fullscreen_vertex",
             "backdrop_blur_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let backdrop_composite_pipeline_state =
-            build_backdrop_composite_pipeline_state(&device, &library, MTLPixelFormat::BGRA8Unorm);
+        let backdrop_composite_pipeline_state = build_backdrop_composite_pipeline_state(
+            &pipelines,
+            &library,
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let group_composite_pipeline_states =
-            GroupCompositePipelines::new(&device, &library, MTLPixelFormat::BGRA8Unorm);
+            GroupCompositePipelines::new(&pipelines, &library, MTLPixelFormat::BGRA8Unorm);
         let backdrop_group_pipeline_state =
-            build_backdrop_group_pipeline_state(&device, &library, MTLPixelFormat::BGRA8Unorm);
+            build_backdrop_group_pipeline_state(&pipelines, &library, MTLPixelFormat::BGRA8Unorm);
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "path_sprites",
             "path_sprite_vertex",
@@ -450,7 +460,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let shadows_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "shadows",
             "shadow_vertex",
@@ -458,7 +468,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let quads_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "quads",
             "quad_vertex",
@@ -466,7 +476,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let underlines_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "underlines",
             "underline_vertex",
@@ -474,7 +484,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "monochrome_sprites",
             "monochrome_sprite_vertex",
@@ -482,7 +492,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "polychrome_sprites",
             "polychrome_sprite_vertex",
@@ -490,7 +500,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let surfaces_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "surfaces",
             "surface_vertex",
@@ -499,13 +509,15 @@ impl MetalRenderer {
         );
 
         let retained_shapes_pipeline_state = build_pipeline_state(
-            &device,
+            &pipelines,
             &library,
             "retained_shapes",
             "retained_shape_vertex",
             "retained_shape_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+
+        pipelines.finish();
 
         let command_queue = shared_command_queue(&device);
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -2292,7 +2304,7 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
 }
 
 fn build_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     label: &str,
     vertex_fn_name: &str,
@@ -2320,14 +2332,12 @@ fn build_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 /// A pipeline that overwrites its target (backdrop copies and blur passes).
 fn build_opaque_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     label: &str,
     vertex_fn_name: &str,
@@ -2347,15 +2357,13 @@ fn build_opaque_pipeline_state(
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(false);
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 /// The filtered color (premultiplied by coverage) over the target, keeping the
 /// target's alpha.
 fn build_backdrop_composite_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     pixel_format: metal::MTLPixelFormat,
 ) -> metal::RenderPipelineState {
@@ -2378,9 +2386,7 @@ fn build_backdrop_composite_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::Zero);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 /// Group images are allocated in steps of this many device pixels per side, so a
@@ -2477,7 +2483,7 @@ struct GroupCompositePipelines {
 
 impl GroupCompositePipelines {
     fn new(
-        device: &metal::DeviceRef,
+        pipelines: &PipelineCache,
         library: &metal::LibraryRef,
         pixel_format: metal::MTLPixelFormat,
     ) -> Self {
@@ -2505,9 +2511,7 @@ impl GroupCompositePipelines {
             } else {
                 color_attachment.set_blending_enabled(false);
             }
-            device
-                .new_render_pipeline_state(&descriptor)
-                .expect("could not create render pipeline state")
+            pipelines.build(&descriptor)
         };
         Self {
             over: build(
@@ -2532,7 +2536,7 @@ impl GroupCompositePipelines {
 
 /// A group's filtered backdrop, premultiplied, over its transparent image.
 fn build_backdrop_group_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     pixel_format: metal::MTLPixelFormat,
 ) -> metal::RenderPipelineState {
@@ -2555,9 +2559,7 @@ fn build_backdrop_group_pipeline_state(
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 /// `BackdropBlurParams` in shaders.metal.
@@ -2569,7 +2571,7 @@ struct BackdropBlurParams {
 }
 
 fn build_path_sprite_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     label: &str,
     vertex_fn_name: &str,
@@ -2597,13 +2599,11 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 fn build_path_rasterization_pipeline_state(
-    device: &metal::DeviceRef,
+    pipelines: &PipelineCache,
     library: &metal::LibraryRef,
     label: &str,
     vertex_fn_name: &str,
@@ -2636,9 +2636,7 @@ fn build_path_rasterization_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+    pipelines.build(&descriptor)
 }
 
 #[derive(Clone)]
