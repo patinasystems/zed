@@ -79,6 +79,8 @@ struct AppleTextSystemState {
     postscript_names_by_font_id: HashMap<FontId, String>,
     /// The PostScript names in the system UI font's files and its cascade's, with their file,
     /// read on the first lookup Core Text cannot answer by name.
+    /// The faces in the system UI font's own files, read on the first hidden name asked for.
+    system_ui_own_files: Option<HashMap<String, std::path::PathBuf>>,
     system_ui_font_files: Option<HashMap<String, std::path::PathBuf>>,
     /// The same for every font file Core Text makes available, read on the first lookup the
     /// UI fonts cannot answer.
@@ -96,6 +98,7 @@ impl AppleTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            system_ui_own_files: None,
             system_ui_font_files: None,
             available_font_files: None,
         }))
@@ -303,6 +306,16 @@ fn file_descriptors(path: &std::path::Path) -> Vec<CTFontDescriptor> {
     }
     let array: CFArray<CTFontDescriptor> = unsafe { CFArray::wrap_under_create_rule(array) };
     array.iter().map(|descriptor| descriptor.clone()).collect()
+}
+
+/// Every PostScript name in the system UI font's own file, with the file.
+fn system_ui_own_files() -> HashMap<String, std::path::PathBuf> {
+    let ui = core_text::font::new_ui_font_for_language(
+        core_text::font::kCTFontSystemFontType,
+        12.,
+        None,
+    );
+    names_in_files(ui.copy_descriptor().font_path().into_iter().collect())
 }
 
 /// Every PostScript name in the files of the system UI font and of the fonts its cascade lists
@@ -612,19 +625,31 @@ impl AppleTextSystemState {
             self.fonts.push(font);
             return Some(font_id);
         }
+        // Core Text opens the system UI fonts (their names start with a period) only through
+        // the UI font APIs or their files: by name it substitutes another font (Times), which
+        // it loads first. So hidden names skip the name lookup.
+        let hidden = postscript_name.starts_with('.');
         // Core Text substitutes another font for a name it does not know: check the name.
-        if let Ok(font) = core_text::font::new_from_name(postscript_name, 12.)
+        if !hidden
+            && let Ok(font) = core_text::font::new_from_name(postscript_name, 12.)
             && font.postscript_name() == postscript_name
         {
             return Some(self.id_for_native_font(font));
         }
-        // Core Text opens the system UI fonts (their names start with a period) only through
-        // the UI font APIs or their files, so look in the files of the UI font and its cascade.
+        // The UI font's own files first (its weights and widths), then the fonts of its
+        // cascade: the cascade opens a font per entry (the CJK families) to find its file.
         let mut path = self
-            .system_ui_font_files
-            .get_or_insert_with(system_ui_font_files)
+            .system_ui_own_files
+            .get_or_insert_with(system_ui_own_files)
             .get(postscript_name)
             .cloned();
+        if path.is_none() {
+            path = self
+                .system_ui_font_files
+                .get_or_insert_with(system_ui_font_files)
+                .get(postscript_name)
+                .cloned();
+        }
         if path.is_none() {
             // Other hidden system fonts (`.SFNSMono-Regular`, the system monospaced font):
             // every font file Core Text makes available, read once.
