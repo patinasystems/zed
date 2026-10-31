@@ -1478,6 +1478,12 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         let element_distance = quad_sdf_xy(position, shadow.element_bounds,
                                            shadow.element_corner_radii, shadow.element_corner_radii_y);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow paints only outside the element's border box (CSS Backgrounds 3 §7.1.1):
+        // a transparent or translucent element shows what is behind it, never its own shadow.
+        let element_distance = quad_sdf_xy(position, shadow.element_bounds,
+                                           shadow.element_corner_radii, shadow.element_corner_radii_y);
+        alpha *= saturate(0.5 + element_distance);
     }
 
     return clip_output(blend_color(input.color, alpha), clip_alpha);
