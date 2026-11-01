@@ -2693,6 +2693,8 @@ struct InstanceBufferWriter {
     filled: Vec<(InstanceBuffer, usize)>,
     current: InstanceBuffer,
     offset: usize,
+    /// Bytes written this frame, for upload measurements.
+    written: usize,
 }
 
 impl InstanceBufferWriter {
@@ -2709,6 +2711,7 @@ impl InstanceBufferWriter {
             filled: Vec::new(),
             current,
             offset: 0,
+            written: 0,
         }
     }
 
@@ -2720,6 +2723,7 @@ impl InstanceBufferWriter {
             offset = 0;
         }
         self.offset = offset + size;
+        self.written += size;
 
         let binding = InstanceBinding {
             buffer: self.current.metal_buffer.clone(),
@@ -2789,8 +2793,10 @@ impl InstanceBufferWriter {
             filled,
             current,
             offset,
+            written,
             ..
         } = self;
+        retained_stats::record_instances(written);
 
         if !unified_memory {
             for (buffer, written) in &filled {
@@ -4396,6 +4402,14 @@ mod retained_stats {
 
     pub fn record_upload(bytes: usize) {
         with(|s| s.uploaded.push(bytes));
+    }
+
+    /// Records a frame's instance buffer bytes; `GPUI_INSTANCE_BYTES` prints each frame's.
+    pub fn record_instances(bytes: usize) {
+        static PRINT: OnceLock<bool> = OnceLock::new();
+        if *PRINT.get_or_init(|| std::env::var_os("GPUI_INSTANCE_BYTES").is_some()) {
+            eprintln!("GPUI_INSTANCE_BYTES {bytes}");
+        }
     }
 
     pub fn record_gpu(ms: f64) {
