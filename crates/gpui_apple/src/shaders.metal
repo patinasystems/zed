@@ -2162,6 +2162,8 @@ vertex BackdropCompositeOutput backdrop_composite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+float3 group_color_filter(float3 rgb, uint kind, float amount);
+
 // The filtered backdrop (straight color and alpha) at `position`, and in `coverage`
 // its coverage of the filter's rounded bounds, faded by its opacity. `region` is
 // where the filtered texture sits in the target: origin and size, device pixels.
@@ -2174,15 +2176,11 @@ float4 backdrop_filtered(float2 position, constant BackdropFilter *filter, float
   // Filter straight colors, then weight them by the backdrop's alpha again, so
   // transparent texels stay empty.
   float3 rgb = color.a > 0. ? color.rgb / color.a : float3(0.);
-  // CSS saturate(), brightness(), contrast() (Filter Effects 1), in that order.
-  float s = filter->saturate;
-  float3x3 saturate_matrix = float3x3(
-      float3(0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s),
-      float3(0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s),
-      float3(0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s));
-  rgb = saturate(saturate_matrix * rgb);
-  rgb = saturate(rgb * filter->brightness);
-  rgb = saturate((rgb - 0.5) * filter->contrast + 0.5);
+  // CSS color filter functions (Filter Effects 1) in order, as a group applies them.
+  for (uint i = 0; i < filter->filter_count; i++) {
+    rgb = group_color_filter(rgb, filter->filter_kinds[i / 4][i % 4],
+                             filter->filter_amounts[i / 4][i % 4]);
+  }
   float distance = quad_sdf_xy(position, filter->bounds, filter->corner_radii, filter->corner_radii_y);
   coverage = saturate(0.5 - distance) * filter->opacity;
   return float4(rgb, color.a);

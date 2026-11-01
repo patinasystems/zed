@@ -220,12 +220,12 @@ struct BackdropCompositeParams {
     corner_radii: [f32; 4],
     corner_radii_y: [f32; 4],
     region: [f32; 4],
+    /// `ColorFilter::gpu` codes, four to a vector; `filter_count` apply.
+    filter_kinds: [[u32; 4]; 2],
+    filter_amounts: [[f32; 4]; 2],
     viewport_size: [f32; 2],
-    saturate: f32,
-    brightness: f32,
-    contrast: f32,
     opacity: f32,
-    pad: [f32; 2],
+    filter_count: u32,
 }
 
 /// The scenes a frame draws (the window's first, then its groups', depth first) with
@@ -2835,12 +2835,11 @@ impl WgpuRendererCore {
                 radii_y.bottom_left.0,
             ],
             region,
+            filter_kinds: filter.filter_kinds,
+            filter_amounts: filter.filter_amounts,
             viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
-            saturate: filter.saturate,
-            brightness: filter.brightness,
-            contrast: filter.contrast,
             opacity: filter.opacity,
-            pad: [0.; 2],
+            filter_count: filter.filter_count,
         };
         let uniforms = self.backdrop_uniforms(bytemuck::bytes_of(&params));
         let source = self.create_texture_bind_group("backdrop_filtered", filtered);
@@ -4104,6 +4103,31 @@ mod tests {
         // Rejection must leave the renderer usable.
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
+        Ok(())
+    }
+
+    /// The shared backdrop filter chain scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn backdrop_filter_chains_render() -> anyhow::Result<()> {
+        use gpui::backdrop_chain_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
         Ok(())
     }
 

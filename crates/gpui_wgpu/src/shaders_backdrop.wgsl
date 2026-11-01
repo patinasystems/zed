@@ -58,13 +58,12 @@ struct CompositeParams {
     corner_radii_y: vec4<f32>,
     // Where the filtered texture sits in the target: origin and size.
     region: vec4<f32>,
+    // `ColorFilter::gpu` codes, four to a vector, applied in order; `filter_count` apply.
+    filter_kinds: array<vec4<u32>, 2>,
+    filter_amounts: array<vec4<f32>, 2>,
     viewport_size: vec2<f32>,
-    saturate: f32,
-    brightness: f32,
-    contrast: f32,
     opacity: f32,
-    pad1: f32,
-    pad2: f32,
+    filter_count: u32,
 }
 
 @group(1) @binding(0) var<uniform> composite: CompositeParams;
@@ -129,16 +128,10 @@ fn backdrop_filtered(position: vec2<f32>) -> Filtered {
     // Filter straight colors, then weight them by the backdrop's alpha again, so
     // transparent texels stay empty.
     var rgb = select(vec3<f32>(0.0), color.rgb / max(color.a, 1e-6), color.a > 0.0);
-    // CSS saturate(), brightness(), contrast() (Filter Effects 1), in that order.
-    let s = composite.saturate;
-    let saturate_matrix = mat3x3<f32>(
-        vec3<f32>(0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s),
-        vec3<f32>(0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s),
-        vec3<f32>(0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s),
-    );
-    rgb = saturate(saturate_matrix * rgb);
-    rgb = saturate(rgb * composite.brightness);
-    rgb = saturate((rgb - 0.5) * composite.contrast + 0.5);
+    // CSS color filter functions (Filter Effects 1) in order, as a group applies them.
+    for (var i = 0u; i < composite.filter_count; i += 1u) {
+        rgb = group_color_filter(rgb, composite.filter_kinds[i / 4u][i % 4u], composite.filter_amounts[i / 4u][i % 4u]);
+    }
     // Rounded-rectangle coverage.
     let half_size = composite.bounds.zw / 2.0;
     let center_to_point = position - (composite.bounds.xy + half_size);

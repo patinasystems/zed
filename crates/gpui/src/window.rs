@@ -5869,8 +5869,8 @@ impl Window {
     }
 
     /// Filters what is already painted behind `bounds` (CSS `backdrop-filter`): a gaussian
-    /// blur of standard deviation `backdrop.blur_radius`, then saturation, brightness and
-    /// contrast, drawn back inside `bounds` with `corner_radii` and the current content mask.
+    /// blur of standard deviation `backdrop.blur_radius`, then its color filters in order,
+    /// drawn back inside `bounds` with `corner_radii` and the current content mask.
     /// Paint it before the element's own background. Under an element transformation it
     /// filters the transformed bounding box.
     ///
@@ -5879,7 +5879,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: impl Into<Corners<Size<Pixels>>>,
-        backdrop: Backdrop,
+        backdrop: &Backdrop,
     ) {
         let corner_radii = corner_radii.into();
         self.invalidator.debug_assert_paint();
@@ -5891,7 +5891,7 @@ impl Window {
         &self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Size<Pixels>>,
-        backdrop: Backdrop,
+        backdrop: &Backdrop,
         opacity: f32,
     ) -> BackdropFilter {
         let scale_factor = self.scale_factor();
@@ -5913,11 +5913,10 @@ impl Window {
             corner_radii: fitted.horizontal().scale(scale_factor),
             corner_radii_y: fitted.vertical().scale(scale_factor),
             blur_radius: backdrop.blur_radius.scale(scale_factor),
-            saturate: backdrop.saturate,
-            brightness: backdrop.brightness,
-            contrast: backdrop.contrast,
             shader: crate::ShaderDraw::NONE,
+            ..BackdropFilter::default()
         }
+        .with_color_filters(&backdrop.color_filters)
     }
 
     /// Paints `shader` over `bounds`, clipped to `corner_radii` and the content
@@ -9882,7 +9881,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                     .rounded(px(8.))
                     .opacity(0.5)
                     .backdrop_filter(super::Backdrop {
-                        saturate: 0.,
+                        color_filters: vec![ColorFilter::Saturate(0.)],
                         ..Default::default()
                     })
                     .hover(|style| style.invisible()),
@@ -9910,7 +9909,15 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
         assert_eq!(painted.len(), 1);
         assert_eq!(painted[0].corner_radii.top_left, ScaledPixels(8. * scale));
         assert_eq!(painted[0].opacity, 0.5, "faded with the element");
-        assert_eq!(painted[0].saturate, 0.);
+        assert_eq!(
+            (
+                painted[0].filter_count,
+                painted[0].filter_kinds[0][0],
+                painted[0].filter_amounts[0][0]
+            ),
+            (1, 6, 0.),
+            "saturate(0)"
+        );
         // Hovered, the element is hidden, and so is its filter.
         window
             .update(cx, |_, window, cx| {
@@ -9939,7 +9946,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                     .size(px(40.))
                     .opacity(0.5)
                     .backdrop_filter(super::Backdrop {
-                        saturate: 0.,
+                        color_filters: vec![ColorFilter::Saturate(0.)],
                         ..Default::default()
                     })
                     .compositing(crate::Compositing {
@@ -9971,7 +9978,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                 assert!(scene.backdrop_filters.is_empty());
                 assert!(group.scene.backdrop_filters.is_empty());
                 let backdrop = group.effects.backdrop.expect("the div's backdrop filter");
-                assert_eq!((backdrop.saturate, backdrop.opacity), (0., 1.));
+                assert_eq!((backdrop.filter_kinds[0][0], backdrop.opacity), (6, 1.));
                 (group.effects.opacity, backdrop.opacity)
             })
             .unwrap()
@@ -12985,30 +12992,18 @@ impl Filter {
     }
 }
 
-/// What [`Window::paint_backdrop_filter`] does to the backdrop.
+/// What [`Window::paint_backdrop_filter`] does to the backdrop: a CSS `backdrop-filter`
+/// with the same functions as a group's [`Filter`].
 #[derive(
-    Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Backdrop {
     /// The blur's standard deviation (CSS `blur()`); zero for none.
     pub blur_radius: Pixels,
-    /// CSS `saturate()`: 1 leaves colors as they are, 0 is grayscale.
-    pub saturate: f32,
-    /// CSS `brightness()`: a multiplier.
-    pub brightness: f32,
-    /// CSS `contrast()`: 1 leaves colors as they are, 0 is mid gray.
-    pub contrast: f32,
-}
-
-impl Default for Backdrop {
-    fn default() -> Self {
-        Self {
-            blur_radius: Pixels::ZERO,
-            saturate: 1.,
-            brightness: 1.,
-            contrast: 1.,
-        }
-    }
+    /// Applied in order after the blur, as a group's are; only the first
+    /// [`crate::MAX_COLOR_FILTERS`] apply. `opacity()` fades the filtered backdrop over
+    /// what is behind it.
+    pub color_filters: Vec<ColorFilter>,
 }
 
 /// The window-space box covering `bounds` after `transformation` (logical pixels).

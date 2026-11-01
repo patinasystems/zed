@@ -3202,7 +3202,7 @@ mod tests {
 
     #[test]
     fn backdrop_filters_keep_transparent_backdrops_transparent() {
-        use gpui::{BackdropFilter, Bounds, ContentMask, Corners, ScaledPixels};
+        use gpui::{BackdropFilter, Bounds, ColorFilter, ContentMask, Corners, ScaledPixels};
         let mut renderer = MetalHeadlessRenderer::new();
         renderer.renderer.update_transparency(true);
         let bounds = Bounds::new(
@@ -3210,20 +3210,19 @@ mod tests {
             size(ScaledPixels(16.), ScaledPixels(16.)),
         );
         let mut scene = Scene::default();
-        scene.insert_primitive(BackdropFilter {
-            bounds,
-            content_mask: ContentMask::from(bounds),
-            corner_radii: Corners::default(),
-            corner_radii_y: Corners::default(),
-            blur_radius: ScaledPixels(2.),
-            opacity: 1.,
-            saturate: 1.,
-            brightness: 1.,
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds,
+                content_mask: ContentMask::from(bounds),
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+                blur_radius: ScaledPixels(2.),
+                opacity: 1.,
+                ..Default::default()
+            }
             // Mid gray where there is color; nothing where there is none.
-            contrast: 0.,
-            order: 0,
-            shader: gpui::ShaderDraw::NONE,
-        });
+            .with_color_filters(&[ColorFilter::Contrast(0.)]),
+        );
         scene.finish();
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
             &mut renderer,
@@ -3251,6 +3250,20 @@ mod tests {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+    }
+
+    #[test]
+    fn backdrop_filter_chains_render() {
+        use gpui::backdrop_chain_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
     }
 
     #[test]
