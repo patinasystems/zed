@@ -1838,9 +1838,15 @@ impl MetalRenderer {
         } else {
             None
         };
-        let (backdrop, region) = match &filtered {
-            Some((texture, region)) => (texture.as_ref(), *region),
-            None => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
+        // A texture input (`ShaderInput::Texture`) binds where the backdrop does.
+        let input = filter.shader.texture(root).and_then(|id| {
+            let tile = self.sprite_atlas.external_texture_tile(id)?;
+            self.sprite_atlas.metal_texture(tile.texture_id)
+        });
+        let (backdrop, region) = match (&filtered, &input) {
+            (Some((texture, region)), _) => (texture.as_ref(), *region),
+            (None, Some(texture)) => (texture.as_ref(), [0., 0., 1., 1.]),
+            (None, None) => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
         };
         let params = crate::metal_custom_shader::ShaderParams::new(
             filter,

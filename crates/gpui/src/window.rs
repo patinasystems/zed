@@ -5924,8 +5924,10 @@ impl Window {
     /// mask and faded by the element opacity. `uniforms` bind at `@group(0)
     /// @binding(3)` (at most 4096 bytes; laid out as the shader declares them).
     /// With [`ShaderInput::Backdrop`], `backdrop(uv)` reads what is drawn behind
-    /// `bounds`, which orders the draw after it, like a backdrop filter. Under an
-    /// element transformation it draws the transformed bounding box.
+    /// `bounds`, which orders the draw after it, like a backdrop filter. With
+    /// [`ShaderInput::Texture`], `texture_input(uv)` reads an external texture
+    /// (one painted with [`Window::paint_to_texture`] this frame is drawn first).
+    /// Under an element transformation it draws the transformed bounding box.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_shader(
@@ -5954,7 +5956,7 @@ impl Window {
         let draw = self.next_frame.scene.add_shader(
             shader,
             uniforms,
-            input == crate::ShaderInput::Backdrop,
+            input,
             scale_factor,
         );
         self.next_frame.scene.insert_primitive(BackdropFilter {
