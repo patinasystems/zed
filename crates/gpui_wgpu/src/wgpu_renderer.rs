@@ -2217,6 +2217,15 @@ impl WgpuRendererCore {
                                     self.filter_backdrop(encoder, filter, target_texture, size)
                                 })
                                 .flatten();
+                            // A texture input (`ShaderInput::Texture`) binds where the
+                            // backdrop does.
+                            let input = filter
+                                .shader
+                                .texture(root)
+                                .and_then(|id| self.atlas.external_texture(id))
+                                .map(|texture| {
+                                    texture.create_view(&wgpu::TextureViewDescriptor::default())
+                                });
                             let resources = &self.resources;
                             self.custom_shaders.draw(
                                 &resources.device,
@@ -2229,7 +2238,8 @@ impl WgpuRendererCore {
                                 filter.shader.uniforms(root),
                                 backdrop
                                     .as_ref()
-                                    .map(|(scratch, region)| (&scratch.view, *region)),
+                                    .map(|(scratch, region)| (&scratch.view, *region))
+                                    .or(input.as_ref().map(|view| (view, [0., 0., 1., 1.]))),
                                 [size.width.0 as f32, size.height.0 as f32],
                             );
                             if let Some((scratch, _)) = &backdrop {

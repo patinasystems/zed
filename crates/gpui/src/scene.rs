@@ -72,6 +72,9 @@ pub struct Scene {
     pub shaders: Vec<Shader>,
     /// Their uniforms, each draw's at [`ShaderDraw::uniforms`], 16-byte aligned.
     pub shader_uniforms: Vec<u8>,
+    /// The external textures shader draws read ([`ShaderInput::Texture`]), at
+    /// [`ShaderDraw::texture`].
+    pub shader_textures: Vec<ExternalTextureId>,
     /// Groups drawn offscreen and composited as one image ([`Scene::push_group`]).
     pub groups: Vec<CompositedGroup>,
     /// Subtrees painted into external textures, never composited
@@ -108,6 +111,7 @@ impl Scene {
         self.backdrop_filters.clear();
         self.shaders.clear();
         self.shader_uniforms.clear();
+        self.shader_textures.clear();
         self.gradients.clear();
     }
 
@@ -136,7 +140,7 @@ impl Scene {
         &mut self,
         shader: &Shader,
         uniforms: &[u8],
-        reads_backdrop: bool,
+        input: ShaderInput,
         scale_factor: f32,
     ) -> ShaderDraw {
         let index = match self.shaders.iter().position(|known| known.id == shader.id) {
@@ -150,12 +154,20 @@ impl Scene {
         self.shader_uniforms.extend_from_slice(uniforms);
         let padded = self.shader_uniforms.len().next_multiple_of(16);
         self.shader_uniforms.resize(padded, 0);
+        let texture = match input {
+            ShaderInput::Texture(id) => {
+                self.shader_textures.push(id);
+                self.shader_textures.len() as u32
+            }
+            _ => 0,
+        };
         ShaderDraw {
             shader: index as u32 + 1,
             uniforms_start: start as u32,
             uniforms_len: uniforms.len() as u32,
-            reads_backdrop: reads_backdrop.into(),
+            reads_backdrop: (input == ShaderInput::Backdrop).into(),
             scale_factor,
+            texture,
         }
     }
 
@@ -427,7 +439,7 @@ impl Scene {
                         filter.shader = self.add_shader(
                             shader,
                             filter.shader.uniforms(prev_scene),
-                            filter.shader.reads_backdrop(),
+                            filter.shader.input(prev_scene),
                             filter.shader.scale_factor,
                         );
                         self.insert_primitive(filter);
@@ -536,7 +548,7 @@ impl Scene {
                         filter.shader = scene.add_shader(
                             shader,
                             filter.shader.uniforms(self),
-                            filter.shader.reads_backdrop(),
+                            filter.shader.input(self),
                             filter.shader.scale_factor,
                         );
                     }
@@ -1554,6 +1566,11 @@ pub enum ShaderInput {
     None,
     /// What is drawn behind the element, through `backdrop(uv)`.
     Backdrop,
+    /// An external texture ([`crate::Window::set_external_texture`], often one a
+    /// subtree painted into with [`crate::Window::paint_to_texture`] this frame),
+    /// through `texture_input(uv)`, `uv` 0 to 1 across the texture. Renderers
+    /// that cannot draw it (DirectX) and a missing texture read transparent black.
+    Texture(ExternalTextureId),
 }
 
 /// A shader draw within a [`BackdropFilter`].
@@ -1570,6 +1587,9 @@ pub struct ShaderDraw {
     pub reads_backdrop: PaddedBool32,
     /// Device pixels per logical pixel, for `ShaderInput`.
     pub scale_factor: f32,
+    /// One more than the index of the texture it reads in [`Scene::shader_textures`]
+    /// ([`ShaderInput::Texture`]); 0 for none.
+    pub texture: u32,
 }
 
 impl ShaderDraw {
@@ -1580,6 +1600,7 @@ impl ShaderDraw {
         uniforms_len: 0,
         reads_backdrop: PaddedBool32(0),
         scale_factor: 1.,
+        texture: 0,
     };
 
     /// The shader this draws, if any.
@@ -1592,6 +1613,23 @@ impl ShaderDraw {
     /// Whether the shader reads the backdrop.
     pub fn reads_backdrop(&self) -> bool {
         self.reads_backdrop.0 != 0
+    }
+
+    /// The external texture the shader reads ([`ShaderInput::Texture`]), if any.
+    pub fn texture(&self, scene: &Scene) -> Option<ExternalTextureId> {
+        (self.texture as usize)
+            .checked_sub(1)
+            .and_then(|index| scene.shader_textures.get(index))
+            .copied()
+    }
+
+    /// What the shader reads, as `paint_shader` was given it.
+    pub fn input(&self, scene: &Scene) -> ShaderInput {
+        match self.texture(scene) {
+            Some(id) => ShaderInput::Texture(id),
+            None if self.reads_backdrop() => ShaderInput::Backdrop,
+            None => ShaderInput::None,
+        }
     }
 
     /// Its uniform bytes in `scene`.
@@ -4185,7 +4223,7 @@ pub mod elliptical_shader_test_scene {
             ..Default::default()
         });
         let source = "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
-        let shader = scene.add_shader(&Shader::new(source), &[], false, 1.);
+        let shader = scene.add_shader(&Shader::new(source), &[], ShaderInput::None, 1.);
         scene.insert_primitive(BackdropFilter {
             bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
             content_mask: full,
@@ -4888,8 +4926,8 @@ mod tests {
         let mut scene = Scene::default();
         let shader =
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
-        let a = scene.add_shader(&shader, &[1, 2, 3, 4, 5], true, 2.);
-        let b = scene.add_shader(&shader, &[6; 8], false, 2.);
+        let a = scene.add_shader(&shader, &[1, 2, 3, 4, 5], ShaderInput::Backdrop, 2.);
+        let b = scene.add_shader(&shader, &[6; 8], ShaderInput::None, 2.);
         assert_eq!(scene.shaders.len(), 1, "one source per frame");
         assert_eq!(a.shader(&scene), Some(&shader));
         assert_eq!(a.uniforms(&scene), &[1, 2, 3, 4, 5]);
@@ -4908,8 +4946,8 @@ mod tests {
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0); }");
         let shader =
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
-        previous.add_shader(&other, &[9; 32], false, 1.);
-        let draw = previous.add_shader(&shader, &[1, 2, 3, 4], true, 2.);
+        previous.add_shader(&other, &[9; 32], ShaderInput::None, 1.);
+        let draw = previous.add_shader(&shader, &[1, 2, 3, 4], ShaderInput::Backdrop, 2.);
         previous.insert_primitive(BackdropFilter {
             bounds: scaled_bounds(0., 0., 10., 10.),
             content_mask: ContentMask::from(scaled_bounds(0., 0., 10., 10.)),
@@ -4923,6 +4961,31 @@ mod tests {
         assert_eq!(replayed.uniforms(&next), &[1, 2, 3, 4]);
         assert!(replayed.reads_backdrop());
         assert_eq!(replayed.scale_factor, 2.);
+    }
+
+    #[test]
+    fn texture_inputs_are_kept_and_replayed() {
+        let mut previous = Scene::default();
+        let shader = Shader::new(
+            "fn shade(input: ShaderInput) -> vec4<f32> { return texture_input(input.uv); }",
+        );
+        let id = ExternalTextureId(0x3d);
+        let draw = previous.add_shader(&shader, &[], ShaderInput::Texture(id), 1.);
+        assert_eq!(draw.texture(&previous), Some(id));
+        assert_eq!(draw.input(&previous), ShaderInput::Texture(id));
+        assert!(!draw.reads_backdrop());
+        assert_eq!(ShaderDraw::NONE.texture(&previous), None);
+        previous.insert_primitive(BackdropFilter {
+            bounds: scaled_bounds(0., 0., 10., 10.),
+            content_mask: ContentMask::from(scaled_bounds(0., 0., 10., 10.)),
+            shader: draw,
+            ..Default::default()
+        });
+        let mut next = Scene::default();
+        next.replay(0..previous.paint_operations.len(), &previous);
+        assert_eq!(next.backdrop_filters[0].shader.texture(&next), Some(id));
+        previous.clear();
+        assert!(previous.shader_textures.is_empty());
     }
 
     #[test]
@@ -5640,7 +5703,8 @@ fn shade(input: ShaderInput) -> vec4<f32> {
         let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
         // Scale factor 2: the gradient's 8 logical pixels are 16 device pixels.
-        let shader = scene.add_shader(&Shader::new(source), &bytes, reads_backdrop, 2.);
+        let input = if reads_backdrop { ShaderInput::Backdrop } else { ShaderInput::None };
+        let shader = scene.add_shader(&Shader::new(source), &bytes, input, 2.);
         scene.insert_primitive(BackdropFilter {
             bounds: at,
             content_mask: full,
