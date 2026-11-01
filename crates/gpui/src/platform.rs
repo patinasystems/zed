@@ -1834,7 +1834,8 @@ pub trait PlatformAtlas {
 
     /// Copies `source` into external texture `id` on the GPU, from its
     /// top-left corner. Which sources a platform takes is its own: the web
-    /// takes `web_sys::{OffscreenCanvas, HtmlCanvasElement, ImageBitmap}`.
+    /// takes `web_sys::{OffscreenCanvas, HtmlCanvasElement, ImageBitmap, HtmlVideoElement}`
+    /// (a video's current frame).
     fn copy_to_external_texture(
         &self,
         _id: ExternalTextureId,
