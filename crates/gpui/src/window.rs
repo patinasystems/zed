@@ -6389,7 +6389,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                exact_scale: 0,
+                nearest: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -6493,11 +6493,16 @@ impl Window {
             frame_index,
             grayscale,
             TransformationMatrix::unit(),
+            TextureSampling::Linear,
         )
     }
 
     /// Paints an image like [`Window::paint_image`], then applies `transformation` to the
-    /// painted sprite, including its rounded corners.
+    /// painted sprite, including its rounded corners. `sampling` is how its texels scale:
+    /// [`TextureSampling::Nearest`] keeps them square (CSS `image-rendering: pixelated` and
+    /// `crisp-edges`); [`TextureSampling::Linear`] filters between them (`auto`), except at a
+    /// whole number of device pixels per texel with no rotation or scale, where the image's
+    /// own hard edges stay hard as browsers draw them.
     ///
     /// `transformation` maps window coordinates in device pixels to window coordinates in
     /// device pixels, the same space [`Window::paint_svg`] uses. The content mask is applied
@@ -6513,6 +6518,7 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
         transformation: TransformationMatrix,
+        sampling: TextureSampling,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -6549,6 +6555,7 @@ impl Window {
             tile,
             grayscale,
             transformation,
+            sampling,
             true,
         );
         Ok(())
@@ -6586,6 +6593,8 @@ impl Window {
             tile,
             false,
             TransformationMatrix::unit(),
+            // The atlas samples an external texture as it was set.
+            TextureSampling::Linear,
             false,
         );
     }
@@ -6637,9 +6646,10 @@ impl Window {
     }
 
     /// The sprite for `tile` (an image's) drawn over `image_bounds`, clipped
-    /// to `visible_bounds`, which lies inside it. With `exact`, a tile drawn at a whole
-    /// number of device pixels per texel, with no rotation or scale, samples texel centres
-    /// (as browsers draw images at integer scales) instead of filtering between texels.
+    /// to `visible_bounds`, which lies inside it. With [`TextureSampling::Nearest`] it
+    /// samples the nearest texel at any scale. With `exact`, a tile drawn at a whole number
+    /// of device pixels per texel, with no rotation or scale, samples texel centres too (as
+    /// browsers draw images at integer scales) instead of filtering between texels.
     fn paint_tile(
         &mut self,
         visible_bounds: Bounds<Pixels>,
@@ -6648,6 +6658,7 @@ impl Window {
         tile: AtlasTile,
         grayscale: bool,
         transformation: TransformationMatrix,
+        sampling: TextureSampling,
         exact: bool,
     ) {
         let transformation = self.device_element_transformation().compose(transformation);
@@ -6695,12 +6706,13 @@ impl Window {
 
         // Checked on the sprite as drawn: its snapped bounds, moved by the translation, over
         // the texels it shows.
-        let exact_scale = exact
-            && sprite_samples_texel_centres(
-                visible_bounds_snapped,
-                sub_tile.bounds.size,
-                &transformation,
-            );
+        let nearest = sampling == TextureSampling::Nearest
+            || (exact
+                && sprite_samples_texel_centres(
+                    visible_bounds_snapped,
+                    sub_tile.bounds.size,
+                    &transformation,
+                ));
         let content_mask = self.snapped_content_mask();
         // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
         let fitted = if corner_radii.is_circular() {
@@ -6714,7 +6726,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: exact_scale as u32,
+            nearest: nearest as u32,
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,

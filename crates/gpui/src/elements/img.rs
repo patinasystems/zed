@@ -2,8 +2,8 @@ use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image,
-    decode_static_image_from_decoder, px,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, TextureSampling, TransformationMatrix,
+    Window, decode_static_image, decode_static_image_from_decoder, px,
 };
 use anyhow::Result;
 
@@ -129,6 +129,7 @@ where
 pub struct ImageStyle {
     grayscale: bool,
     object_fit: ObjectFit,
+    sampling: TextureSampling,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -138,6 +139,7 @@ impl Default for ImageStyle {
         Self {
             grayscale: false,
             object_fit: ObjectFit::Contain,
+            sampling: TextureSampling::Linear,
             loading: None,
             fallback: None,
         }
@@ -158,6 +160,13 @@ pub trait StyledImage: Sized {
     /// Set the object fit for the image.
     fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.image_style().object_fit = object_fit;
+        self
+    }
+
+    /// Set how the image's texels scale (CSS `image-rendering`): [`TextureSampling::Nearest`]
+    /// keeps them square, [`TextureSampling::Linear`] (the default) smooths them.
+    fn sampling(mut self, sampling: TextureSampling) -> Self {
+        self.image_style().sampling = sampling;
         self
     }
 
@@ -495,13 +504,15 @@ impl Element for Img {
                     // circular ones keep the per-radius clamp `paint_image` applies.
                     let corner_radii = style.fitted_radii(bounds.size, window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with_transformation(
                             bounds,
                             new_bounds,
                             corner_radii,
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            TransformationMatrix::unit(),
+                            self.style.sampling,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
@@ -805,8 +816,7 @@ impl From<image::ImageError> for ImageCacheError {
 mod tests {
     use super::*;
     use crate::{
-        Corners, ParentElement as _, TestAppContext, TransformationMatrix, canvas, div, point, px,
-        size,
+        Corners, ParentElement as _, TestAppContext, canvas, div, point, px, size,
     };
     use image::{Frame, ImageBuffer, Rgba};
 
@@ -846,6 +856,30 @@ mod tests {
             .draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
                 img(ImageSource::Render(test_image(0))).into_any_element()
             });
+    }
+
+    #[gpui::test]
+    fn image_sampling_reaches_the_sprite(cx: &mut TestAppContext) {
+        // 3x2 texels over a 10x7 box: no whole scale, so only `Nearest` samples texel centres.
+        let window = cx.add_empty_window();
+        let image = test_image_with_size(3, 2);
+        let nearest = |sampling: Option<TextureSampling>| {
+            let image = image.clone();
+            window.draw(point(px(0.), px(0.)), size(px(10.), px(7.)), move |_, _| {
+                let picture = img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Fill);
+                match sampling {
+                    Some(sampling) => picture.sampling(sampling),
+                    None => picture,
+                }
+                .into_any_element()
+            });
+            window.update(|window, _| {
+                window.rendered_frame.scene.polychrome_sprites.last().expect("a sprite").nearest
+            })
+        };
+        assert_eq!(nearest(None), 0, "smooth by default");
+        assert_eq!(nearest(Some(TextureSampling::Linear)), 0);
+        assert_eq!(nearest(Some(TextureSampling::Nearest)), 1);
     }
 
     #[gpui::test]
@@ -931,6 +965,7 @@ mod tests {
                             0,
                             false,
                             transformation,
+                            TextureSampling::Linear,
                         )
                         .unwrap();
                 },

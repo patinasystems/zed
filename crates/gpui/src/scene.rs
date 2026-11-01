@@ -2501,10 +2501,13 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    /// Nonzero for an image drawn at a whole number of device pixels per texel with no
-    /// rotation or scale: the fragment shader samples texel centres, so the image's own hard
-    /// edges stay hard instead of blending into the neighbouring texel's color.
-    pub exact_scale: u32,
+    /// Nonzero samples the nearest texel (the fragment shader reads texel centres) instead of
+    /// filtering between texels: for an image painted with [`crate::TextureSampling::Nearest`]
+    /// (CSS `image-rendering: pixelated`), whose texels stay square at any scale, and for one
+    /// drawn at a whole number of device pixels per texel with no rotation or scale, where the
+    /// two agree except that the image's own hard edges stay hard instead of blending into the
+    /// neighbouring texel's color.
+    pub nearest: u32,
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
@@ -4082,7 +4085,7 @@ pub mod elliptical_image_test_scene {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile,
             grayscale: false.into(),
             opacity: 1.,
@@ -4104,6 +4107,66 @@ pub mod elliptical_image_test_scene {
         assert!(!at(10, 10), "box corner {:?}", pixel(10, 10));
         assert!(!at(24, 9), "above the elliptical arc {:?}", pixel(24, 9));
         assert!(at(12, 26), "left tip {:?}", pixel(12, 26));
+    }
+}
+
+/// A 2x1 image (red, blue) stretched 2.5x by nearest and by linear sampling, for
+/// `image-rendering: pixelated` against `auto`.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod image_sampling_test_scene {
+    use super::*;
+    use crate::size;
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (16, 12);
+
+    /// The image's pixels, BGRA: red, then blue.
+    pub const PIXELS: [u8; 8] = [0, 0, 255, 255, 255, 0, 0, 255];
+
+    /// The image's size in texels.
+    pub const IMAGE_SIZE: (i32, i32) = (2, 1);
+
+    /// `tile` (the image of [`PIXELS`]) at (1, 1), 5 x 10: 2.5 device pixels per texel across.
+    /// Row 1 draws it with `nearest` 0 (linear), row 6 with 1 (nearest).
+    pub fn scene(tile: AtlasTile) -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        for (nearest, y) in [(0, 1.), (1, 6.)] {
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                nearest,
+                tile,
+                grayscale: false.into(),
+                opacity: 1.,
+                bounds: Bounds::new(point(ScaledPixels(1.), ScaledPixels(y)), size(ScaledPixels(5.), ScaledPixels(5.))),
+                content_mask: full,
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Linear: the device pixel across the texel boundary (x 3, centre 3.5, between the texel
+    /// centres at 1.25 and 3.75 device pixels from the left edge) mixes red and blue. Nearest:
+    /// every pixel is one texel's color, red up to x 3.5 and blue after.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let mixed = |p: [u8; 4]| p[0] > 40 && p[2] > 40;
+        let linear = pixel(3, 3);
+        assert!(mixed(linear), "linear blends across the texel boundary: {linear:?}");
+        for x in 1..6 {
+            let p = pixel(x, 8);
+            assert!(!mixed(p) && p[3] >= 254, "nearest pixel ({x}, 8) is one opaque texel: {p:?}");
+            if x != 3 {
+                assert_eq!(p[0] > 200, x < 3, "nearest pixel ({x}, 8) is red left of x 3, blue right: {p:?}");
+            }
+        }
     }
 }
 
@@ -4792,7 +4855,7 @@ mod tests {
     ) -> PolychromeSprite {
         PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,

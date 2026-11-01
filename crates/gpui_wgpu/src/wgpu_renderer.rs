@@ -4513,6 +4513,31 @@ mod tests {
         Ok(())
     }
 
+    /// Linear and nearest image sprites in one batch (`image-rendering: auto` and `pixelated`).
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn images_sample_nearest_or_linear_per_sprite() -> anyhow::Result<()> {
+        use gpui::image_sampling_test_scene as t;
+        use gpui::{AtlasKey, DevicePixels, ImageId, PlatformHeadlessRenderer, RenderImageParams};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let atlas = renderer.sprite_atlas();
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(8), frame_index: 0 }),
+                &mut || Ok(Some((Size { width: DevicePixels(t::IMAGE_SIZE.0), height: DevicePixels(t::IMAGE_SIZE.1) }, std::borrow::Cow::Borrowed(&t::PIXELS[..])))),
+            )?
+            .expect("tile");
+        let image = renderer.render_scene_to_image(&t::scene(tile), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
     /// A backdrop filter inside an oval follows its elliptical corners.
     #[cfg(not(target_family = "wasm"))]
     #[test]

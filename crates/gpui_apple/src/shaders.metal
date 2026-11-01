@@ -927,9 +927,9 @@ fragment float4 polychrome_sprite_fragment(
   // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
   float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
   float2 tile_position = clamp_to_tile(input.tile_position, sprite.tile, atlas_size);
-  // At a whole number of device pixels per texel, sample texel centres: the image's own
-  // hard edges stay hard, as browsers draw images at integer scales.
-  if (sprite.exact_scale != 0) {
+  // Nearest sampling (`image-rendering: pixelated`, or a whole number of device pixels per
+  // texel, where browsers keep the image's own hard edges): read the texel's centre.
+  if (sprite.nearest != 0) {
     tile_position = (floor(tile_position * atlas_size) + 0.5) / atlas_size;
   }
   float4 sample = atlas_texture.sample(atlas_texture_sampler, tile_position);

@@ -214,6 +214,7 @@ impl Render for TransformedPaintExample {
                             0,
                             false,
                             transformation_about(rotated_bounds.center(), PI / 6., 1., window),
+                            gpui::TextureSampling::Linear,
                         )
                         .expect("painting an image should succeed");
                     window.paint_quad(outline(rotated_bounds, rgb(0x8c959f), BorderStyle::Solid));
@@ -234,6 +235,7 @@ impl Render for TransformedPaintExample {
                                 0,
                                 false,
                                 transformation_about(clipped_bounds.center(), PI / 4., 1., window),
+                                gpui::TextureSampling::Linear,
                             )
                             .expect("painting an image should succeed");
 

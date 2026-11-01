@@ -3128,7 +3128,7 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile,
             grayscale: PaddedBool32::from(false),
             opacity: 1.,
@@ -3150,14 +3150,14 @@ mod tests {
 
     #[test]
     fn images_at_whole_scales_keep_their_hard_edges() {
-        // A 1x2 image (green over transparent) drawn 2x: with `exact_scale` each texel fills its
+        // A 1x2 image (green over transparent) drawn 2x: with `nearest` each texel fills its
         // 2x2 device pixels; without it, linear filtering bleeds a quarter of the green into the
         // first transparent row.
         use gpui::{
             AtlasKey, Bounds, ContentMask, Corners, ImageId, PaddedBool32, PolychromeSprite,
             RenderImageParams, ScaledPixels, TransformationMatrix,
         };
-        let draw = |exact_scale: u32| {
+        let draw = |nearest: u32| {
             let mut renderer = MetalHeadlessRenderer::new();
             renderer.renderer.update_transparency(true);
             let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
@@ -3174,7 +3174,7 @@ mod tests {
             let mut scene = Scene::default();
             scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                exact_scale,
+                nearest,
                 tile,
                 grayscale: PaddedBool32::from(false),
                 opacity: 1.,
@@ -3788,6 +3788,24 @@ mod tests {
             .expect("tile");
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(tile), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
         t::check(|x, y| image.get_pixel(x, y).0, |p| p[3] > 128);
+    }
+
+    #[test]
+    fn images_sample_nearest_or_linear_per_sprite() {
+        use gpui::image_sampling_test_scene as t;
+        use gpui::{AtlasKey, ImageId, RenderImageParams};
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.update_transparency(true);
+        let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(8), frame_index: 0 }),
+                &mut || Ok(Some((size(DevicePixels(t::IMAGE_SIZE.0), DevicePixels(t::IMAGE_SIZE.1)), std::borrow::Cow::Borrowed(&t::PIXELS[..])))),
+            )
+            .expect("insert")
+            .expect("tile");
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(tile), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0);
     }
 
     #[test]
