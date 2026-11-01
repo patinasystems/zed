@@ -1552,6 +1552,18 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id_for_postscript_name(&self, _postscript_name: &str) -> Option<FontId> {
         None
     }
+    /// The face [`Self::font_id_for_postscript_name`] finds, at the variation coordinates
+    /// `variations` (OpenType axis tag, user value): a variable font's instance between its
+    /// named ones (CSS `font-weight: 450`, `font-variation-settings`). Its glyph ids are the
+    /// face's. Axes the face lacks are ignored. Platforms that cannot instance a face return
+    /// the face itself.
+    fn font_id_for_postscript_name_with_variations(
+        &self,
+        postscript_name: &str,
+        _variations: &[(u32, f32)],
+    ) -> Option<FontId> {
+        self.font_id_for_postscript_name(postscript_name)
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.
