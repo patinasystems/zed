@@ -863,7 +863,7 @@ mod tests {
         // 3x2 texels over a 10x7 box: no whole scale, so only `Nearest` samples texel centres.
         let window = cx.add_empty_window();
         let image = test_image_with_size(3, 2);
-        let nearest = |sampling: Option<TextureSampling>| {
+        let mut nearest = |sampling: Option<TextureSampling>| {
             let image = image.clone();
             window.draw(point(px(0.), px(0.)), size(px(10.), px(7.)), move |_, _| {
                 let picture = img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Fill);
