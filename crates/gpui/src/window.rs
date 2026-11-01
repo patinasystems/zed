@@ -5153,7 +5153,7 @@ impl Window {
             self.backdrop_filter(
                 backdrop.bounds,
                 backdrop.corner_radii,
-                backdrop.backdrop,
+                &backdrop.backdrop,
                 1.,
             )
         });

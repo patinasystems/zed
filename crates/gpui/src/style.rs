@@ -882,7 +882,7 @@ impl Style {
         let corner_radii = quad_radii.circular();
         window.paint_drop_shadows(bounds, quad_radii, &self.box_shadow);
 
-        if backdrop && let Some(backdrop) = self.backdrop_filter {
+        if backdrop && let Some(backdrop) = &self.backdrop_filter {
             window.paint_backdrop_filter(bounds, quad_radii, backdrop);
         }
 

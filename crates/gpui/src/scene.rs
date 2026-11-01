@@ -4245,6 +4245,7 @@ pub mod elliptical_backdrop_test_scene {
                 opacity: 1.,
                 order: 0,
                 shader: ShaderDraw::NONE,
+                ..Default::default()
             }
             .with_color_filters(&[ColorFilter::Contrast(0.)]),
         );
