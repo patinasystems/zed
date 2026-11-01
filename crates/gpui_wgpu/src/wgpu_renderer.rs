@@ -149,6 +149,8 @@ struct WgpuPipelines {
 struct BackdropPipelines {
     /// Copies a texture to a render target (downsampling, and the final frame copy).
     copy: wgpu::RenderPipeline,
+    /// Copies a region of a texture, texel for texel (`copy_region`).
+    copy_region: wgpu::RenderPipeline,
     blur: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     /// Composite a group's image over the target, adding to it (plus-lighter) and
@@ -201,6 +203,14 @@ const BACKDROP_COMPOSITE_BLEND: wgpu::BlendState = wgpu::BlendState {
         operation: wgpu::BlendOperation::Add,
     },
 };
+
+/// `CopyParams` in shaders_backdrop.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BackdropCopyParams {
+    offset: [i32; 2],
+    pad: [i32; 2],
+}
 
 /// `BlurParams` in shaders_backdrop.wgsl.
 #[repr(C)]
@@ -1314,6 +1324,14 @@ impl WgpuRendererCore {
                 "vs_backdrop_fullscreen",
                 "fs_backdrop_copy",
                 false,
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+            ),
+            copy_region: pipeline(
+                "backdrop_copy_region",
+                "vs_backdrop_fullscreen",
+                "fs_backdrop_copy_region",
+                true,
                 None,
                 wgpu::PrimitiveTopology::TriangleList,
             ),
@@ -2674,29 +2692,37 @@ impl WgpuRendererCore {
         let pool = &self.resources().texture_pool;
         let device = &self.resources().device;
         let copy = pool.acquire(device, self.target_format, width, height);
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: frame_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: x as u32,
-                    y: y as u32,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &copy.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Drawn, not `copy_texture_to_texture`: on wgpu's GL backend (WebGL2 too) a copy
+        // from a pooled image drawn earlier in the same command buffer read the image's
+        // previous contents, so a blend inside a group blended with the last frame's
+        // image again (the result compounded frame by frame).
+        let source = frame_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = BackdropCopyParams {
+            offset: [x as i32, y as i32],
+            pad: [0; 2],
+        };
+        let uniforms = self.backdrop_uniforms(bytemuck::bytes_of(&params));
+        let source_group = self.create_texture_bind_group("backdrop_copy_source", &source);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("backdrop_copy_region"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &copy.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.resources().pipelines.backdrop.copy_region);
+            pass.set_bind_group(0, &source_group, &[]);
+            pass.set_bind_group(1, &uniforms, &[]);
+            pass.draw(0..3, 0..1);
+        }
         let region = [x, y, width as f32, height as f32];
         if sigma < 0.5 {
             return Some((copy, region));
@@ -4592,17 +4618,23 @@ mod tests {
             }
         };
         let (scene, probes) = t::scene();
-        let image = renderer.render_scene_to_image(
-            &scene,
-            Size {
-                width: DevicePixels(t::SIZE.0),
-                height: DevicePixels(t::SIZE.1),
-            },
-        )?;
-        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
-            image.save(std::path::Path::new(&dir).join("group_isolation_wgpu.png"))?;
+        // Several frames: group images come from a pool, so a later frame draws into
+        // an image an earlier one used. On GL (`WGPU_BACKEND=gl`, the web renderer's
+        // path) a texture copy of the group read that earlier frame's image.
+        for frame in 0..3 {
+            let image = renderer.render_scene_to_image(
+                &scene,
+                Size {
+                    width: DevicePixels(t::SIZE.0),
+                    height: DevicePixels(t::SIZE.1),
+                },
+            )?;
+            if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+                let name = format!("group_isolation_wgpu_{frame}.png");
+                image.save(std::path::Path::new(&dir).join(name))?;
+            }
+            t::check(|x, y| image.get_pixel(x, y).0, &probes, 1);
         }
-        t::check(|x, y| image.get_pixel(x, y).0, &probes, 1);
         Ok(())
     }
 

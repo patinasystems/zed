@@ -239,7 +239,10 @@ impl WgpuContext {
         let device_id_filter = Self::device_id_filter();
         let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
             gpui::block_on(async {
-                let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+                // `WGPU_BACKEND` (for example `gl`) pins the backend, so tests can run the
+                // GL path the web renderer takes.
+                let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+                let mut adapters = instance.enumerate_adapters(backends).await;
                 Self::sort_adapters(&mut adapters, device_id_filter, None);
 
                 for adapter in adapters {

@@ -25,6 +25,21 @@ fn fs_backdrop_copy(input: FullscreenVarying) -> @location(0) vec4<f32> {
     return textureSampleLevel(t_source, s_source, input.uv, 0.0);
 }
 
+struct CopyParams {
+    // Where the copied region starts in the source, texels.
+    offset: vec2<i32>,
+    pad: vec2<i32>,
+}
+
+@group(1) @binding(0) var<uniform> copy_params: CopyParams;
+
+// A region of the source, texel for texel, into a target the region's size: what
+// a texture copy does, drawn instead (see `copy_region`).
+@fragment
+fn fs_backdrop_copy_region(input: FullscreenVarying) -> @location(0) vec4<f32> {
+    return textureLoad(t_source, vec2<i32>(input.position.xy) + copy_params.offset, 0);
+}
+
 struct BlurParams {
     // One texel along the blur axis, in uv.
     direction: vec2<f32>,
