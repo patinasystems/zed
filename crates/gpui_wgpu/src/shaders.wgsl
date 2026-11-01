@@ -114,6 +114,7 @@ struct Corners {
 struct ContentMask {
     bounds: Bounds,
     corner_radii: Corners,
+    rounded_bounds: Bounds,
 }
 
 struct Edges {
@@ -1693,7 +1694,8 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
-    // The content mask (`ContentMask`): bounds, then corner radii.
+    // The content mask's rounded rectangle (`ContentMask::rounded_bounds`), then its corner
+    // radii; the square clip is `clip_distances`.
     @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(4) @interpolate(flat) mask_radii: vec4<f32>,
 }
@@ -1709,7 +1711,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
-    out.mask_bounds = vec4<f32>(sprite.content_mask.bounds.origin, sprite.content_mask.bounds.size);
+    out.mask_bounds = vec4<f32>(sprite.content_mask.rounded_bounds.origin, sprite.content_mask.rounded_bounds.size);
     let r = sprite.content_mask.corner_radii;
     out.mask_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
     return out;
@@ -1728,6 +1730,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let mask = ContentMask(
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_radii.x, input.mask_radii.y, input.mask_radii.z, input.mask_radii.w),
+        Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
     );
     let clip_alpha = content_mask_alpha(input.position.xy, mask);
     return clip_output(blend_color(input.color, alpha_corrected), clip_alpha);
@@ -2161,15 +2164,15 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the clip distances; a square mask costs this
-// one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the clip distances';
+// a square mask costs this one test.
 fn content_mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     let r = mask.corner_radii;
     if (r.top_left <= 0.0 && r.top_right <= 0.0 && r.bottom_right <= 0.0 && r.bottom_left <= 0.0) {
         return 1.0;
     }
-    return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
 }
 
 // A fragment's color with its content mask coverage applied, in the target's alpha

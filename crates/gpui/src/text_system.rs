@@ -73,6 +73,36 @@ pub enum FallbackFontClass {
     Monospace,
 }
 
+/// The graphemes of `text` holding any of `missing_text_indices` (byte indices of glyphs no
+/// font had, in any order), once each in text order, with the fallback class `class_at` gives
+/// the grapheme's start.
+pub fn missing_graphemes(
+    text: &str,
+    missing_text_indices: &[usize],
+    class_at: impl Fn(usize) -> FallbackFontClass,
+) -> Vec<MissingGlyph> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    if missing_text_indices.is_empty() {
+        return Vec::new();
+    }
+    let mut indices = missing_text_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+    let mut next = 0;
+    let mut out = Vec::new();
+    for (start, grapheme) in text.grapheme_indices(true) {
+        let end = start + grapheme.len();
+        while indices.get(next).is_some_and(|i| *i < start) {
+            next += 1;
+        }
+        let Some(&i) = indices.get(next) else { break };
+        if i < end {
+            out.push(MissingGlyph::new(SharedString::from(grapheme.to_owned()), class_at(start)));
+        }
+    }
+    out
+}
+
 /// A grapheme cluster that could not be represented by any available font.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MissingGlyph {
@@ -1541,5 +1571,21 @@ mod missing_glyph_tests {
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
+    }
+}
+
+#[cfg(test)]
+mod missing_grapheme_tests {
+    use super::*;
+
+    #[test]
+    fn each_grapheme_with_a_missing_glyph_is_reported_once_in_text_order() {
+        // "e" + combining acute is one grapheme; both of its indices are missing.
+        let text = "ae\u{301}b\u{1F600}";
+        let missing = missing_graphemes(text, &[7, 2, 1], |_| FallbackFontClass::Monospace);
+        let graphemes: Vec<&str> = missing.iter().map(MissingGlyph::grapheme).collect();
+        assert_eq!(graphemes, ["e\u{301}", "\u{1F600}"]);
+        assert!(missing.iter().all(|m| m.font_class() == FallbackFontClass::Monospace));
+        assert!(missing_graphemes(text, &[], |_| FallbackFontClass::Proportional).is_empty());
     }
 }

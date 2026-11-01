@@ -2428,15 +2428,15 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the vertex stage's clip distances; a square
-// mask costs this one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the vertex stage's
+// clip distances; a square mask costs this one test.
 float content_mask_alpha(float2 position, ContentMask_ScaledPixels mask) {
   Corners_ScaledPixels r = mask.corner_radii;
   if (r.top_left <= 0. && r.top_right <= 0. && r.bottom_right <= 0. && r.bottom_left <= 0.) {
     return 1.;
   }
-  return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+  return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
 }
 
 float4 clip_alpha_straight(float4 color, float alpha) {

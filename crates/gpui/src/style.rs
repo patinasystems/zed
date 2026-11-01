@@ -804,10 +804,7 @@ impl Style {
                     Corners::default()
                 };
 
-                Some(ContentMask {
-                    bounds,
-                    corner_radii,
-                })
+                Some(ContentMask::rounded(bounds, corner_radii))
             }
         }
     }

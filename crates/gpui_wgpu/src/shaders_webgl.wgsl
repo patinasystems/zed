@@ -120,7 +120,7 @@ fn read_background(cursor: ptr<function, InstanceCursor>) -> Background {
 }
 
 fn read_content_mask(cursor: ptr<function, InstanceCursor>) -> ContentMask {
-    return ContentMask(read_bounds(cursor), read_corners(cursor));
+    return ContentMask(read_bounds(cursor), read_corners(cursor), read_bounds(cursor));
 }
 
 fn read_atlas_tile(cursor: ptr<function, InstanceCursor>) -> AtlasTile {
@@ -151,7 +151,7 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 fn load_quad(instance_id: u32) -> Quad {
     // Keep this fixed-layout decoder explicit. Some WebGL shader compilers fail
     // to optimize the cursor's branches and dynamic vector indexing for quads.
-    let first_texel_index = instance_id * 14u;
+    let first_texel_index = instance_id * 15u;
     let width = textureDimensions(t_instances).x;
     let texel0 = fetch_instance_texel(first_texel_index, width);
     let texel1 = fetch_instance_texel(first_texel_index + 1u, width);
@@ -167,6 +167,7 @@ fn load_quad(instance_id: u32) -> Quad {
     let texel11 = fetch_instance_texel(first_texel_index + 11u, width);
     let texel12 = fetch_instance_texel(first_texel_index + 12u, width);
     let texel13 = fetch_instance_texel(first_texel_index + 13u, width);
+    let texel14 = fetch_instance_texel(first_texel_index + 14u, width);
 
     let values0 = bitcast<vec4<f32>>(texel0);
     let values1 = bitcast<vec4<f32>>(texel1);
@@ -182,6 +183,7 @@ fn load_quad(instance_id: u32) -> Quad {
     let values11 = bitcast<vec4<f32>>(texel11);
     let values12 = bitcast<vec4<f32>>(texel12);
     let values13 = bitcast<vec4<f32>>(texel13);
+    let values14 = bitcast<vec4<f32>>(texel14);
 
     return Quad(
         texel0.x,
@@ -190,35 +192,36 @@ fn load_quad(instance_id: u32) -> Quad {
         ContentMask(
             Bounds(values1.zw, values2.xy),
             Corners(values2.z, values2.w, values3.x, values3.y),
+            Bounds(values3.zw, values4.xy),
         ),
         Background(
-            texel3.z,
-            texel3.w,
-            Hsla(values4.x, values4.y, values4.z, values4.w),
-            values5.x,
+            texel4.z,
+            texel4.w,
+            Hsla(values5.x, values5.y, values5.z, values5.w),
+            values6.x,
             array<LinearColorStop, 2>(
                 LinearColorStop(
-                    Hsla(values5.y, values5.z, values5.w, values6.x),
-                    values6.y,
+                    Hsla(values6.y, values6.z, values6.w, values7.x),
+                    values7.y,
                 ),
                 LinearColorStop(
-                    Hsla(values6.z, values6.w, values7.x, values7.y),
-                    values7.z,
+                    Hsla(values7.z, values7.w, values8.x, values8.y),
+                    values8.z,
                 ),
             ),
-            texel7.w,
+            texel8.w,
         ),
-        Hsla(values8.x, values8.y, values8.z, values8.w),
-        Corners(values9.x, values9.y, values9.z, values9.w),
+        Hsla(values9.x, values9.y, values9.z, values9.w),
         Corners(values10.x, values10.y, values10.z, values10.w),
-        Edges(values11.x, values11.y, values11.z, values11.w),
-        TransformationMatrix(mat2x2<f32>(values12.xy, values12.zw), values13.xy),
-        texel13.zw,
+        Corners(values11.x, values11.y, values11.z, values11.w),
+        Edges(values12.x, values12.y, values12.z, values12.w),
+        TransformationMatrix(mat2x2<f32>(values13.xy, values13.zw), values14.xy),
+        texel14.zw,
     );
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 46u);
+    var cursor = instance_cursor(instance_id * 50u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
@@ -237,7 +240,7 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 34u);
+    var cursor = instance_cursor(vertex_id * 38u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
@@ -253,7 +256,7 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 26u);
+    var cursor = instance_cursor(instance_id * 30u);
     return Underline(
         read_word(&cursor),
         read_word(&cursor),
@@ -267,7 +270,7 @@ fn load_underline(instance_id: u32) -> Underline {
 }
 
 fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 32u);
+    var cursor = instance_cursor(instance_id * 36u);
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -280,7 +283,7 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 38u);
+    var cursor = instance_cursor(instance_id * 42u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
