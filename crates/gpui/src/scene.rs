@@ -3227,6 +3227,12 @@ pub mod porter_duff_test_scene {
         std::array::from_fn(|i| s[i] * fa + d[i] * fb)
     }
 
+    /// The premultiplied result of [`ColorFilter::LuminanceToAlpha`] on straight `color`:
+    /// black, at its luminance times its alpha.
+    pub fn luminance_to_alpha(color: [f32; 4]) -> [f32; 4] {
+        [0., 0., 0., (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3]]
+    }
+
     fn rgba(c: [f32; 4]) -> Hsla {
         Rgba {
             r: c[0],
@@ -3308,12 +3314,11 @@ pub mod porter_duff_test_scene {
             });
             scene.insert_primitive(quad(bounds, full, color));
             scene.pop_group();
-            let alpha = (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3];
             probes.push(Probe {
                 what: "luminance to alpha cell",
                 x: 16 * column as u32 + 8,
                 y: 4 * row as u32 + 2,
-                rgba: over_white([0., 0., 0., alpha]),
+                rgba: over_white(luminance_to_alpha(color)),
             });
         }
         // Source-in groups that draw nothing, or only transparently: the cell clears.
@@ -5586,6 +5591,36 @@ mod tests {
             assert_eq!(scene.quads.len(), 1);
             assert_eq!(scene.quads[0].background.solid.a, 0.5);
         }
+    }
+
+    #[test]
+    fn porter_duff_operators_match_their_table() {
+        use porter_duff_test_scene::{luminance_to_alpha, reference};
+        // A half-transparent red source over a half-transparent blue backdrop.
+        let (d, s) = ([0., 0., 1., 0.5], [1., 0., 0., 0.5]);
+        let close = |a: [f32; 4], e: [f32; 4]| a.iter().zip(e).all(|(a, e)| (a - e).abs() < 1e-5);
+        let cases = [
+            (BlendMode::SourceIn, [0.25, 0., 0., 0.25], true),
+            (BlendMode::SourceOut, [0.25, 0., 0., 0.25], true),
+            (BlendMode::SourceAtop, [0.25, 0., 0.25, 0.5], false),
+            (BlendMode::DestinationOver, [0.25, 0., 0.5, 0.75], false),
+            (BlendMode::DestinationIn, [0., 0., 0.25, 0.25], true),
+            (BlendMode::DestinationOut, [0., 0., 0.25, 0.25], false),
+            (BlendMode::DestinationAtop, [0.25, 0., 0.25, 0.5], true),
+            (BlendMode::Xor, [0.25, 0., 0.25, 0.5], false),
+            (BlendMode::Copy, [0.5, 0., 0., 0.5], true),
+        ];
+        for (mode, expected, clears) in cases {
+            assert!(close(reference(mode, d, s), expected), "{mode:?}");
+            assert_eq!(mode.clears_outside(), clears, "{mode:?}");
+        }
+        assert_eq!(BlendMode::Normal.porter_duff(), None);
+        assert!(!BlendMode::Multiply.clears_outside());
+
+        assert_eq!(ColorFilter::LuminanceToAlpha.gpu(), (8, 0.));
+        assert!(close(luminance_to_alpha([1., 1., 1., 1.]), [0., 0., 0., 1.]));
+        assert!(close(luminance_to_alpha([0., 1., 0., 0.5]), [0., 0., 0., 0.3577]));
+        assert!(close(luminance_to_alpha([1., 0., 0., 1.]), [0., 0., 0., 0.2125]));
     }
 
     #[test]
