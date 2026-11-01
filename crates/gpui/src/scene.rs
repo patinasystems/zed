@@ -817,8 +817,9 @@ impl Primitive {
     }
 
     /// Whether fading this primitive alone equals fading it as a group: it paints
-    /// nothing over itself (a quad with both a background and a border does) and can
-    /// be faded (surfaces, retained shapes and backdrop filters cannot).
+    /// nothing over itself (a quad with both a background and a border does, and so
+    /// may a retained shapes draw of several instances) and can be faded (surfaces,
+    /// marks and backdrop filters cannot). One retained shape shades each pixel once.
     fn fades_alone(&self) -> bool {
         match self {
             Primitive::Quad(quad) => {
@@ -835,10 +836,8 @@ impl Primitive {
             | Primitive::MonochromeSprite(_)
             | Primitive::SubpixelSprite(_)
             | Primitive::PolychromeSprite(_) => true,
-            Primitive::Surface(_)
-            | Primitive::RetainedShapes(_)
-            | Primitive::Marks(_)
-            | Primitive::BackdropFilter(_) => false,
+            Primitive::RetainedShapes(draw) => draw.paint.range.len() == 1,
+            Primitive::Surface(_) | Primitive::Marks(_) | Primitive::BackdropFilter(_) => false,
         }
     }
 
@@ -3354,6 +3353,88 @@ pub mod compositing_group_content_test_scene {
     }
 }
 
+/// Isolated groups as CSS composites them (Compositing and Blending 1 §3.2: an
+/// isolated group starts from transparent black, and each group inside blends with
+/// what the group drew, once, when it composites), for renderer tests:
+///
+/// - `fx-isolation`: an orange page; an isolated blue box holding a gray square that
+///   multiplies. The gray multiplies the blue only, once: (42, 66, 136).
+/// - `vt-root-crossfade`: a white page; an isolated image pair holding two
+///   plus-lighter images, each a translucent group of a page and a box on it (old:
+///   white and blue at 0.194; new: white and a wider green at 0.806). Where both boxes
+///   are, 0.194 blue + 0.806 green = (49.99, 170.75, 142.16); where only the new box
+///   is, 0.194 white + 0.806 green = (84.13, 196.16, 142.16); elsewhere white.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod group_isolation_test_scene {
+    use super::*;
+    pub use crate::retained_shapes_test_scene::{Probe, SIZE, check};
+    use crate::{Rgba, size};
+
+    /// The scene and the probes every renderer must hit, within 1 per channel.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let rgb = |c: u32| Rgba {
+            r: ((c >> 16) & 0xff) as f32 / 255.,
+            g: ((c >> 8) & 0xff) as f32 / 255.,
+            b: (c & 0xff) as f32 / 255.,
+            a: 1.,
+        };
+        let quad = |x: f32, y: f32, w: f32, h: f32, c: u32| Quad {
+            bounds: Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(w), ScaledPixels(h)),
+            ),
+            content_mask: full,
+            background: Hsla::from(rgb(c)).into(),
+            ..Default::default()
+        };
+        let group = |opacity: f32, blend_mode: BlendMode| GroupEffects {
+            opacity,
+            blend_mode,
+            content_mask: full,
+            ..GroupEffects::default()
+        };
+        let (white, blue, green) = (0xffffff, 0x4f7cff, 0x2bb673);
+        let mut scene = Scene::default();
+        // fx-isolation, in the top half.
+        scene.insert_primitive(quad(0., 0., 64., 32., 0xff8a3d));
+        scene.push_group(group(1., BlendMode::Normal));
+        scene.insert_primitive(quad(4., 4., 40., 24., blue));
+        scene.push_group(group(1., BlendMode::Multiply));
+        scene.insert_primitive(quad(8., 8., 16., 16., 0x888888));
+        scene.pop_group();
+        scene.pop_group();
+        // vt-root-crossfade, in the bottom half.
+        let page = || quad(0., 32., 64., 32., white);
+        scene.insert_primitive(page());
+        scene.push_group(group(1., BlendMode::Normal));
+        for (opacity, color, width) in [(0.194, blue, 24.), (0.806, green, 40.)] {
+            scene.push_group(group(1., BlendMode::PlusLighter));
+            scene.push_group(group(opacity, BlendMode::Normal));
+            scene.insert_primitive(page());
+            scene.insert_primitive(quad(4., 36., width, 24., color));
+            scene.pop_group();
+            scene.pop_group();
+        }
+        scene.pop_group();
+        scene.finish();
+        let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
+        let probes = vec![
+            probe("gray multiplies the blue once", 16, 16, [42, 66, 136, 255]),
+            probe("the isolated blue box", 36, 16, [79, 124, 255, 255]),
+            probe("the orange page", 56, 16, [255, 138, 61, 255]),
+            probe("both boxes cross-faded", 16, 48, [50, 171, 142, 255]),
+            probe("the new box over the old page", 36, 48, [84, 196, 142, 255]),
+            probe("both pages", 56, 48, [255, 255, 255, 255]),
+        ];
+        (scene, probes)
+    }
+}
+
 /// Group masks ([`GroupMask`]), for renderer tests. Over a white page: a red square
 /// whose mask is opaque on its left half and half opaque on its right (alpha); a
 /// blue square masked by white and 50% gray (luminance), inside a multiplying group
@@ -5095,6 +5176,33 @@ mod tests {
         assert_eq!(scene.group_depth(), 1);
         let batches: Vec<String> = scene.batches().map(|b| b.label()).collect();
         assert_eq!(batches, ["quads (1)", "groups (1)"]);
+    }
+
+    #[test]
+    fn a_translucent_group_fades_one_retained_shape_but_not_several() {
+        // One instance shades each pixel once: faded directly.
+        let shapes = crate::RetainedShapes::new();
+        let mut scene = Scene::default();
+        scene.push_group(effects(0.5));
+        scene.insert_primitive(retained(scaled_bounds(0., 0., 10., 10.), &shapes));
+        scene.pop_group();
+        scene.finish();
+        assert!(scene.groups.is_empty());
+        assert_eq!(scene.retained_shapes.len(), 1);
+        assert_eq!(scene.retained_shapes[0].opacity, 0.5);
+
+        // Two instances may overlap each other (a page and a box on it): offscreen, so the
+        // page does not show through the box.
+        let mut scene = Scene::default();
+        scene.push_group(effects(0.5));
+        let mut draw = retained(scaled_bounds(0., 0., 10., 10.), &shapes);
+        draw.paint.range = 0..2;
+        scene.insert_primitive(draw);
+        scene.pop_group();
+        scene.finish();
+        assert!(scene.retained_shapes.is_empty());
+        assert_eq!(scene.groups.len(), 1);
+        assert_eq!(scene.groups[0].scene.retained_shapes[0].opacity, 1.);
     }
 
     #[test]

@@ -3604,6 +3604,25 @@ mod tests {
     }
 
     #[test]
+    fn isolated_groups_blend_once_from_transparent() {
+        use gpui::group_isolation_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image
+                .save(std::path::Path::new(&dir).join("group_isolation_metal.png"))
+                .expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 1);
+    }
+
+    #[test]
     fn group_masks_render() {
         use gpui::group_mask_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();

@@ -4578,6 +4578,34 @@ mod tests {
         Ok(())
     }
 
+    /// The shared isolated group scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn isolated_groups_blend_once_from_transparent() -> anyhow::Result<()> {
+        use gpui::group_isolation_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("group_isolation_wgpu.png"))?;
+        }
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 1);
+        Ok(())
+    }
+
     /// The shared group content scene (a path and a turned square in an offset group)
     /// on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
