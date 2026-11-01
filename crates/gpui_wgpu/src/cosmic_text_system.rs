@@ -169,6 +169,13 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().add_fonts(fonts)
     }
 
+    fn font_weight_and_style(
+        &self,
+        font_id: FontId,
+    ) -> Option<(gpui::FontWeight, gpui::FontStyle)> {
+        CosmicTextSystem::font_weight_and_style(self, font_id).ok()
+    }
+
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
         self.0.write().missing_glyph_sink = sink;
     }

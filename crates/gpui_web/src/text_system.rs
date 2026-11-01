@@ -8,7 +8,6 @@ use gpui::{
     MissingGlyphSink, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
     SUBPIXEL_VARIANTS_Y, ShapedGlyph, Size, TextRenderingMode, point, px, size,
 };
-use gpui_wgpu::CosmicTextSystem;
 use parking_lot::RwLock;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
@@ -17,7 +16,9 @@ const CANVAS_FONT_BIT: usize = 1 << (usize::BITS - 1);
 const MAX_MEASUREMENTS: usize = 4096;
 
 pub(crate) struct WebTextSystem {
-    native: CosmicTextSystem,
+    /// The text system that shapes and rasterizes; this one adds the browser's Canvas text
+    /// for what its fonts lack (emoji, scripts the page has no font for).
+    native: Arc<dyn PlatformTextSystem>,
     state: RwLock<State>,
     canvas_font_fallback: CanvasFontFallback,
 }
@@ -55,11 +56,11 @@ impl State {
 
 impl WebTextSystem {
     pub(crate) fn new(
-        system_font_fallback: &str,
+        native: Arc<dyn PlatformTextSystem>,
         canvas_font_fallback: CanvasFontFallback,
     ) -> Self {
         Self {
-            native: CosmicTextSystem::new_without_system_fonts(system_font_fallback),
+            native,
             state: RwLock::new(State::default()),
             canvas_font_fallback,
         }
@@ -269,7 +270,9 @@ impl PlatformTextSystem for WebTextSystem {
             "native font ID space exhausted"
         );
         let mut descriptor = font.clone();
-        (descriptor.weight, descriptor.style) = self.native.font_weight_and_style(font_id)?;
+        if let Some((weight, style)) = self.native.font_weight_and_style(font_id) {
+            (descriptor.weight, descriptor.style) = (weight, style);
+        }
         self.state
             .write()
             .descriptors

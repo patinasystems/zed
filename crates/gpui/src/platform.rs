@@ -1552,6 +1552,11 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id_for_postscript_name(&self, _postscript_name: &str) -> Option<FontId> {
         None
     }
+    /// The weight and style of the face `font_id` names, which may differ from the descriptor
+    /// that asked for it (the closest face a family has). `None`: the system does not say.
+    fn font_weight_and_style(&self, _font_id: FontId) -> Option<(crate::FontWeight, crate::FontStyle)> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.

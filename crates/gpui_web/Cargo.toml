@@ -10,8 +10,11 @@ autoexamples = false
 workspace = true
 
 [features]
-default = ["multithreaded"]
+default = ["multithreaded", "cosmic"]
 multithreaded = ["dep:wasm_thread", "scheduler/wasm-threads"]
+# Cosmic Text as the native text system when the application gives none
+# (`WebPlatformOptions::text_system`).
+cosmic = ["gpui_wgpu/cosmic"]
 
 [lib]
 path = "src/gpui_web.rs"
