@@ -1560,13 +1560,16 @@ pub trait PlatformTextSystem: Send + Sync {
     /// The graphemes of `text` (laid out in `font_runs`) that hold the text indices of glyphs
     /// no font had (`missing_text_indices`), as reports for a [`MissingGlyphSink`]: a system
     /// that adds its own fallback (the web's Canvas text) reports what is still missing after it.
+    /// The default reports each such grapheme for a proportional fallback font.
     fn missing_glyphs(
         &self,
-        _text: &str,
+        text: &str,
         _font_runs: &[FontRun],
-        _missing_text_indices: &[usize],
+        missing_text_indices: &[usize],
     ) -> Vec<crate::MissingGlyph> {
-        Vec::new()
+        crate::missing_graphemes(text, missing_text_indices, |_| {
+            crate::FallbackFontClass::Proportional
+        })
     }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
