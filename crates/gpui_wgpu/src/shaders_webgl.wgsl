@@ -2,6 +2,15 @@
 // The frame's gradient records (`gpui::GradientRecord`), for quads, written first in
 // the frame's instance data, so they start at texel 0.
 @group(2) @binding(0) var t_gradients: texture_2d<u32>;
+// The scene's record table (`gpui::InstanceTables`), in the same texture: renderers offset
+// the records' table indices by the table's first texel, so they index it absolutely.
+@group(3) @binding(0) var t_tables: texture_2d<u32>;
+
+fn load_table_texel(index: u32) -> vec4<f32> {
+    let width = textureDimensions(t_tables).x;
+    let coordinate = vec2<i32>(i32(index % width), i32(index / width));
+    return bitcast<vec4<f32>>(textureLoad(t_tables, coordinate, 0));
+}
 
 fn load_gradient_texel(index: u32) -> vec4<f32> {
     let width = textureDimensions(t_gradients).x;
@@ -58,195 +67,65 @@ fn read_f32(cursor: ptr<function, InstanceCursor>) -> f32 {
     return bitcast<f32>(read_word(cursor));
 }
 
-fn read_i32(cursor: ptr<function, InstanceCursor>) -> i32 {
-    return bitcast<i32>(read_word(cursor));
-}
-
 fn read_vec2_f32(cursor: ptr<function, InstanceCursor>) -> vec2<f32> {
     return vec2<f32>(read_f32(cursor), read_f32(cursor));
-}
-
-fn read_vec2_i32(cursor: ptr<function, InstanceCursor>) -> vec2<i32> {
-    return vec2<i32>(read_i32(cursor), read_i32(cursor));
-}
-
-fn read_hsla(cursor: ptr<function, InstanceCursor>) -> Hsla {
-    return Hsla(
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-    );
 }
 
 fn read_bounds(cursor: ptr<function, InstanceCursor>) -> Bounds {
     return Bounds(read_vec2_f32(cursor), read_vec2_f32(cursor));
 }
 
-fn read_corners(cursor: ptr<function, InstanceCursor>) -> Corners {
-    return Corners(
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
+fn instance_texel(texel_index: u32) -> vec4<u32> {
+    return fetch_instance_texel(texel_index, textureDimensions(t_instances).x);
+}
+
+// Records of whole texels, decoded at fixed positions: some WebGL shader compilers fail to
+// optimize the cursor's branches and dynamic vector indexing.
+fn load_quad_record(instance_id: u32) -> QuadRecord {
+    let first = instance_id * 4u;
+    let t0 = bitcast<vec4<f32>>(instance_texel(first));
+    let t1 = bitcast<vec4<f32>>(instance_texel(first + 1u));
+    let t2 = bitcast<vec4<f32>>(instance_texel(first + 2u));
+    let t3 = instance_texel(first + 3u);
+    return QuadRecord(
+        Bounds(t0.xy, t0.zw),
+        Corners(t1.x, t1.y, t1.z, t1.w),
+        Hsla(t2.x, t2.y, t2.z, t2.w),
+        t3.x,
+        t3.y,
+        t3.z,
+        t3.w,
     );
 }
 
-fn read_edges(cursor: ptr<function, InstanceCursor>) -> Edges {
-    return Edges(
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
+fn load_shadow_record(instance_id: u32) -> ShadowRecord {
+    let first = instance_id * 6u;
+    let t0 = bitcast<vec4<f32>>(instance_texel(first));
+    let t1 = bitcast<vec4<f32>>(instance_texel(first + 1u));
+    let t2 = bitcast<vec4<f32>>(instance_texel(first + 2u));
+    let t3 = bitcast<vec4<f32>>(instance_texel(first + 3u));
+    let t4 = bitcast<vec4<f32>>(instance_texel(first + 4u));
+    let t5 = instance_texel(first + 5u);
+    return ShadowRecord(
+        Bounds(t0.xy, t0.zw),
+        Corners(t1.x, t1.y, t1.z, t1.w),
+        Hsla(t2.x, t2.y, t2.z, t2.w),
+        Bounds(t3.xy, t3.zw),
+        Corners(t4.x, t4.y, t4.z, t4.w),
+        bitcast<f32>(t5.x),
+        t5.y,
+        t5.z,
+        t5.w,
     );
 }
 
-fn read_color_stop(cursor: ptr<function, InstanceCursor>) -> LinearColorStop {
-    return LinearColorStop(read_hsla(cursor), read_f32(cursor));
-}
-
-fn read_background(cursor: ptr<function, InstanceCursor>) -> Background {
-    return Background(
-        read_word(cursor),
-        read_word(cursor),
-        read_hsla(cursor),
-        read_f32(cursor),
-        array<LinearColorStop, 2>(
-            read_color_stop(cursor),
-            read_color_stop(cursor),
-        ),
-        read_word(cursor),
-    );
-}
-
-fn read_content_mask(cursor: ptr<function, InstanceCursor>) -> ContentMask {
-    return ContentMask(read_bounds(cursor), read_corners(cursor), read_bounds(cursor));
-}
-
-fn read_atlas_tile(cursor: ptr<function, InstanceCursor>) -> AtlasTile {
-    return AtlasTile(
-        AtlasTextureId(
-            read_word(cursor),
-            read_word(cursor),
-        ),
-        read_word(cursor),
-        read_word(cursor),
-        AtlasBounds(
-            read_vec2_i32(cursor),
-            read_vec2_i32(cursor),
-        ),
-    );
-}
-
-fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationMatrix {
-    return TransformationMatrix(
-        mat2x2<f32>(
-            read_vec2_f32(cursor),
-            read_vec2_f32(cursor),
-        ),
-        read_vec2_f32(cursor),
-    );
-}
-
-fn load_quad(instance_id: u32) -> Quad {
-    // Keep this fixed-layout decoder explicit. Some WebGL shader compilers fail
-    // to optimize the cursor's branches and dynamic vector indexing for quads.
-    let first_texel_index = instance_id * 15u;
-    let width = textureDimensions(t_instances).x;
-    let texel0 = fetch_instance_texel(first_texel_index, width);
-    let texel1 = fetch_instance_texel(first_texel_index + 1u, width);
-    let texel2 = fetch_instance_texel(first_texel_index + 2u, width);
-    let texel3 = fetch_instance_texel(first_texel_index + 3u, width);
-    let texel4 = fetch_instance_texel(first_texel_index + 4u, width);
-    let texel5 = fetch_instance_texel(first_texel_index + 5u, width);
-    let texel6 = fetch_instance_texel(first_texel_index + 6u, width);
-    let texel7 = fetch_instance_texel(first_texel_index + 7u, width);
-    let texel8 = fetch_instance_texel(first_texel_index + 8u, width);
-    let texel9 = fetch_instance_texel(first_texel_index + 9u, width);
-    let texel10 = fetch_instance_texel(first_texel_index + 10u, width);
-    let texel11 = fetch_instance_texel(first_texel_index + 11u, width);
-    let texel12 = fetch_instance_texel(first_texel_index + 12u, width);
-    let texel13 = fetch_instance_texel(first_texel_index + 13u, width);
-    let texel14 = fetch_instance_texel(first_texel_index + 14u, width);
-
-    let values0 = bitcast<vec4<f32>>(texel0);
-    let values1 = bitcast<vec4<f32>>(texel1);
-    let values2 = bitcast<vec4<f32>>(texel2);
-    let values3 = bitcast<vec4<f32>>(texel3);
-    let values4 = bitcast<vec4<f32>>(texel4);
-    let values5 = bitcast<vec4<f32>>(texel5);
-    let values6 = bitcast<vec4<f32>>(texel6);
-    let values7 = bitcast<vec4<f32>>(texel7);
-    let values8 = bitcast<vec4<f32>>(texel8);
-    let values9 = bitcast<vec4<f32>>(texel9);
-    let values10 = bitcast<vec4<f32>>(texel10);
-    let values11 = bitcast<vec4<f32>>(texel11);
-    let values12 = bitcast<vec4<f32>>(texel12);
-    let values13 = bitcast<vec4<f32>>(texel13);
-    let values14 = bitcast<vec4<f32>>(texel14);
-
-    return Quad(
-        texel0.x,
-        texel0.y,
-        Bounds(values0.zw, values1.xy),
-        ContentMask(
-            Bounds(values1.zw, values2.xy),
-            Corners(values2.z, values2.w, values3.x, values3.y),
-            Bounds(values3.zw, values4.xy),
-        ),
-        Background(
-            texel4.z,
-            texel4.w,
-            Hsla(values5.x, values5.y, values5.z, values5.w),
-            values6.x,
-            array<LinearColorStop, 2>(
-                LinearColorStop(
-                    Hsla(values6.y, values6.z, values6.w, values7.x),
-                    values7.y,
-                ),
-                LinearColorStop(
-                    Hsla(values7.z, values7.w, values8.x, values8.y),
-                    values8.z,
-                ),
-            ),
-            texel8.w,
-        ),
-        Hsla(values9.x, values9.y, values9.z, values9.w),
-        Corners(values10.x, values10.y, values10.z, values10.w),
-        Corners(values11.x, values11.y, values11.z, values11.w),
-        Edges(values12.x, values12.y, values12.z, values12.w),
-        TransformationMatrix(mat2x2<f32>(values13.xy, values13.zw), values14.xy),
-        texel14.zw,
-    );
-}
-
-fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 50u);
-    return Shadow(
-        read_word(&cursor),
-        read_f32(&cursor),
-        read_bounds(&cursor),
-        read_corners(&cursor),
-        read_corners(&cursor),
-        read_content_mask(&cursor),
-        read_hsla(&cursor),
-        read_bounds(&cursor),
-        read_corners(&cursor),
-        read_corners(&cursor),
-        read_word(&cursor),
-        read_word(&cursor),
-        read_transformation(&cursor),
-    );
-}
-
-fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 38u);
-    return PathRasterizationVertex(
+fn load_path_vertex_record(vertex_id: u32) -> PathVertexRecord {
+    var cursor = instance_cursor(vertex_id * 6u);
+    return PathVertexRecord(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
-        read_background(&cursor),
-        read_bounds(&cursor),
-        read_content_mask(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
     );
 }
 
@@ -255,46 +134,51 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
     return PathSprite(read_bounds(&cursor));
 }
 
-fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 30u);
-    return Underline(
-        read_word(&cursor),
-        read_word(&cursor),
-        read_bounds(&cursor),
-        read_content_mask(&cursor),
-        read_hsla(&cursor),
-        read_f32(&cursor),
-        read_word(&cursor),
-        read_transformation(&cursor),
+fn load_underline_record(instance_id: u32) -> UnderlineRecord {
+    let first = instance_id * 3u;
+    let t0 = bitcast<vec4<f32>>(instance_texel(first));
+    let t1 = bitcast<vec4<f32>>(instance_texel(first + 1u));
+    let t2 = instance_texel(first + 2u);
+    return UnderlineRecord(
+        Bounds(t0.xy, t0.zw),
+        Hsla(t1.x, t1.y, t1.z, t1.w),
+        bitcast<f32>(t2.x),
+        t2.y,
+        t2.z,
+        t2.w,
     );
 }
 
-fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 36u);
-    return MonochromeSprite(
-        read_word(&cursor),
-        read_word(&cursor),
-        read_atlas_tile(&cursor),
-        read_bounds(&cursor),
-        read_content_mask(&cursor),
-        read_hsla(&cursor),
-        read_transformation(&cursor),
+fn load_mono_sprite_record(instance_id: u32) -> SpriteRecord {
+    let first = instance_id * 4u;
+    let t0 = bitcast<vec4<i32>>(instance_texel(first));
+    let t1 = bitcast<vec4<f32>>(instance_texel(first + 1u));
+    let t2 = bitcast<vec4<f32>>(instance_texel(first + 2u));
+    let t3 = instance_texel(first + 3u);
+    return SpriteRecord(
+        AtlasBounds(t0.xy, t0.zw),
+        Bounds(t1.xy, t1.zw),
+        Hsla(t2.x, t2.y, t2.z, t2.w),
+        t3.x,
+        t3.y,
+        t3.zw,
     );
 }
 
-fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 42u);
-    return PolychromeSprite(
-        read_word(&cursor),
-        read_word(&cursor),
-        read_atlas_tile(&cursor),
-        read_word(&cursor),
-        read_f32(&cursor),
-        read_bounds(&cursor),
-        read_content_mask(&cursor),
-        read_corners(&cursor),
-        read_corners(&cursor),
-        read_transformation(&cursor),
+fn load_poly_sprite_record(instance_id: u32) -> PolychromeSpriteRecord {
+    let first = instance_id * 4u;
+    let t0 = bitcast<vec4<i32>>(instance_texel(first));
+    let t1 = bitcast<vec4<f32>>(instance_texel(first + 1u));
+    let t2 = bitcast<vec4<f32>>(instance_texel(first + 2u));
+    let t3 = instance_texel(first + 3u);
+    return PolychromeSpriteRecord(
+        AtlasBounds(t0.xy, t0.zw),
+        Bounds(t1.xy, t1.zw),
+        Corners(t2.x, t2.y, t2.z, t2.w),
+        bitcast<f32>(t3.x),
+        t3.y,
+        t3.z,
+        t3.w,
     );
 }
 

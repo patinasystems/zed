@@ -38,6 +38,12 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+impl From<PaddedBool32> for bool {
+    fn from(value: PaddedBool32) -> Self {
+        value.0 != 0
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
