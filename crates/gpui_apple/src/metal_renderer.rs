@@ -3764,6 +3764,17 @@ mod tests {
     }
 
     #[test]
+    fn rounded_dashes_sit_where_webkit_draws_them() {
+        use gpui::rounded_dashes_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("rounded_dashes_metal.png")).expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0);
+    }
+
+    #[test]
     fn elliptical_shadows_follow_the_oval() {
         use gpui::elliptical_shadow_test_scene as t;
         let mut renderer = MetalHeadlessRenderer::new();

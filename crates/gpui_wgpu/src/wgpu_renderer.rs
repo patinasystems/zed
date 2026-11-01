@@ -4449,6 +4449,24 @@ mod tests {
         Ok(())
     }
 
+    /// Rounded dashed borders: dashes and gaps where WebKit draws them.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn rounded_dashes_sit_where_webkit_draws_them() -> anyhow::Result<()> {
+        use gpui::rounded_dashes_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
     /// A dashed border on an oval: dashes alternate with gaps around the whole elliptical arc, in every quadrant.
     #[cfg(not(target_family = "wasm"))]
     #[test]

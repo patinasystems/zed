@@ -3996,6 +3996,100 @@ pub mod elliptical_dashes_test_scene {
     }
 }
 
+/// Rounded dashed borders where WebKit draws their dashes: a 100 x 100 circle and a 200 x 100 box
+/// with 20 px corners, each with a 4 px dashed black border. The expected dashes and gaps are
+/// WebKit's (Playwright WebKit on macOS at 2x, measured along the outer edge from halfway down the
+/// right edge, clockwise).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod rounded_dashes_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (240, 240);
+
+    /// Each box: its bounds `[x, y, w, h]` and corner radius.
+    const BOXES: [([f32; 4], f32); 2] = [([10., 10., 100., 100.], 50.), ([10., 120., 200., 100.], 20.)];
+
+    /// Positions along each box's outer edge at the middle of a WebKit dash (`true`) or gap.
+    const EXPECTED: [&[(f32, bool)]; 2] = [
+        &[(6., false), (18., true), (30., false), (42., true), (54., false), (66., true), (162., true), (174., false), (306., true)],
+        &[(2., false), (6., false), (18.2, true), (30.7, false), (43., true), (55.5, false), (67.7, true), (80., false), (92.2, true), (104.4, false), (264., true), (276., false), (532.8, true)],
+    ];
+
+    pub fn scene() -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let color = |v: f32| -> Hsla { Rgba { r: v, g: v, b: v, a: 1. }.into() };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad { bounds: full.bounds, content_mask: full, background: color(1.).into(), ..Default::default() });
+        let b = ScaledPixels(4.);
+        for ([x, y, w, h], r) in BOXES {
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(point(ScaledPixels(x), ScaledPixels(y)), size(ScaledPixels(w), ScaledPixels(h))),
+                content_mask: full,
+                background: color(1.).into(),
+                border_color: color(0.),
+                border_style: BorderStyle::Dashed,
+                corner_radii: Corners::all(ScaledPixels(r)),
+                corner_radii_y: Corners::all(ScaledPixels(r)),
+                border_widths: Edges { top: b, right: b, bottom: b, left: b },
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// The point of a box's outer edge `s` along it (from halfway down the right edge, clockwise)
+    /// and the inward normal there.
+    fn along([x, y, w, h]: [f32; 4], r: f32, mut s: f32) -> ([f32; 2], [f32; 2]) {
+        use std::f32::consts::FRAC_PI_2;
+        let arc = |cx: f32, cy: f32, a0: f32, s: f32| {
+            let a = a0 + s / r;
+            ([cx + r * a.cos(), cy + r * a.sin()], [-a.cos(), -a.sin()])
+        };
+        let (side_v, side_h, quarter) = (h - 2. * r, w - 2. * r, r * FRAC_PI_2);
+        let pieces: [(f32, &dyn Fn(f32) -> ([f32; 2], [f32; 2])); 9] = [
+            (side_v / 2., &|s| ([x + w, y + h / 2. + s], [-1., 0.])),
+            (quarter, &|s| arc(x + w - r, y + h - r, 0., s)),
+            (side_h, &|s| ([x + w - r - s, y + h], [0., -1.])),
+            (quarter, &|s| arc(x + r, y + h - r, FRAC_PI_2, s)),
+            (side_v, &|s| ([x, y + h - r - s], [1., 0.])),
+            (quarter, &|s| arc(x + r, y + r, 2. * FRAC_PI_2, s)),
+            (side_h, &|s| ([x + r + s, y], [0., 1.])),
+            (quarter, &|s| arc(x + w - r, y + r, 3. * FRAC_PI_2, s)),
+            (side_v / 2., &|s| ([x + w, y + r + s], [-1., 0.])),
+        ];
+        for (len, at) in pieces {
+            if s <= len {
+                return at(s);
+            }
+            s -= len;
+        }
+        pieces[8].1(pieces[8].0)
+    }
+
+    /// Checks each expected dash and gap at the border's mid-depth; panics with every miss.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let mut misses = Vec::new();
+        for ((rect, r), expected) in BOXES.into_iter().zip(EXPECTED) {
+            for &(s, dash) in expected {
+                let (p, n) = along(rect, r, s);
+                let (px, py) = (p[0] + n[0] * 2., p[1] + n[1] * 2.);
+                let v = pixel(px as u32, py as u32)[0];
+                if (dash && v > 80) || (!dash && v < 180) {
+                    misses.push(format!("box {rect:?} at {s} ({px:.1}, {py:.1}): expected {}, red {v}", if dash { "a dash" } else { "a gap" }));
+                }
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+}
+
 /// Shadows of an oval (rx 32, ry 18): sharp, and blurred.
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 #[doc(hidden)]
