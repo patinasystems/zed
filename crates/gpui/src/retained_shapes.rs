@@ -436,7 +436,7 @@ pub(crate) fn clip_uniform(
 /// clip, already in device pixels; `None` for a square mask.
 pub(crate) fn rounded_mask_clip(mask: &ContentMask<ScaledPixels>) -> Option<RetainedClipUniform> {
     mask.is_rounded().then(|| {
-        let b = mask.bounds;
+        let b = mask.rounded_bounds;
         let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
         let r = mask.corner_radii;
         RetainedClipUniform {
@@ -1196,18 +1196,18 @@ mod tests {
     #[test]
     fn a_rounded_content_mask_is_one_more_clip_in_device_pixels() {
         use crate::{Corners, point, size};
-        let mask = ContentMask {
-            bounds: Bounds::new(
+        let mask = ContentMask::rounded(
+            Bounds::new(
                 point(ScaledPixels(10.0), ScaledPixels(20.0)),
                 size(ScaledPixels(40.0), ScaledPixels(30.0)),
             ),
-            corner_radii: Corners {
+            Corners {
                 top_left: ScaledPixels(8.0),
                 top_right: ScaledPixels(0.0),
                 bottom_right: ScaledPixels(40.0),
                 bottom_left: ScaledPixels(2.0),
             },
-        };
+        );
         let draw = RetainedShapesDraw {
             order: 0,
             bounds: Bounds::default(),

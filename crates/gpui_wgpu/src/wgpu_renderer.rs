@@ -4912,14 +4912,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 46 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 60 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 50 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 38 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 42 * 4);
     }
 
     #[test]
@@ -4953,6 +4953,16 @@ mod tests {
                     top_right: 91.0.into(),
                     bottom_right: 92.0.into(),
                     bottom_left: 93.0.into(),
+                },
+                rounded_bounds: Bounds {
+                    origin: Point {
+                        x: 94.0.into(),
+                        y: 95.0.into(),
+                    },
+                    size: Size {
+                        width: 96.0.into(),
+                        height: 97.0.into(),
+                    },
                 },
             },
             background: linear_gradient(
@@ -5027,6 +5037,10 @@ mod tests {
                 91.0_f32.to_bits(),
                 92.0_f32.to_bits(),
                 93.0_f32.to_bits(),
+                94.0_f32.to_bits(),
+                95.0_f32.to_bits(),
+                96.0_f32.to_bits(),
+                97.0_f32.to_bits(),
                 1,
                 1,
                 0,

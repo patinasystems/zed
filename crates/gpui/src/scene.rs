@@ -575,7 +575,7 @@ impl Scene {
     /// further right and down: a group's scene moves to its own image's origin.
     fn translate(&mut self, offset: Point<ScaledPixels>) {
         let bounds = |b: &mut Bounds<ScaledPixels>| b.origin = b.origin + offset;
-        let mask = |m: &mut ContentMask<ScaledPixels>| m.bounds.origin = m.bounds.origin + offset;
+        let mask = |m: &mut ContentMask<ScaledPixels>| *m = m.translate(offset);
         // A transformation applied to content in window pixels, conjugated: content
         // moved by `offset`, transformed, lands `offset` from where it did.
         let conjugate = |t: &mut TransformationMatrix| {
@@ -1463,7 +1463,7 @@ impl BackdropFilter {
     /// The same filter moved by `offset` (bounds and content mask).
     pub fn translated(mut self, offset: Point<ScaledPixels>) -> Self {
         self.bounds.origin = self.bounds.origin + offset;
-        self.content_mask.bounds.origin = self.content_mask.bounds.origin + offset;
+        self.content_mask = self.content_mask.translate(offset);
         self
     }
 
@@ -2015,10 +2015,7 @@ impl OpenGroup {
             mask: None,
             masked_out: false,
             effects: GroupEffects {
-                content_mask: ContentMask {
-                    bounds,
-                    corner_radii: Corners::default(),
-                },
+                content_mask: ContentMask::from(bounds),
                 ..GroupEffects::default()
             },
             scene: Scene {
@@ -3501,9 +3498,8 @@ pub mod rounded_clip_test_scene {
             background: color(1., 1., 1.).into(),
             ..Default::default()
         });
-        let masks = MASKS.map(|[x, y, w, h]| ContentMask {
-            bounds: bounds(x, y, w, h),
-            corner_radii: Corners::all(ScaledPixels(RADIUS)),
+        let masks = MASKS.map(|[x, y, w, h]| {
+            ContentMask::rounded(bounds(x, y, w, h), Corners::all(ScaledPixels(RADIUS)))
         });
         // Each primitive overfills its mask by 4 px on every side.
         let over = |m: &ContentMask<ScaledPixels>| {

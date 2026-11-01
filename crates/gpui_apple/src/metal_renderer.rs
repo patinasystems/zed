@@ -3645,10 +3645,10 @@ mod tests {
                 };
                 scene.insert_primitive(Quad {
                     bounds: bounds(0.),
-                    content_mask: ContentMask {
-                        bounds: bounds(8.),
-                        corner_radii: Corners::all(ScaledPixels(radius)),
-                    },
+                    content_mask: ContentMask::rounded(
+                        bounds(8.),
+                        Corners::all(ScaledPixels(radius)),
+                    ),
                     background: gpui::Hsla {
                         h: 0.6,
                         s: 0.5,
