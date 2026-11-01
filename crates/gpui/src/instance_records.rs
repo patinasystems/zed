@@ -126,10 +126,11 @@ pub struct PolychromeSpriteRecord {
     pub info: u32,
 }
 
-/// A path vertex as renderers upload it (24 bytes): its positions and its path's record, whose
+/// A path vertex as renderers upload it (24 bytes): its positions, its path's record, whose
 /// texels are the clipped bounds, the background's solid color, then the background tag and color
-/// space (bits as in [`QuadRecord::flags`]) and the content mask's texel, then a background block
-/// for a background other than a solid color.
+/// space (bits as in [`QuadRecord::flags`]), then a background block for a background other than
+/// a solid color; and the path's content mask. Table texels never hold table indices, so only
+/// records need [`RebaseRecord`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -138,7 +139,15 @@ pub struct PathVertexRecord {
     pub st_position: Point<f32>,
     /// The first texel of the path's record.
     pub path: u32,
-    pub pad: u32,
+    pub content_mask: u32,
+}
+
+/// A path's place in the table, which its vertices share ([`InstanceTables::path`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[expect(missing_docs)]
+pub struct PathRecord {
+    pub texel: u32,
+    pub content_mask: u32,
 }
 
 /// A record's table indices, which a renderer whose shaders index the table absolutely (WebGL's
@@ -193,6 +202,14 @@ impl RebaseRecord for PolychromeSpriteRecord {
 impl RebaseRecord for PathVertexRecord {
     fn rebase(&mut self, base: u32) {
         self.path += base;
+        self.content_mask += base;
+    }
+}
+
+impl RebaseRecord for PathRecord {
+    fn rebase(&mut self, base: u32) {
+        self.texel += base;
+        self.content_mask += base;
     }
 }
 
@@ -491,34 +508,32 @@ impl InstanceTables {
         }
     }
 
-    /// The first texel of `path`'s record (see [`PathVertexRecord`]), which its vertices share.
-    pub fn path(&mut self, path: &Path<ScaledPixels>) -> u32 {
+    /// `path`'s record (see [`PathVertexRecord`]) and content mask, which its vertices share.
+    pub fn path(&mut self, path: &Path<ScaledPixels>) -> PathRecord {
         let content_mask = self.content_mask(&path.content_mask);
         let record = self.next();
         self.texels.extend_from_slice(&[
             bounds_texel(&path.clipped_bounds()),
             hsla_texel(&path.color.solid),
-            [
-                bits(background_flags(&path.color)),
-                bits(content_mask),
-                0.,
-                0.,
-            ],
+            [bits(background_flags(&path.color)), 0., 0., 0.],
         ]);
         self.background_block(&path.color);
-        record
+        PathRecord {
+            texel: record,
+            content_mask,
+        }
     }
 
     /// `path`'s vertices, each pointing at `record` ([`InstanceTables::path`]).
     pub fn path_vertices<'a>(
         path: &'a Path<ScaledPixels>,
-        record: u32,
+        record: PathRecord,
     ) -> impl ExactSizeIterator<Item = PathVertexRecord> + 'a {
         path.vertices.iter().map(move |vertex| PathVertexRecord {
             xy_position: vertex.xy_position,
             st_position: vertex.st_position,
-            path: record,
-            pad: 0,
+            path: record.texel,
+            content_mask: record.content_mask,
         })
     }
 }

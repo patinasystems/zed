@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, BackdropFilter, Bounds, DevicePixels, GpuSpecs, InstanceTables, Path,
-    PathVertexRecord, PolychromeSpriteRecord, PrimitiveBatch, QuadRecord, RebaseRecord,
+    PathRecord, PathVertexRecord, PolychromeSpriteRecord, PrimitiveBatch, QuadRecord, RebaseRecord,
     ScaledPixels, Scene, ShadowRecord, Size, SpriteRecord, UnderlineRecord,
     get_gamma_correction_ratios,
 };
@@ -416,7 +416,7 @@ struct InstanceBindings {
     tables: InstanceBinding,
     /// Each path's record in the table (offset like the other records' indices), which its
     /// vertices share.
-    path_records: Vec<u32>,
+    path_records: Vec<PathRecord>,
 }
 
 struct WgpuBindGroupLayouts {
@@ -2945,7 +2945,8 @@ impl WgpuRendererCore {
         encode(polychrome_sprites, &scene.polychrome_sprites, |sprite| {
             tables.polychrome_sprite(sprite)
         });
-        let mut path_records: Vec<u32> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        let mut path_records: Vec<PathRecord> =
+            scene.paths.iter().map(|path| tables.path(path)).collect();
 
         let table_binding =
             self.write_instance_binding("tables_bind_group", instance_offset, tables.texels())?;
@@ -2957,9 +2958,7 @@ impl WgpuRendererCore {
             rebase(monochrome_sprites, base);
             rebase(subpixel_sprites, base);
             rebase(polychrome_sprites, base);
-            for record in &mut path_records {
-                *record += base;
-            }
+            rebase(&mut path_records, base);
         }
         Ok(InstanceBindings {
             quads: self.write_instance_binding("quads_bind_group", instance_offset, quads)?,
@@ -3174,7 +3173,7 @@ impl WgpuRendererCore {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
-        path_records: &[u32],
+        path_records: &[PathRecord],
         tables: &InstanceBinding,
         instance_offset: &mut u64,
         size: Size<DevicePixels>,

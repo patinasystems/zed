@@ -2247,7 +2247,7 @@ struct PathVertexRecord {
     st_position: vec2<f32>,
     // The first texel of the path's record.
     path: u32,
-    pad: u32,
+    content_mask: u32,
 }
 
 // `gpui::QuadRecord::flags`.
@@ -2409,6 +2409,6 @@ fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
         record.st_position,
         load_background(bitcast<u32>(info.x), record.path + 3u, texel_hsla(load_table_texel(record.path + 1u))),
         texel_bounds(load_table_texel(record.path)),
-        load_content_mask(bitcast<u32>(info.y)),
+        load_content_mask(record.content_mask),
     );
 }

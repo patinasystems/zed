@@ -2541,8 +2541,8 @@ TransformationMatrix load_transformation(constant float4 *tables, uint index) {
 // gradient's opacity, then a linear gradient's two stops.
 Background load_background(constant float4 *tables, uint flags, uint block, Hsla solid) {
   Background background = {};
-  background.tag = (BackgroundTag)((flags >> 1) & 7u);
-  background.color_space = (ColorSpace)((flags >> 4) & 1u);
+  background.tag = (BackgroundTag)((flags >> BACKGROUND_TAG_SHIFT) & 7u);
+  background.color_space = (ColorSpace)((flags & BACKGROUND_OKLAB) != 0 ? 1u : 0u);
   background.solid = solid;
   if (background.tag != 0) {
     float4 head = tables[block];
@@ -2559,11 +2559,7 @@ Background load_background(constant float4 *tables, uint flags, uint block, Hsla
   return background;
 }
 
-// `gpui::QuadRecord::flags`.
-constant uint QUAD_DASHED = 1u;
-constant uint QUAD_BORDER = 1u << 5;
-constant uint QUAD_ELLIPTICAL = 1u << 6;
-constant uint QUAD_SHAPED = 1u << 7;
+// `QuadRecord::flags` bits (`QUAD_*`) come from the generated scene header.
 
 Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id) {
   QuadRecord record = quads[id];
@@ -2670,11 +2666,11 @@ PathRasterizationVertex load_path_vertex(constant PathVertexRecord *vertices,
   uint path = record.path;
   float4 info = tables[path + 2];
   uint flags = as_type<uint>(info.x);
-  PathRasterizationVertex vertex;
-  vertex.xy_position = record.xy_position;
-  vertex.st_position = record.st_position;
-  vertex.bounds = texel_bounds(tables[path]);
-  vertex.content_mask = load_content_mask(tables, as_type<uint>(info.y));
-  vertex.color = load_background(tables, flags, path + 3, texel_hsla(tables[path + 1]));
-  return vertex;
+  PathRasterizationVertex out;
+  out.xy_position = record.xy_position;
+  out.st_position = record.st_position;
+  out.bounds = texel_bounds(tables[path]);
+  out.content_mask = load_content_mask(tables, record.content_mask);
+  out.color = load_background(tables, flags, path + 3, texel_hsla(tables[path + 1]));
+  return out;
 }

@@ -4,8 +4,8 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, BackdropFilter, Bounds, ContentMask, DevicePixels, InstanceTables,
-    PaintSurface, Path, PlatformAtlas as _, PrimitiveBatch, RetainedShapesDraw, RetainedUpload,
-    ScaledPixels, Scene, ShapeInstance, Size, point, size,
+    PaintSurface, Path, PathRecord, PlatformAtlas as _, PrimitiveBatch, RetainedShapesDraw,
+    RetainedUpload, ScaledPixels, Scene, ShapeInstance, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
@@ -1500,7 +1500,7 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
-        path_records: &[u32],
+        path_records: &[PathRecord],
         tables: &InstanceBinding,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
@@ -2681,7 +2681,7 @@ struct InstanceBindings {
     /// The scene's record table ([`InstanceTables`]), which its records index.
     tables: InstanceBinding,
     /// Each path's record in `tables`, which its vertices share.
-    path_records: Vec<u32>,
+    path_records: Vec<PathRecord>,
 }
 
 /// Binds a scene's record table to both stages at `index`.
