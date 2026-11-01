@@ -77,10 +77,11 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    /// The PostScript names in the system UI font's files and its cascade's, with their file,
-    /// read on the first lookup Core Text cannot answer by name.
-    /// The faces in the system UI font's own files, read on the first hidden name asked for.
+    /// The faces in the system UI font's own files, read on the first lookup Core Text cannot
+    /// answer by name.
     system_ui_own_files: Option<HashMap<String, std::path::PathBuf>>,
+    /// The PostScript names in the system UI font's files and its cascade's, with their file,
+    /// read on the first lookup the UI font's own files cannot answer.
     system_ui_font_files: Option<HashMap<String, std::path::PathBuf>>,
     /// The same for every font file Core Text makes available, read on the first lookup the
     /// UI fonts cannot answer.
