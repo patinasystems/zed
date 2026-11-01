@@ -2499,11 +2499,16 @@ macro_rules! content_mask_intersect {
         impl ContentMask<$unit> {
             /// Intersect the content mask with the given content mask.
             ///
-            /// The result is one rounded rectangle. Each of its corners takes the largest
-            /// radius a mask's rounded corner gives it: a mask's own corner keeps its
-            /// radius; a corner inset by `dx`, `dy` inside a mask's rounded corner takes
-            /// `radius - max(dx, dy)`, as CSS derives an inner curve from an outer one
-            /// (the padding box's curve from the border box's).
+            /// The result is one rounded rectangle, as close to the true intersection as
+            /// circular corners get. Each corner takes the largest radius a mask's rounded
+            /// corner gives it: a mask's own corner keeps its radius. A corner inset by `dx`,
+            /// `dy` inside a mask's corner of radius `r` is cut only where that arc crosses
+            /// its edges: along its horizontal edge the arc reaches `ex = r - sqrt(r² -
+            /// (r - dy)²)` from the mask's side, along its vertical edge `ey` likewise, so the
+            /// corner loses `ex - dx` by `ey - dy`, which it rounds by the smaller of the two
+            /// (a corner inside the arc stays square). An inner curve a box derives from its
+            /// border box (CSS's padding-box curve) is the caller's to give as the mask's own
+            /// radii: a nested square clip near a rounded corner is not one.
             pub fn intersect(&self, other: &Self) -> Self {
                 let bounds = self.bounds.intersect(&other.bounds);
                 if self.corner_radii == Corners::default()
@@ -2514,15 +2519,19 @@ macro_rules! content_mask_intersect {
                 let corner = |at: fn(&Bounds<$unit>) -> Point<$unit>,
                               radius: fn(&Corners<$unit>) -> $unit| {
                     let here = at(&bounds);
-                    let mut r = 0f32;
+                    let mut out = 0f32;
                     for mask in [self, other] {
                         let there = at(&mask.bounds);
-                        let inset = (here.x.0 - there.x.0)
-                            .abs()
-                            .max((here.y.0 - there.y.0).abs());
-                        r = r.max(radius(&mask.corner_radii).0 - inset);
+                        let r = radius(&mask.corner_radii).0;
+                        let (dx, dy) = ((here.x.0 - there.x.0).abs(), (here.y.0 - there.y.0).abs());
+                        if r <= 0. || dx >= r || dy >= r {
+                            continue;
+                        }
+                        // How far the arc reaches into the corner along each edge.
+                        let reach = |d: f32| r - (r * r - (r - d) * (r - d)).max(0.).sqrt();
+                        out = out.max((reach(dy) - dx).min(reach(dx) - dy));
                     }
-                    <$unit>::from(r.max(0.))
+                    <$unit>::from(out.max(0.))
                 };
                 let corner_radii = Corners {
                     top_left: corner(|b| b.origin, |c| c.top_left),
@@ -2629,11 +2638,11 @@ mod content_mask_tests {
                 bottom_left: px(12.)
             }
         );
-        // A child inset by 4 px takes the card's inner curve (12 - 4); one inset past the
-        // radius clips square; inset unevenly, the larger inset wins (12 - max(2, 6)).
+        // A corner inside the card's arc is not cut: inset 4 px (the arc passes 3.5 px from
+        // the card's corner on the diagonal), past the radius, or 2 by 6.
         assert_eq!(
             mask(4., 4., 92., 92., 0.).intersect(&card).corner_radii,
-            Corners::all(px(8.))
+            Corners::default()
         );
         assert_eq!(
             mask(20., 20., 60., 60., 0.).intersect(&card).corner_radii,
@@ -2644,8 +2653,18 @@ mod content_mask_tests {
                 .intersect(&card)
                 .corner_radii
                 .top_left,
-            px(6.)
+            px(0.)
         );
+        // A tile flush with the card's left edge, ending 4 px above its bottom: the arc cuts
+        // its corner by 12 - sqrt(144 - 64) = 3.06 px along the bottom edge (8 along the side),
+        // and the corner rounds by the smaller, not by the card's 12 - 4.
+        let tile = mask(0., 40., 50., 56., 0.).intersect(&card);
+        let r = tile.corner_radii.bottom_left.0;
+        assert!((r - (12. - 80f32.sqrt())).abs() < 1e-4, "{r}");
+        assert_eq!(tile.corner_radii.top_left, px(0.));
+        // Shrinking the inset to zero reaches the card's own radius.
+        let r = mask(0., 40., 50., 59.999, 0.).intersect(&card).corner_radii.bottom_left.0;
+        assert!((r - 12.).abs() < 0.2, "{r}");
         // Square masks stay square.
         assert!(
             !mask(0., 0., 10., 10., 0.)
