@@ -2524,8 +2524,11 @@ macro_rules! content_mask_intersect {
             /// are rounded, the result is one rounded rectangle inside both: their rectangles'
             /// intersection, each corner rounded by the smallest circle that keeps it inside
             /// every mask whose curve reaches it ([`contained_corner_radius`]). One rounded
-            /// rectangle inside the other comes out exactly as the inner one; only two that
-            /// cross keep slightly more corner than a browser would.
+            /// rectangle inside the other comes out exactly as the inner one; two that cross
+            /// lose slightly more corner than a browser would. Where those circles do not fit
+            /// the intersection (a strip narrower than the corner it sits in), the result keeps
+            /// the mask with the larger corner exactly and the other's rectangle as its square
+            /// clip, so only the smaller corners can show past their curve.
             pub fn intersect(&self, other: &Self) -> Self {
                 let bounds = self.bounds.intersect(&other.bounds);
                 match (self.is_rounded(), other.is_rounded()) {
@@ -2535,7 +2538,6 @@ macro_rules! content_mask_intersect {
                     (true, true) => {}
                 }
                 let rounded = self.rounded_bounds.intersect(&other.rounded_bounds);
-                let limit = rounded.size.width.0.min(rounded.size.height.0) / 2.;
                 let corner = |at: fn(&Bounds<$unit>) -> Point<$unit>,
                               radius: fn(&Corners<$unit>) -> $unit| {
                     let here = at(&rounded);
@@ -2548,18 +2550,35 @@ macro_rules! content_mask_intersect {
                             (here.y.0 - there.y.0).abs(),
                         ));
                     }
-                    <$unit>::from(out.min(limit).max(0.))
+                    <$unit>::from(out)
                 };
-                ContentMask {
-                    bounds,
-                    corner_radii: Corners {
-                        top_left: corner(|b| b.origin, |c| c.top_left),
-                        top_right: corner(|b| b.top_right(), |c| c.top_right),
-                        bottom_right: corner(|b| b.bottom_right(), |c| c.bottom_right),
-                        bottom_left: corner(|b| b.bottom_left(), |c| c.bottom_left),
-                    },
-                    rounded_bounds: rounded,
+                let corner_radii = Corners {
+                    top_left: corner(|b| b.origin, |c| c.top_left),
+                    top_right: corner(|b| b.top_right(), |c| c.top_right),
+                    bottom_right: corner(|b| b.bottom_right(), |c| c.bottom_right),
+                    bottom_left: corner(|b| b.bottom_left(), |c| c.bottom_left),
+                };
+                // Coverage picks each corner's radius by quadrant: a radius fits in half the
+                // rectangle's shorter side.
+                let fits = |c: &Corners<$unit>| {
+                    let half = rounded.size.width.0.min(rounded.size.height.0) / 2.;
+                    [c.top_left, c.top_right, c.bottom_right, c.bottom_left]
+                        .iter()
+                        .all(|r| r.0 <= half)
+                };
+                if fits(&corner_radii) {
+                    return ContentMask {
+                        bounds,
+                        corner_radii,
+                        rounded_bounds: rounded,
+                    };
                 }
+                let largest = |m: &Self| {
+                    let r = &m.corner_radii;
+                    r.top_left.0.max(r.top_right.0).max(r.bottom_right.0).max(r.bottom_left.0)
+                };
+                let kept = if largest(self) >= largest(other) { self } else { other };
+                ContentMask { bounds, ..*kept }
             }
 
             /// Whether `point` is inside the mask, rounded corners included.
@@ -2703,6 +2722,14 @@ mod content_mask_tests {
             let p = point(px(x), px(y));
             assert!(!tile.contains(&p) || card.contains(&p), "({x}, {y}) leaks");
         }
+        // A strip narrower than the card's corner, in that corner: no circle on the strip
+        // fits inside the card's arc, so the card's rectangle and curve stay as they are and
+        // the strip clips square.
+        let strip = mask(0., 0., 10., 100., 1.).intersect(&card);
+        assert_eq!(strip.rounded_bounds, card.rounded_bounds);
+        assert_eq!(strip.corner_radii, card.corner_radii);
+        assert_eq!(strip.bounds, Bounds::new(point(px(0.), px(0.)), size(px(10.), px(100.))));
+        assert!(!strip.contains(&point(px(0.5), px(5.))), "outside the card's arc");
         // A corner inside the arc stays as the child has it.
         assert_eq!(contained_corner_radius(12., 4., 4.), 0.);
         assert_eq!(contained_corner_radius(12., 0., 0.), 12.);
