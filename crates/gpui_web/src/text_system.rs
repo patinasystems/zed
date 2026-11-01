@@ -433,10 +433,11 @@ impl PlatformTextSystem for WebTextSystem {
                 .filter(|run| run.font_id.0 & CANVAS_FONT_BIT == 0)
                 .flat_map(|run| &run.glyphs)
                 .filter(|glyph| glyph.id.0 == 0)
-                .map(|glyph| glyph.index);
+                .map(|glyph| glyph.index)
+                .collect::<Vec<_>>();
             sink.report(
                 self.native
-                    .missing_glyphs(text, &native_runs, missing_indices),
+                    .missing_glyphs(text, &native_runs, &missing_indices),
             );
         }
         layout
