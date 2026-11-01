@@ -2738,6 +2738,7 @@ impl ContentMask<Pixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
             corner_radii: self.corner_radii.scale(factor),
+            rounded_bounds: self.rounded_bounds.scale(factor),
         }
     }
 }
