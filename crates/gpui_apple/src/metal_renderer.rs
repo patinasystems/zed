@@ -3422,6 +3422,100 @@ mod tests {
         }
     }
 
+    /// Instance-bound frames: many small primitives, so each frame's cost is mostly the
+    /// instance records the GPU fetches, not the pixels it shades. Two scenes at 2400x1600:
+    /// 40k 10 px quads under 400 rounded masks (half with borders), and the same quads plus
+    /// 10k underlines. Scenes alternate each round; each line is the median GPU time
+    /// (command buffer start to end) and the median CPU time of `render_scene_to_image`.
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib instance_frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn instance_frame_cost() {
+        use gpui::{ContentMask, Corners, Edges, Quad, ScaledPixels, Scene, TransformationMatrix, Underline};
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
+        let (width, height) = (2400i32, 1600i32);
+        let px = |x: f32| ScaledPixels(x);
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let scene = |underlines: usize| {
+            let mut scene = Scene::default();
+            // 400 masks of 120 x 80 px (20 x 20 of them), each rounded by 12 px.
+            let mask = |i: usize| {
+                let (mx, my) = ((i % 20) as f32 * 120., ((i / 20) % 20) as f32 * 80.);
+                ContentMask::rounded(rect(mx, my, 120., 80.), Corners::all(px(12.)))
+            };
+            for i in 0..40_000usize {
+                let (x, y) = ((i % 240) as f32 * 10., ((i / 240) % 160) as f32 * 10.);
+                let m = (x / 120.) as usize + 20 * (y / 80.) as usize;
+                let bordered = i % 2 == 0;
+                scene.insert_primitive(Quad {
+                    bounds: rect(x + 1., y + 1., 8., 8.),
+                    content_mask: mask(m),
+                    background: gpui::Hsla { h: (i % 7) as f32 / 7., s: 0.5, l: 0.5, a: 1. }.into(),
+                    border_widths: if bordered { Edges::all(px(1.)) } else { Edges::default() },
+                    border_color: gpui::Hsla { h: 0., s: 0., l: 0.1, a: 1. },
+                    corner_radii: Corners::all(px(2.)),
+                    ..Default::default()
+                });
+            }
+            for i in 0..underlines {
+                let (x, y) = ((i % 60) as f32 * 40., ((i / 60) % 160) as f32 * 10. + 8.);
+                scene.insert_primitive(Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: rect(x, y, 36., 1.),
+                    content_mask: mask((x / 120.) as usize + 20 * (y / 80.) as usize),
+                    color: gpui::Hsla { h: 0.6, s: 0.8, l: 0.4, a: 1. },
+                    thickness: px(1.),
+                    wavy: false.into(),
+                    transformation: TransformationMatrix::unit(),
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let scenes = [("40k quads", scene(0)), ("40k quads + 10k underlines", scene(10_000))];
+        let viewport = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let mut gpu = vec![Vec::new(); scenes.len()];
+        let mut cpu = vec![Vec::new(); scenes.len()];
+        for round in 0..65 {
+            for (k, (_, scene)) in scenes.iter().enumerate() {
+                let t = std::time::Instant::now();
+                gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, viewport)
+                    .expect("render");
+                let elapsed = t.elapsed().as_secs_f64() * 1000.;
+                // The completion handler runs after the wait returns: let it record.
+                let mut recorded = retained_stats::take_gpu();
+                for _ in 0..100 {
+                    if !recorded.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    recorded = retained_stats::take_gpu();
+                }
+                if round >= 5 {
+                    gpu[k].extend(recorded);
+                    cpu[k].push(elapsed);
+                }
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for (k, (name, _)) in scenes.iter().enumerate() {
+            println!(
+                "INSTANCE_FRAME_COST {name}: GPU {:.3} ms, CPU {:.3} ms per frame (median of {})",
+                median(&mut gpu[k]),
+                median(&mut cpu[k]),
+                cpu[k].len()
+            );
+        }
+    }
+
     /// Frame costs with and without compositing groups. Run with
     /// `cargo test -p gpui_apple --release --lib group_frame_cost -- --ignored --nocapture`.
     #[test]
