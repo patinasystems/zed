@@ -496,7 +496,7 @@ impl InstanceTables {
         let content_mask = self.content_mask(&path.content_mask);
         let record = self.next();
         self.texels.extend_from_slice(&[
-            bounds_texel(&path.bounds.intersect(&path.content_mask.bounds)),
+            bounds_texel(&path.clipped_bounds()),
             hsla_texel(&path.color.solid),
             [
                 bits(background_flags(&path.color)),

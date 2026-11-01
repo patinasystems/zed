@@ -2916,9 +2916,9 @@ impl WgpuRendererCore {
         instance_offset: &mut u64,
         records: &mut RecordScratch,
     ) -> Result<InstanceBindings> {
-        fn encode<P, R>(out: &mut Vec<R>, primitives: &[P], mut encode: impl FnMut(&P) -> R) {
+        fn encode<P, R>(out: &mut Vec<R>, primitives: &[P], record: impl FnMut(&P) -> R) {
             out.clear();
-            out.extend(primitives.iter().map(|primitive| encode(primitive)));
+            out.extend(primitives.iter().map(record));
         }
         let RecordScratch {
             tables,

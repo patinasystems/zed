@@ -4496,7 +4496,12 @@ mod retained_stats {
         with(|s| s.uploaded.push(bytes));
     }
 
+    /// Records a frame's instance buffer bytes; `GPUI_INSTANCE_BYTES` prints each frame's.
     pub fn record_instances(bytes: usize) {
+        static PRINT: OnceLock<bool> = OnceLock::new();
+        if *PRINT.get_or_init(|| std::env::var_os("GPUI_INSTANCE_BYTES").is_some()) {
+            eprintln!("GPUI_INSTANCE_BYTES {bytes}");
+        }
         with(|s| s.instances.push(bytes));
     }
 
