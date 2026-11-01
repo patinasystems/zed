@@ -166,6 +166,7 @@ impl BackdropPipelines {
     fn group_composite(&self, blend_mode: gpui::BlendMode) -> &wgpu::RenderPipeline {
         match blend_mode {
             gpui::BlendMode::PlusLighter => &self.group_add,
+            mode if mode.porter_duff().is_some() => &self.group_replace,
             gpui::BlendMode::PlusDarker
             | gpui::BlendMode::ColorDodge
             | gpui::BlendMode::ColorBurn => &self.group_replace,
@@ -4128,6 +4129,31 @@ mod tests {
             },
         )?;
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
+        Ok(())
+    }
+
+    /// The shared Porter-Duff and luminance-to-alpha scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn porter_duff_groups_render() -> anyhow::Result<()> {
+        use gpui::porter_duff_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
         Ok(())
     }
 

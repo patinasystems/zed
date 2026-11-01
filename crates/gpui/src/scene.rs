@@ -1643,8 +1643,9 @@ impl From<BackdropFilter> for Primitive {
 }
 
 /// How a group's image blends onto what is behind it: CSS `mix-blend-mode`
-/// (Compositing and Blending Level 1) and the `plus-lighter` and `plus-darker`
-/// compositing operators.
+/// (Compositing and Blending Level 1), the `plus-lighter` and `plus-darker`
+/// compositing operators, and the Porter-Duff operators (CSS `mask-composite`,
+/// Canvas 2D `globalCompositeOperation`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[repr(u32)]
 #[expect(missing_docs)]
@@ -1673,6 +1674,28 @@ pub enum BlendMode {
     /// premultiplied colors, `max(0, a - ((a_b - b) + (a_s - s)))` with alpha
     /// `a = min(1, a_s + a_b)`; for opaque colors `max(0, 1 - ((1 - b) + (1 - s)))`.
     PlusDarker = 17,
+    /// Porter-Duff source-in: the image where something is behind it; nothing else
+    /// remains inside the group's clip (CSS `mask-composite: intersect`).
+    SourceIn = 18,
+    /// Porter-Duff source-out: the image where nothing is behind it; nothing else
+    /// remains inside the group's clip (CSS `mask-composite: subtract`).
+    SourceOut = 19,
+    /// Porter-Duff source-atop: the image where something is behind it, over it.
+    SourceAtop = 20,
+    /// Porter-Duff destination-over: the image behind what is there.
+    DestinationOver = 21,
+    /// Porter-Duff destination-in: what is behind, where the image is; nothing else
+    /// remains inside the group's clip.
+    DestinationIn = 22,
+    /// Porter-Duff destination-out: what is behind, where the image is not.
+    DestinationOut = 23,
+    /// Porter-Duff destination-atop: what is behind over the image, where the image
+    /// is; nothing else remains inside the group's clip.
+    DestinationAtop = 24,
+    /// Porter-Duff xor: each where the other is not (CSS `mask-composite: exclude`).
+    Xor = 25,
+    /// Porter-Duff copy: the image replaces everything inside the group's clip.
+    Copy = 26,
 }
 
 impl BlendMode {
@@ -1680,6 +1703,33 @@ impl BlendMode {
     /// but normal and plus-lighter, which blending hardware draws.
     pub fn reads_backdrop(self) -> bool {
         !matches!(self, BlendMode::Normal | BlendMode::PlusLighter)
+    }
+
+    /// The Porter-Duff factors `(source, destination)` as weights of the source's
+    /// and the destination's alpha: the result is `source * Fa + destination * Fb`
+    /// on premultiplied colors, with `Fa = a.0 + a.1 * dst_alpha` and
+    /// `Fb = b.0 + b.1 * src_alpha`. `None` for the blend modes.
+    pub fn porter_duff(self) -> Option<([f32; 2], [f32; 2])> {
+        Some(match self {
+            BlendMode::SourceIn => ([0., 1.], [0., 0.]),
+            BlendMode::SourceOut => ([1., -1.], [0., 0.]),
+            BlendMode::SourceAtop => ([0., 1.], [1., -1.]),
+            BlendMode::DestinationOver => ([1., -1.], [1., 0.]),
+            BlendMode::DestinationIn => ([0., 0.], [0., 1.]),
+            BlendMode::DestinationOut => ([0., 0.], [1., -1.]),
+            BlendMode::DestinationAtop => ([1., -1.], [0., 1.]),
+            BlendMode::Xor => ([1., -1.], [1., -1.]),
+            BlendMode::Copy => ([1., 0.], [0., 0.]),
+            _ => return None,
+        })
+    }
+
+    /// Whether compositing changes what is behind where the image is transparent:
+    /// Porter-Duff operators whose destination factor is not 1 there. A group with
+    /// one composites over its whole clip ([`GroupEffects::content_mask`]), and does
+    /// even when it draws nothing.
+    pub fn clears_outside(self) -> bool {
+        self.porter_duff().is_some_and(|(_, b)| b[0] != 1.)
     }
 }
 
@@ -1703,11 +1753,16 @@ pub enum ColorFilter {
     Sepia(f32),
     /// `opacity()`: multiplies alpha. A group folds it into its opacity.
     Opacity(f32),
+    /// SVG `feColorMatrix type="luminanceToAlpha"` on a straight color, kept as
+    /// CSS `mask-mode: luminance` wants it: alpha becomes the color's luminance
+    /// (sRGB coefficients 0.2125, 0.7154, 0.0721) times its alpha, and the color
+    /// black. Groups apply it; backdrop filters ignore it.
+    LuminanceToAlpha,
 }
 
 impl ColorFilter {
     /// The code and amount shaders take: 1 brightness, 2 contrast, 3 grayscale,
-    /// 4 hue-rotate (in radians), 5 invert, 6 saturate, 7 sepia. Amounts of
+    /// 4 hue-rotate (in radians), 5 invert, 6 saturate, 7 sepia, 8 luminance to alpha. Amounts of
     /// grayscale, invert and sepia are clamped to 0..1, others to 0 and above.
     pub fn gpu(self) -> (u32, f32) {
         let unit = |amount: f32| amount.clamp(0., 1.);
@@ -1720,6 +1775,7 @@ impl ColorFilter {
             ColorFilter::Invert(amount) => (5, unit(amount)),
             ColorFilter::Saturate(amount) => (6, positive(amount)),
             ColorFilter::Sepia(amount) => (7, unit(amount)),
+            ColorFilter::LuminanceToAlpha => (8, 0.),
             // Folded into the group's opacity; shaders skip code 0.
             ColorFilter::Opacity(amount) => (0, unit(amount)),
         }
@@ -2119,8 +2175,19 @@ impl OpenGroup {
     }
 
     fn close(mut self) -> ClosedGroup {
+        let clears = self.effects.blend_mode.clears_outside();
         if self.effects.opacity <= 0. || self.masked_out {
-            return ClosedGroup::Nothing;
+            if !clears {
+                return ClosedGroup::Nothing;
+            }
+            // What it draws is transparent, but compositing it still clears its clip.
+            self.scene = Scene {
+                in_group: true,
+                ..Scene::default()
+            };
+            self.mask = None;
+            self.masked_out = false;
+            self.effects.opacity = 1.;
         }
         let backdrop = self
             .effects
@@ -2131,8 +2198,15 @@ impl OpenGroup {
             (Some(drawn), Some(backdrop)) => drawn.union(&backdrop),
             (drawn, backdrop) => match drawn.or(backdrop) {
                 Some(drawn) => drawn,
+                None if clears => self.effects.content_mask.bounds,
                 None => return ClosedGroup::Nothing,
             },
+        };
+        // Its image covers its whole clip: compositing changes all of it.
+        let drawn = if clears {
+            self.effects.content_mask.bounds
+        } else {
+            drawn
         };
         if let Some(operations) = self.operations.take() {
             return ClosedGroup::Direct {
@@ -3097,6 +3171,177 @@ pub mod backdrop_chain_test_scene {
                 y: 8,
                 rgba: [expected[0], expected[1], expected[2], 1.]
                     .map(|v| (v.clamp(0., 1.) * 255.).round() as u8),
+            });
+        }
+        scene.finish();
+        (scene, probes)
+    }
+}
+
+/// Porter-Duff groups and luminance-to-alpha filters, for renderer tests. Each cell is
+/// an isolated group clipped to the cell over a white page: a backdrop over the whole
+/// cell, then a group with the operator whose source covers the cell's left half. The
+/// left half shows the operator on both; the right half shows it on the backdrop alone
+/// (operators that clear outside their image clear it there). Below: groups filtered
+/// to luminance as alpha, and source-in groups that draw nothing (the cell clears).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod porter_duff_test_scene {
+    use super::*;
+    use crate::blend_mode_test_scene::PAIRS;
+    pub use crate::retained_shapes_test_scene::{Probe, check};
+    use crate::{Rgba, size};
+
+    /// Four 16 x 4 cells a row: the nine operators, then luminance, then empty groups.
+    pub const SIZE: (i32, i32) = (64, 44);
+
+    /// Every Porter-Duff operator, one row each.
+    pub const MODES: [BlendMode; 9] = [
+        BlendMode::SourceIn,
+        BlendMode::SourceOut,
+        BlendMode::SourceAtop,
+        BlendMode::DestinationOver,
+        BlendMode::DestinationIn,
+        BlendMode::DestinationOut,
+        BlendMode::DestinationAtop,
+        BlendMode::Xor,
+        BlendMode::Copy,
+    ];
+
+    /// Straight colors filtered to luminance as alpha, one cell each.
+    pub const LUMINANCE: [[f32; 4]; 4] = [
+        [0.3, 0.5, 0.7, 1.],
+        [1., 1., 1., 1.],
+        [0.9, 0.2, 0.4, 0.5],
+        [0.1, 0.8, 0.2, 1.],
+    ];
+
+    /// The premultiplied result of `mode` with straight `source` over straight
+    /// `backdrop`.
+    pub fn reference(mode: BlendMode, backdrop: [f32; 4], source: [f32; 4]) -> [f32; 4] {
+        let (a, b) = mode.porter_duff().expect("a Porter-Duff operator");
+        let fa = a[0] + a[1] * backdrop[3];
+        let fb = b[0] + b[1] * source[3];
+        let premultiplied = |c: [f32; 4]| [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        let (s, d) = (premultiplied(source), premultiplied(backdrop));
+        std::array::from_fn(|i| s[i] * fa + d[i] * fb)
+    }
+
+    fn rgba(c: [f32; 4]) -> Hsla {
+        Rgba {
+            r: c[0],
+            g: c[1],
+            b: c[2],
+            a: c[3],
+        }
+        .into()
+    }
+
+    /// Premultiplied `c` over white, as a probe color.
+    fn over_white(c: [f32; 4]) -> [u8; 4] {
+        [c[0] + 1. - c[3], c[1] + 1. - c[3], c[2] + 1. - c[3], 1.]
+            .map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+    }
+
+    fn cell(column: usize, row: usize) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(16. * column as f32), ScaledPixels(4. * row as f32)),
+            size(ScaledPixels(16.), ScaledPixels(4.)),
+        )
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: rgba([1.; 4]).into(),
+            ..Default::default()
+        });
+        let mut probes = Vec::new();
+        let quad = |bounds, mask, color| Quad {
+            bounds,
+            content_mask: mask,
+            background: rgba(color).into(),
+            ..Default::default()
+        };
+        for (row, mode) in MODES.into_iter().enumerate() {
+            for (column, (backdrop, source)) in PAIRS.into_iter().enumerate() {
+                let bounds = cell(column, row);
+                let clip = ContentMask::from(bounds);
+                let left = Bounds::new(bounds.origin, size(ScaledPixels(8.), ScaledPixels(4.)));
+                scene.push_group(GroupEffects {
+                    content_mask: clip,
+                    ..GroupEffects::default()
+                });
+                scene.insert_primitive(quad(bounds, clip, backdrop));
+                scene.push_group(GroupEffects {
+                    blend_mode: mode,
+                    content_mask: clip,
+                    ..GroupEffects::default()
+                });
+                scene.insert_primitive(quad(left, clip, source));
+                scene.pop_group();
+                scene.pop_group();
+                for (x, source) in [(4, source), (12, [0.; 4])] {
+                    probes.push(Probe {
+                        what: "porter-duff cell",
+                        x: 16 * column as u32 + x,
+                        y: 4 * row as u32 + 2,
+                        rgba: over_white(reference(mode, backdrop, source)),
+                    });
+                }
+            }
+        }
+        let row = MODES.len();
+        for (column, color) in LUMINANCE.into_iter().enumerate() {
+            let bounds = cell(column, row);
+            scene.push_group(GroupEffects {
+                color_filters: [ColorFilter::LuminanceToAlpha].into_iter().collect(),
+                content_mask: full,
+                ..GroupEffects::default()
+            });
+            scene.insert_primitive(quad(bounds, full, color));
+            scene.pop_group();
+            let alpha = (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3];
+            probes.push(Probe {
+                what: "luminance to alpha cell",
+                x: 16 * column as u32 + 8,
+                y: 4 * row as u32 + 2,
+                rgba: over_white([0., 0., 0., alpha]),
+            });
+        }
+        // Source-in groups that draw nothing, or only transparently: the cell clears.
+        let row = row + 1;
+        for (column, (backdrop, _)) in PAIRS.into_iter().enumerate() {
+            let bounds = cell(column, row);
+            let clip = ContentMask::from(bounds);
+            scene.push_group(GroupEffects {
+                content_mask: clip,
+                ..GroupEffects::default()
+            });
+            scene.insert_primitive(quad(bounds, clip, backdrop));
+            scene.push_group(GroupEffects {
+                blend_mode: BlendMode::SourceIn,
+                opacity: if column % 2 == 0 { 1. } else { 0. },
+                content_mask: clip,
+                ..GroupEffects::default()
+            });
+            if column % 2 == 1 {
+                scene.insert_primitive(quad(bounds, clip, [0., 0., 1., 1.]));
+            }
+            scene.pop_group();
+            scene.pop_group();
+            probes.push(Probe {
+                what: "empty source-in cell",
+                x: 16 * column as u32 + 8,
+                y: 4 * row as u32 + 2,
+                rgba: [255; 4],
             });
         }
         scene.finish();

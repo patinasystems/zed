@@ -2526,6 +2526,7 @@ impl GroupCompositePipelines {
     fn for_blend_mode(&self, blend_mode: gpui::BlendMode) -> &metal::RenderPipelineStateRef {
         match blend_mode {
             gpui::BlendMode::PlusLighter => self.add.state(),
+            mode if mode.porter_duff().is_some() => self.replace.state(),
             gpui::BlendMode::PlusDarker
             | gpui::BlendMode::ColorDodge
             | gpui::BlendMode::ColorBurn => self.replace.state(),
@@ -3264,6 +3265,20 @@ mod tests {
         )
         .expect("render");
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
+    }
+
+    #[test]
+    fn porter_duff_groups_render() {
+        use gpui::porter_duff_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
     }
 
     #[test]
