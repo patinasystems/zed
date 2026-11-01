@@ -6500,9 +6500,9 @@ impl Window {
     /// Paints an image like [`Window::paint_image`], then applies `transformation` to the
     /// painted sprite, including its rounded corners. `sampling` is how its texels scale:
     /// [`TextureSampling::Nearest`] keeps them square (CSS `image-rendering: pixelated` and
-    /// `crisp-edges`); [`TextureSampling::Linear`] filters between them (`auto`), except at a
-    /// whole number of device pixels per texel with no rotation or scale, where the image's
-    /// own hard edges stay hard as browsers draw them.
+    /// `crisp-edges`); [`TextureSampling::Linear`] filters between them (`auto`) at every
+    /// scale, as WebKit and Chromium draw `auto` images, whole numbers of device pixels per
+    /// texel included.
     ///
     /// `transformation` maps window coordinates in device pixels to window coordinates in
     /// device pixels, the same space [`Window::paint_svg`] uses. The content mask is applied
@@ -6556,7 +6556,6 @@ impl Window {
             grayscale,
             transformation,
             sampling,
-            true,
         );
         Ok(())
     }
@@ -6595,7 +6594,6 @@ impl Window {
             TransformationMatrix::unit(),
             // The atlas samples an external texture as it was set.
             TextureSampling::Linear,
-            false,
         );
     }
 
@@ -6647,9 +6645,7 @@ impl Window {
 
     /// The sprite for `tile` (an image's) drawn over `image_bounds`, clipped
     /// to `visible_bounds`, which lies inside it. With [`TextureSampling::Nearest`] it
-    /// samples the nearest texel at any scale. With `exact`, a tile drawn at a whole number
-    /// of device pixels per texel, with no rotation or scale, samples texel centres too (as
-    /// browsers draw images at integer scales) instead of filtering between texels.
+    /// samples the nearest texel at any scale; otherwise it filters between texels.
     fn paint_tile(
         &mut self,
         visible_bounds: Bounds<Pixels>,
@@ -6659,7 +6655,6 @@ impl Window {
         grayscale: bool,
         transformation: TransformationMatrix,
         sampling: TextureSampling,
-        exact: bool,
     ) {
         let transformation = self.device_element_transformation().compose(transformation);
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
@@ -6704,15 +6699,7 @@ impl Window {
             }
         };
 
-        // Checked on the sprite as drawn: its snapped bounds, moved by the translation, over
-        // the texels it shows.
-        let nearest = sampling == TextureSampling::Nearest
-            || (exact
-                && sprite_samples_texel_centres(
-                    visible_bounds_snapped,
-                    sub_tile.bounds.size,
-                    &transformation,
-                ));
+        let nearest = sampling == TextureSampling::Nearest;
         let content_mask = self.snapped_content_mask();
         // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
         let fitted = if corner_radii.is_circular() {
@@ -9596,33 +9583,6 @@ fn snap_bounds_to_device(bounds: Bounds<Pixels>, scale_factor: f32) -> Bounds<Sc
     )
 }
 
-/// Whether a sprite drawn over `sprite` (snapped device bounds) through the device-space
-/// `transformation`, showing `texels`, puts every texel edge on a device pixel edge: no
-/// rotation or scale, a pixel-aligned origin once translated, and a whole number (at least
-/// one) of device pixels per texel. Only then does sampling texel centres match how browsers
-/// draw images.
-fn sprite_samples_texel_centres(
-    sprite: Bounds<ScaledPixels>,
-    texels: Size<DevicePixels>,
-    transformation: &TransformationMatrix,
-) -> bool {
-    // Device coordinates are f32; this absorbs rounding noise, not real offsets.
-    const TOLERANCE: f32 = 1e-2;
-    let aligned = |device: f32| (device - device.round()).abs() < TOLERANCE;
-    let whole_multiple = |device: ScaledPixels, texels: DevicePixels| {
-        let device_pixels = device.0.round() as i32;
-        aligned(device.0)
-            && texels.0 > 0
-            && device_pixels >= texels.0
-            && device_pixels % texels.0 == 0
-    };
-    transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
-        && aligned(sprite.origin.x.0 + transformation.translation[0])
-        && aligned(sprite.origin.y.0 + transformation.translation[1])
-        && whole_multiple(sprite.size.width, texels.width)
-        && whole_multiple(sprite.size.height, texels.height)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -10777,53 +10737,6 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                 window.invalidator.set_phase(super::DrawPhase::None);
             })
             .unwrap();
-    }
-
-    #[test]
-    fn images_sample_texel_centres_only_on_the_device_pixel_grid() {
-        use super::{TransformationMatrix, snap_bounds_to_device, sprite_samples_texel_centres};
-        use crate::DevicePixels;
-
-        let texels = size(DevicePixels(4), DevicePixels(4));
-        let unit = TransformationMatrix::unit();
-        let translated = |x: f32, y: f32| TransformationMatrix {
-            translation: [x, y],
-            ..TransformationMatrix::unit()
-        };
-        // An image at (x, 10), `side` px square, drawn as a sprite at `scale`.
-        let exact = |x: f32, side: f32, scale: f32, transformation: &TransformationMatrix| {
-            let image = Bounds::new(point(px(x), px(10.)), size(px(side), px(side)));
-            sprite_samples_texel_centres(
-                snap_bounds_to_device(image, scale),
-                texels,
-                transformation,
-            )
-        };
-
-        // A 4-texel image drawn 4 or 8 px wide at 2x: 2 or 4 device pixels per texel.
-        assert!(exact(10., 4., 2., &unit));
-        assert!(exact(10., 8., 2., &unit));
-        assert!(exact(10.5, 4., 2., &unit));
-        assert!(exact(10., 4., 2., &translated(3., 5.)));
-        // At 10.25 logical px, 2x, the sprite snaps to device pixel 20, 8 px wide: exact.
-        assert!(exact(10.25, 4., 2., &unit));
-        // Half a device pixel of translation puts the drawn sprite off the grid, whether or
-        // not the unsnapped origin plus the translation would land on it.
-        assert!(!exact(10.25, 4., 2., &translated(0.5, 0.)));
-        assert!(!exact(10., 4., 2., &translated(0.5, 0.)));
-        assert!(!exact(10., 4., 2., &translated(0., 0.5)));
-        // Drawn sizes that are not a whole multiple of the texels filter.
-        assert!(!exact(10., 3., 2., &unit));
-        assert!(!exact(10.25, 4.5, 2., &unit));
-        assert!(!exact(10., 6., 1., &unit));
-        // Downscales, and rotations or scales, filter.
-        assert!(!exact(10., 1., 2., &unit));
-        assert!(!exact(
-            10.,
-            4.,
-            2.,
-            &TransformationMatrix::unit().scale(size(1.5, 1.5))
-        ));
     }
 
     #[test]

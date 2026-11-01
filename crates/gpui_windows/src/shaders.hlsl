@@ -1417,8 +1417,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
     // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
     float2 tile_position = clamp_to_tile(input.tile_position, sprite.tile);
-    // Nearest sampling (`image-rendering: pixelated`, or a whole number of device pixels per
-    // texel, where browsers keep the image's own hard edges): read the texel's centre.
+    // Nearest sampling (`image-rendering: pixelated` and `crisp-edges`): read the texel's centre.
     if (sprite.nearest != 0u) {
         float2 atlas_size;
         t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
