@@ -10593,6 +10593,55 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
         );
     }
 
+    /// A 50 px box with the pointing-hand cursor at the window's corner.
+    struct PointerBox;
+
+    impl Render for PointerBox {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().id("box").w(px(50.)).h(px(50.)).cursor_pointer())
+        }
+    }
+
+    /// The test platform shows the cursor as the platforms do on every OS: the pointer moving
+    /// over the window hovers it (Linux and Windows show only a hovered window's cursor), and
+    /// leaving it unhovers it.
+    #[gpui::test]
+    fn test_the_platform_shows_the_hovered_windows_cursor(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| PointerBox);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let cursor_at = |cx: &mut crate::VisualTestContext, at: Point<Pixels>| {
+            cx.simulate_mouse_move(at, None, crate::Modifiers::default());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.cx.active_cursor()
+        };
+        assert_eq!(
+            cursor_at(cx, point(px(10.), px(10.))),
+            crate::CursorStyle::PointingHand
+        );
+        assert_eq!(
+            cursor_at(cx, point(px(100.), px(100.))),
+            crate::CursorStyle::Arrow
+        );
+        assert_eq!(
+            cursor_at(cx, point(px(20.), px(20.))),
+            crate::CursorStyle::PointingHand
+        );
+        assert!(cx.update(|window, _| window.is_window_hovered()) || cfg!(target_os = "macos"));
+        cx.simulate_event(crate::MouseExitEvent {
+            position: point(px(-1.), px(20.)),
+            pressed_button: None,
+            modifiers: crate::Modifiers::default(),
+        });
+        cx.run_until_parked();
+        if cfg!(not(target_os = "macos")) {
+            assert!(!cx.update(|window, _| window.is_window_hovered()));
+        }
+    }
+
     #[gpui::test]
     fn test_transformed_underline_keeps_its_exclusions(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| crate::Empty);
