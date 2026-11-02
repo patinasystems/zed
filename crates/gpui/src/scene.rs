@@ -2503,10 +2503,8 @@ pub struct PolychromeSprite {
     pub order: DrawOrder,
     /// Nonzero samples the nearest texel (the fragment shader reads texel centres) instead of
     /// filtering between texels: for an image painted with [`crate::TextureSampling::Nearest`]
-    /// (CSS `image-rendering: pixelated`), whose texels stay square at any scale, and for one
-    /// drawn at a whole number of device pixels per texel with no rotation or scale, where the
-    /// two agree except that the image's own hard edges stay hard instead of blending into the
-    /// neighbouring texel's color.
+    /// (CSS `image-rendering: pixelated` and `crisp-edges`), whose texels stay square at any
+    /// scale.
     pub nearest: u32,
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,

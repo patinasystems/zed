@@ -815,9 +815,7 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Corners, ParentElement as _, TestAppContext, canvas, div, point, px, size,
-    };
+    use crate::{Corners, ParentElement as _, Size, TestAppContext, canvas, div, point, px, size};
     use image::{Frame, ImageBuffer, Rgba};
 
     const TEST_IMG_ID: &str = "test-img";
@@ -860,13 +858,16 @@ mod tests {
 
     #[gpui::test]
     fn image_sampling_reaches_the_sprite(cx: &mut TestAppContext) {
-        // 3x2 texels over a 10x7 box: no whole scale, so only `Nearest` samples texel centres.
+        // Only `Nearest` samples texel centres, over a 10x7 box (no whole scale) and over a
+        // 6x4 box (a whole number of pixels per texel), where `auto` images still smooth.
         let window = cx.add_empty_window();
         let image = test_image_with_size(3, 2);
-        let mut nearest = |sampling: Option<TextureSampling>| {
+        let mut nearest = |sampling: Option<TextureSampling>, side: Size<Pixels>| {
             let image = image.clone();
-            window.draw(point(px(0.), px(0.)), size(px(10.), px(7.)), move |_, _| {
-                let picture = img(ImageSource::Render(image)).size_full().object_fit(ObjectFit::Fill);
+            window.draw(point(px(0.), px(0.)), side, move |_, _| {
+                let picture = img(ImageSource::Render(image))
+                    .size_full()
+                    .object_fit(ObjectFit::Fill);
                 match sampling {
                     Some(sampling) => picture.sampling(sampling),
                     None => picture,
@@ -874,12 +875,20 @@ mod tests {
                 .into_any_element()
             });
             window.update(|window, _| {
-                window.rendered_frame.scene.polychrome_sprites.last().expect("a sprite").nearest
+                window
+                    .rendered_frame
+                    .scene
+                    .polychrome_sprites
+                    .last()
+                    .expect("a sprite")
+                    .nearest
             })
         };
-        assert_eq!(nearest(None), 0, "smooth by default");
-        assert_eq!(nearest(Some(TextureSampling::Linear)), 0);
-        assert_eq!(nearest(Some(TextureSampling::Nearest)), 1);
+        for side in [size(px(10.), px(7.)), size(px(6.), px(4.))] {
+            assert_eq!(nearest(None, side), 0, "smooth by default over {side:?}");
+            assert_eq!(nearest(Some(TextureSampling::Linear), side), 0);
+            assert_eq!(nearest(Some(TextureSampling::Nearest), side), 1);
+        }
     }
 
     #[gpui::test]

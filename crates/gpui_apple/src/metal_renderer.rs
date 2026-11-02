@@ -3150,9 +3150,10 @@ mod tests {
 
     #[test]
     fn images_at_whole_scales_keep_their_hard_edges() {
-        // A 1x2 image (green over transparent) drawn 2x: with `nearest` each texel fills its
-        // 2x2 device pixels; without it, linear filtering bleeds a quarter of the green into the
-        // first transparent row.
+        // A 1x2 image (green over transparent) drawn 2x: with `nearest` (`image-rendering:
+        // pixelated`) each texel fills its 2x2 device pixels; without it (`auto`), linear
+        // filtering blends a quarter of the green into the first transparent row, as WebKit and
+        // Chromium draw it.
         use gpui::{
             AtlasKey, Bounds, ContentMask, Corners, ImageId, PaddedBool32, PolychromeSprite,
             RenderImageParams, ScaledPixels, TransformationMatrix,
