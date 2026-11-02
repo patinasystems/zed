@@ -4769,12 +4769,13 @@ mod tests {
             scene
         };
         let size = Size { width: DevicePixels(100), height: DevicePixels(100) };
-        // Alpha at (1, 1), outside both corners, and (2, 8), inside a 10 px circular corner but
-        // outside a 10 x 40 px elliptical one.
+        // How much of the white quad covers (1, 1), outside both corners, and (2, 8), inside a
+        // 10 px circular corner but outside a 10 x 40 px elliptical one (red over the clear color;
+        // the target's alpha is opaque).
         let alpha_at = |renderer: &mut WgpuHeadlessRenderer, mask| -> anyhow::Result<(u8, u8)> {
             let image = renderer.render_scene_to_image(&scene(mask), size)?;
-            assert_eq!(image.get_pixel(50, 50).0[3], 255, "the quad's middle is drawn");
-            Ok((image.get_pixel(1, 1).0[3], image.get_pixel(2, 8).0[3]))
+            assert_eq!(image.get_pixel(50, 50).0[0], 255, "the quad's middle is drawn");
+            Ok((image.get_pixel(1, 1).0[0], image.get_pixel(2, 8).0[0]))
         };
         let circular = alpha_at(&mut renderer, ContentMask::rounded(bounds, Corners::all(ScaledPixels(10.))))?;
         let elliptical = alpha_at(
