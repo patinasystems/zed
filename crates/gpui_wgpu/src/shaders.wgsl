@@ -433,11 +433,6 @@ fn corner_pair(x: f32, y: f32) -> vec2<f32> {
     return select(vec2<f32>(x, y), vec2<f32>(0.0), x <= 0.0 || y <= 0.0);
 }
 
-// The length of a quarter ellipse of radii `r` (Ramanujan's approximation; exact for a circle).
-fn quarter_arc_length(r: vec2<f32>) -> f32 {
-    return (M_PI_F / 4.0) * (3.0 * (r.x + r.y) - sqrt((3.0 * r.x + r.y) * (r.x + 3.0 * r.y)));
-}
-
 // Each corner's circle of the smaller radius: what dashed borders lay out around (an
 // elliptical corner's dashes follow its smaller circle).
 fn min_corners(x: Corners, y: Corners) -> Corners {
@@ -1144,145 +1139,41 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 dash_velocity = dv_numerator / border_width;
                 t = select(point.y, point.x, is_horizontal) * dash_velocity;
                 max_t = select(size.y, size.x, is_horizontal) * dash_velocity;
-            } else {
-                // When corners are rounded, the dashes are laid out clockwise
-                // around the whole perimeter.
 
-                // Each corner's (rx, ry): an elliptical corner's dashes follow its arc.
-                let r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
-                let r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
-                let r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
-                let r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+                let dash_length = dash_length_per_width / dash_period_per_width;
+                let desired_dash_gap = dash_gap_per_width / dash_period_per_width;
 
-                let w_t = quad.border_widths.top;
-                let w_r = quad.border_widths.right;
-                let w_b = quad.border_widths.bottom;
-                let w_l = quad.border_widths.left;
-
-                // Straight side dash velocities
-                let dv_t = select(dv_numerator / w_t, 0.0, w_t <= 0.0);
-                let dv_r = select(dv_numerator / w_r, 0.0, w_r <= 0.0);
-                let dv_b = select(dv_numerator / w_b, 0.0, w_b <= 0.0);
-                let dv_l = select(dv_numerator / w_l, 0.0, w_l <= 0.0);
-
-                // Straight side lengths in dash space
-                let s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
-                let s_r = (size.y - r_tr.y - r_br.y) * dv_r;
-                let s_b = (size.x - r_br.x - r_bl.x) * dv_b;
-                let s_l = (size.y - r_bl.y - r_tl.y) * dv_l;
-
-                let corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
-                let corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
-                let corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
-                let corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
-
-                // Corner lengths in dash space
-                let c_tr = quarter_arc_length(r_tr) * corner_dash_velocity_tr;
-                let c_br = quarter_arc_length(r_br) * corner_dash_velocity_br;
-                let c_bl = quarter_arc_length(r_bl) * corner_dash_velocity_bl;
-                let c_tl = quarter_arc_length(r_tl) * corner_dash_velocity_tl;
-
-                // Cumulative dash space upto each segment
-                let upto_tr = s_t;
-                let upto_r = upto_tr + c_tr;
-                let upto_br = upto_r + s_r;
-                let upto_b = upto_br + c_br;
-                let upto_bl = upto_b + s_b;
-                let upto_l = upto_bl + c_bl;
-                let upto_tl = upto_l + s_l;
-                max_t = upto_tl + c_tl;
-
-                if (is_near_rounded_corner) {
-                    // The angle in the corner's unit circle (an ellipse's parameter), spread over its arc.
-                    let radians = atan2(corner_center_to_point.y / max(corner_radii_xy.y, 1e-4),
-                                        corner_center_to_point.x / max(corner_radii_xy.x, 1e-4));
-                    let corner_t = select(radians * quarter_arc_length(corner_radii_xy) / (M_PI_F / 2.0),
-                                          radians * corner_radius,
-                                          corner_radii_xy.x == corner_radii_xy.y);
-
-                    if (center_to_point.x >= 0.0) {
-                        if (center_to_point.y < 0.0) {
-                            dash_velocity = corner_dash_velocity_tr;
-                            // Subtracted because radians is pi/2 to 0 when
-                            // going clockwise around the top right corner,
-                            // since the y axis has been flipped
-                            t = upto_r - corner_t * dash_velocity;
-                        } else {
-                            dash_velocity = corner_dash_velocity_br;
-                            // Added because radians is 0 to pi/2 when going
-                            // clockwise around the bottom-right corner
-                            t = upto_br + corner_t * dash_velocity;
-                        }
-                    } else {
-                        if (center_to_point.y >= 0.0) {
-                            dash_velocity = corner_dash_velocity_bl;
-                            // Subtracted because radians is pi/2 to 0 when
-                            // going clockwise around the bottom-left corner,
-                            // since the x axis has been flipped
-                            t = upto_l - corner_t * dash_velocity;
-                        } else {
-                            dash_velocity = corner_dash_velocity_tl;
-                            // Added because radians is 0 to pi/2 when going
-                            // clockwise around the top-left corner, since both
-                            // axis were flipped
-                            t = upto_tl + corner_t * dash_velocity;
-                        }
-                    }
-                } else {
-                    // Straight borders
-                    let is_horizontal =
-                            corner_center_to_point.x <
-                            corner_center_to_point.y;
-                    if (is_horizontal) {
-                        if (center_to_point.y < 0.0) {
-                            dash_velocity = dv_t;
-                            t = (point.x - r_tl.x) * dash_velocity;
-                        } else {
-                            dash_velocity = dv_b;
-                            t = upto_bl - (point.x - r_bl.x) * dash_velocity;
-                        }
-                    } else {
-                        if (center_to_point.x < 0.0) {
-                            dash_velocity = dv_l;
-                            t = upto_tl - (point.y - r_tl.y) * dash_velocity;
-                        } else {
-                            dash_velocity = dv_r;
-                            t = upto_r + (point.y - r_tr.y) * dash_velocity;
-                        }
-                    }
-                }
-            }
-
-            let dash_length = dash_length_per_width / dash_period_per_width;
-            let desired_dash_gap = dash_gap_per_width / dash_period_per_width;
-
-            // Straight borders should start and end with a dash, so max_t is
-            // reduced to cause this.
-            max_t -= select(0.0, dash_length, unrounded);
-            if (max_t >= 1.0) {
-                // Adjust dash gap to evenly divide max_t.
-                let dash_count = floor(max_t);
-                let dash_period = max_t / dash_count;
-                border_color.a *= dash_alpha(
-                    t,
-                    dash_period,
-                    dash_length,
-                    dash_velocity,
-                    antialias_threshold);
-            } else if (unrounded) {
-                // When there isn't enough space for the full gap between the
-                // two start / end dashes of a straight border, reduce gap to
-                // make them fit.
-                let dash_gap = max_t - dash_length;
-                if (dash_gap > 0.0) {
-                    let dash_period = dash_length + dash_gap;
+                // Straight borders should start and end with a dash, so max_t is
+                // reduced to cause this.
+                max_t -= dash_length;
+                if (max_t >= 1.0) {
+                    // Adjust dash gap to evenly divide max_t.
+                    let dash_count = floor(max_t);
+                    let dash_period = max_t / dash_count;
                     border_color.a *= dash_alpha(
                         t,
                         dash_period,
                         dash_length,
                         dash_velocity,
                         antialias_threshold);
+                } else {
+                    // When there isn't enough space for the full gap between the
+                    // two start / end dashes of a straight border, reduce gap to
+                    // make them fit.
+                    let dash_gap = max_t - dash_length;
+                    if (dash_gap > 0.0) {
+                        let dash_period = dash_length + dash_gap;
+                        border_color.a *= dash_alpha(
+                            t,
+                            dash_period,
+                            dash_length,
+                            dash_velocity,
+                            antialias_threshold);
+                    }
                 }
+            } else {
+                border_color.a *= rounded_dash_alpha(quad, point, size, center_to_point, corner_to_point,
+                    corner_center_to_point, is_near_rounded_corner, corner_radii_xy, antialias_threshold);
             }
         }
 
@@ -1296,22 +1187,120 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     return clip_output(blend_color(color, saturate(antialias_threshold - outer_sdf)), clip_alpha);
 }
 
-// Returns the dash velocity of a corner given the dash velocity of the two
-// sides, by returning the slower velocity (larger dashes).
-//
-// Since 0 is used for dash velocity when the border width is 0 (instead of
-// +inf), this returns the other dash velocity in that case.
-//
-// An alternative to this might be to appropriately interpolate the dash
-// velocity around the corner, but that seems overcomplicated.
-fn corner_dash_velocity(dv1: f32, dv2: f32) -> f32 {
-    if (dv1 == 0.0) {
-        return dv2;
-    } else if (dv2 == 0.0) {
-        return dv1;
+// The alpha of a rounded dashed border at `point` (from the quad's origin), as WebKit draws it
+// (`BorderPainter::drawBoxSideFromPath`). Each side strokes the outer edge's path, which starts
+// halfway down the straight part of the right edge and runs clockwise (down the right edge
+// first), with dashes three times the side's width and gaps as long. When the count of dashes
+// along the whole path is odd and not whole, each gap grows by a dash over half that count. The
+// pattern starts with a gap (a dash offset of one dash), and under four dashes the side is solid.
+// A pixel takes the position of the point of the outer edge nearest to it, and the pattern of the
+// side whose part of the border holds it: each corner splits along the line from the box's outer
+// corner to the border's inner corner.
+fn rounded_dash_alpha(
+    quad: Quad,
+    point: vec2<f32>,
+    size: vec2<f32>,
+    center_to_point: vec2<f32>,
+    corner_to_point: vec2<f32>,
+    corner_center_to_point: vec2<f32>,
+    is_near_rounded_corner: bool,
+    corner_radii_xy: vec2<f32>,
+    antialias_threshold: f32,
+) -> f32 {
+    let r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
+    let r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
+    let r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
+    let r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+    let q_tr = ellipse_arc_length(r_tr, M_PI_F / 2.0);
+    let q_br = ellipse_arc_length(r_br, M_PI_F / 2.0);
+    let q_bl = ellipse_arc_length(r_bl, M_PI_F / 2.0);
+    let q_tl = ellipse_arc_length(r_tl, M_PI_F / 2.0);
+
+    // Where each piece of the path starts, along it.
+    let start_y = (r_tr.y + size.y - r_br.y) / 2.0;
+    let at_br = size.y - r_br.y - start_y;
+    let at_b = at_br + q_br;
+    let at_bl = at_b + (size.x - r_br.x - r_bl.x);
+    let at_l = at_bl + q_bl;
+    let at_tl = at_l + (size.y - r_bl.y - r_tl.y);
+    let at_t = at_tl + q_tl;
+    let at_tr = at_t + (size.x - r_tl.x - r_tr.x);
+    let at_r = at_tr + q_tr;
+    let total = at_r + (start_y - r_tr.y);
+
+    let right = center_to_point.x >= 0.0;
+    let bottom = center_to_point.y >= 0.0;
+    var s = 0.0;
+    if (is_near_rounded_corner) {
+        let arc = ellipse_arc_length(corner_radii_xy,
+            ellipse_nearest_angle(corner_center_to_point, corner_radii_xy));
+        if (right) {
+            s = select(at_tr + q_tr - arc, at_br + arc, bottom);
+        } else {
+            s = select(at_tl + arc, at_bl + q_bl - arc, bottom);
+        }
+    } else if (corner_to_point.y > corner_to_point.x) {
+        // Nearest a horizontal edge.
+        s = select(at_t + (point.x - r_tl.x), at_b + (size.x - r_br.x - point.x), bottom);
+    } else if (right) {
+        s = select(at_r + (point.y - r_tr.y), point.y - start_y, point.y >= start_y);
     } else {
-        return min(dv1, dv2);
+        s = at_l + (size.y - r_bl.y - point.y);
     }
+
+    let from_corner = -corner_to_point;
+    let horizontal_width = select(quad.border_widths.top, quad.border_widths.bottom, bottom);
+    let vertical_width = select(quad.border_widths.left, quad.border_widths.right, right);
+    let width = select(vertical_width, horizontal_width,
+        from_corner.y * vertical_width < from_corner.x * horizontal_width);
+    let dash = 3.0 * width;
+    if (dash <= 0.0) {
+        return 1.0;
+    }
+    let count = total / dash;
+    if (count < 4.0) {
+        return 1.0;
+    }
+    var gap = dash;
+    if ((i32(count) & 1) == 1 && fract(count) > 0.0) {
+        gap += dash / (count / 2.0);
+    }
+    return dash_alpha(s + dash, dash + gap, dash, 1.0, antialias_threshold);
+}
+
+// The arc length of an ellipse of radii `r` from parametric angle 0 (the end of its horizontal
+// radius) to `t`: Simpson's rule over eight steps, exact for a circle.
+fn ellipse_arc_length(r: vec2<f32>, t: f32) -> f32 {
+    if (r.x == r.y) {
+        return r.x * t;
+    }
+    let h = t / 8.0;
+    var sum = 0.0;
+    for (var i = 0; i <= 8; i++) {
+        let a = h * f32(i);
+        let weight = select(select(2.0, 4.0, (i & 1) == 1), 1.0, i == 0 || i == 8);
+        sum += weight * length(vec2<f32>(r.x * sin(a), r.y * cos(a)));
+    }
+    return sum * h / 3.0;
+}
+
+// The parametric angle of the point of an ellipse of radii `r` (centered at the origin) nearest
+// to `p`, both components of `p` at least 0: where the ellipse's normal through `p` meets it. Three
+// iterations of the evolute method; exact for a circle.
+fn ellipse_nearest_angle(p: vec2<f32>, r: vec2<f32>) -> f32 {
+    if (r.x == r.y) {
+        return atan2(p.y, p.x);
+    }
+    var t = vec2<f32>(0.70710678);
+    for (var i = 0; i < 3; i++) {
+        let e = vec2<f32>((r.x * r.x - r.y * r.y) * t.x * t.x * t.x / r.x,
+                          (r.y * r.y - r.x * r.x) * t.y * t.y * t.y / r.y);
+        let q = p - e;
+        let scale = length(r * t - e) / max(length(q), 1e-4);
+        t = clamp((q * scale + e) / r, vec2<f32>(0.0), vec2<f32>(1.0));
+        t /= max(length(t), 1e-4);
+    }
+    return atan2(t.y, t.x);
 }
 
 // Returns alpha used to render antialiased dashes.

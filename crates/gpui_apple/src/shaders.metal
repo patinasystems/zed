@@ -27,7 +27,12 @@ Bounds_ScaledPixels dilate_bounds(Bounds_ScaledPixels bounds, float2 amount);
 Bounds_ScaledPixels scale_bounds(Bounds_ScaledPixels bounds, float2 scale);
 Corners_ScaledPixels scale_corners(Corners_ScaledPixels corners, float scale);
 float2 bounds_position(float2 unit_vertex, Bounds_ScaledPixels bounds);
-float corner_dash_velocity(float dv1, float dv2);
+float rounded_dash_alpha(Quad quad, float2 point, float2 size, float2 center_to_point,
+                         float2 corner_to_point, float2 corner_center_to_point,
+                         bool is_near_rounded_corner, float2 corner_radii_xy,
+                         float antialias_threshold);
+float ellipse_arc_length(float2 r, float t);
+float ellipse_nearest_angle(float2 p, float2 r);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
@@ -37,7 +42,6 @@ Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y)
 bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b);
 float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii);
 float2 corner_pair(float x, float y);
-float quarter_arc_length(float2 r);
 float ellipse_sdf(float2 p, float2 r);
 float pick_corner_shape(float2 center_to_point, uint2 shapes);
 float shaped_corner_sdf(float2 p, float2 radii, float k);
@@ -420,135 +424,34 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
         t *= dash_velocity;
         max_t = is_horizontal ? size.x : size.y;
         max_t *= dash_velocity;
-      } else {
-        // When corners are rounded, the dashes are laid out clockwise
-        // around the whole perimeter.
 
-        // Each corner's (rx, ry): an elliptical corner's dashes follow its arc.
-        float2 r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
-        float2 r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
-        float2 r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
-        float2 r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+        float dash_length = dash_length_per_width / dash_period_per_width;
+        float desired_dash_gap = dash_gap_per_width / dash_period_per_width;
 
-        float w_t = quad.border_widths.top;
-        float w_r = quad.border_widths.right;
-        float w_b = quad.border_widths.bottom;
-        float w_l = quad.border_widths.left;
-
-        // Straight side dash velocities
-        float dv_t = w_t <= 0.0 ? 0.0 : dv_numerator / w_t;
-        float dv_r = w_r <= 0.0 ? 0.0 : dv_numerator / w_r;
-        float dv_b = w_b <= 0.0 ? 0.0 : dv_numerator / w_b;
-        float dv_l = w_l <= 0.0 ? 0.0 : dv_numerator / w_l;
-
-        // Straight side lengths in dash space
-        float s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
-        float s_r = (size.y - r_tr.y - r_br.y) * dv_r;
-        float s_b = (size.x - r_br.x - r_bl.x) * dv_b;
-        float s_l = (size.y - r_bl.y - r_tl.y) * dv_l;
-
-        float corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
-        float corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
-        float corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
-        float corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
-
-        // Corner lengths in dash space
-        float c_tr = quarter_arc_length(r_tr) * corner_dash_velocity_tr;
-        float c_br = quarter_arc_length(r_br) * corner_dash_velocity_br;
-        float c_bl = quarter_arc_length(r_bl) * corner_dash_velocity_bl;
-        float c_tl = quarter_arc_length(r_tl) * corner_dash_velocity_tl;
-
-        // Cumulative dash space upto each segment
-        float upto_tr = s_t;
-        float upto_r = upto_tr + c_tr;
-        float upto_br = upto_r + s_r;
-        float upto_b = upto_br + c_br;
-        float upto_bl = upto_b + s_b;
-        float upto_l = upto_bl + c_bl;
-        float upto_tl = upto_l + s_l;
-        max_t = upto_tl + c_tl;
-
-        if (is_near_rounded_corner) {
-          // The angle in the corner's unit circle (an ellipse's parameter), spread over its arc.
-          float radians = atan2(corner_center_to_point.y / max(corner_radii_xy.y, 1e-4),
-                                corner_center_to_point.x / max(corner_radii_xy.x, 1e-4));
-          float corner_t = corner_radii_xy.x == corner_radii_xy.y
-            ? radians * corner_radius
-            : radians * quarter_arc_length(corner_radii_xy) / (M_PI_F / 2.0);
-
-          if (center_to_point.x >= 0.0) {
-            if (center_to_point.y < 0.0) {
-              dash_velocity = corner_dash_velocity_tr;
-              // Subtracted because radians is pi/2 to 0 when
-              // going clockwise around the top right corner,
-              // since the y axis has been flipped
-              t = upto_r - corner_t * dash_velocity;
-            } else {
-              dash_velocity = corner_dash_velocity_br;
-              // Added because radians is 0 to pi/2 when going
-              // clockwise around the bottom-right corner
-              t = upto_br + corner_t * dash_velocity;
-            }
-          } else {
-            if (center_to_point.y >= 0.0) {
-              dash_velocity = corner_dash_velocity_bl;
-              // Subtracted because radians is pi/1 to 0 when
-              // going clockwise around the bottom-left corner,
-              // since the x axis has been flipped
-              t = upto_l - corner_t * dash_velocity;
-            } else {
-              dash_velocity = corner_dash_velocity_tl;
-              // Added because radians is 0 to pi/2 when going
-              // clockwise around the top-left corner, since both
-              // axis were flipped
-              t = upto_tl + corner_t * dash_velocity;
-            }
-          }
-        } else {
-          // Straight borders
-          bool is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
-          if (is_horizontal) {
-            if (center_to_point.y < 0.0) {
-              dash_velocity = dv_t;
-              t = (point.x - r_tl.x) * dash_velocity;
-            } else {
-              dash_velocity = dv_b;
-              t = upto_bl - (point.x - r_bl.x) * dash_velocity;
-            }
-          } else {
-            if (center_to_point.x < 0.0) {
-              dash_velocity = dv_l;
-              t = upto_tl - (point.y - r_tl.y) * dash_velocity;
-            } else {
-              dash_velocity = dv_r;
-              t = upto_r + (point.y - r_tr.y) * dash_velocity;
-            }
-          }
-        }
-      }
-
-      float dash_length = dash_length_per_width / dash_period_per_width;
-      float desired_dash_gap = dash_gap_per_width / dash_period_per_width;
-
-      // Straight borders should start and end with a dash, so max_t is
-      // reduced to cause this.
-      max_t -= unrounded ? dash_length : 0.0;
-      if (max_t >= 1.0) {
-        // Adjust dash gap to evenly divide max_t
-        float dash_count = floor(max_t);
-        float dash_period = max_t / dash_count;
-        border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
-                                     antialias_threshold);
-      } else if (unrounded) {
-        // When there isn't enough space for the full gap between the
-        // two start / end dashes of a straight border, reduce gap to
-        // make them fit.
-        float dash_gap = max_t - dash_length;
-        if (dash_gap > 0.0) {
-          float dash_period = dash_length + dash_gap;
+        // Straight borders should start and end with a dash, so max_t is
+        // reduced to cause this.
+        max_t -= dash_length;
+        if (max_t >= 1.0) {
+          // Adjust dash gap to evenly divide max_t
+          float dash_count = floor(max_t);
+          float dash_period = max_t / dash_count;
           border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
                                        antialias_threshold);
+        } else {
+          // When there isn't enough space for the full gap between the
+          // two start / end dashes of a straight border, reduce gap to
+          // make them fit.
+          float dash_gap = max_t - dash_length;
+          if (dash_gap > 0.0) {
+            float dash_period = dash_length + dash_gap;
+            border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
+                                         antialias_threshold);
+          }
         }
+      } else {
+        border_color.a *= rounded_dash_alpha(quad, point, size, center_to_point, corner_to_point,
+                                             corner_center_to_point, is_near_rounded_corner,
+                                             corner_radii_xy, antialias_threshold);
       }
     }
 
@@ -562,22 +465,114 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return clip_alpha_straight(color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf)), clip_alpha);
 }
 
-// Returns the dash velocity of a corner given the dash velocity of the two
-// sides, by returning the slower velocity (larger dashes).
-//
-// Since 0 is used for dash velocity when the border width is 0 (instead of
-// +inf), this returns the other dash velocity in that case.
-//
-// An alternative to this might be to appropriately interpolate the dash
-// velocity around the corner, but that seems overcomplicated.
-float corner_dash_velocity(float dv1, float dv2) {
-  if (dv1 == 0.0) {
-    return dv2;
-  } else if (dv2 == 0.0) {
-    return dv1;
+// The alpha of a rounded dashed border at `point` (from the quad's origin), as WebKit draws it
+// (`BorderPainter::drawBoxSideFromPath`). Each side strokes the outer edge's path, which starts
+// halfway down the straight part of the right edge and runs clockwise (down the right edge
+// first), with dashes three times the side's width and gaps as long. When the count of dashes
+// along the whole path is odd and not whole, each gap grows by a dash over half that count. The
+// pattern starts with a gap (a dash offset of one dash), and under four dashes the side is solid.
+// A pixel takes the position of the point of the outer edge nearest to it, and the pattern of the
+// side whose part of the border holds it: each corner splits along the line from the box's outer
+// corner to the border's inner corner.
+float rounded_dash_alpha(Quad quad, float2 point, float2 size, float2 center_to_point,
+                         float2 corner_to_point, float2 corner_center_to_point,
+                         bool is_near_rounded_corner, float2 corner_radii_xy,
+                         float antialias_threshold) {
+  float2 r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
+  float2 r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
+  float2 r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
+  float2 r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+  float q_tr = ellipse_arc_length(r_tr, M_PI_F / 2.0);
+  float q_br = ellipse_arc_length(r_br, M_PI_F / 2.0);
+  float q_bl = ellipse_arc_length(r_bl, M_PI_F / 2.0);
+  float q_tl = ellipse_arc_length(r_tl, M_PI_F / 2.0);
+
+  // Where each piece of the path starts, along it.
+  float start_y = (r_tr.y + size.y - r_br.y) / 2.0;
+  float at_br = size.y - r_br.y - start_y;
+  float at_b = at_br + q_br;
+  float at_bl = at_b + (size.x - r_br.x - r_bl.x);
+  float at_l = at_bl + q_bl;
+  float at_tl = at_l + (size.y - r_bl.y - r_tl.y);
+  float at_t = at_tl + q_tl;
+  float at_tr = at_t + (size.x - r_tl.x - r_tr.x);
+  float at_r = at_tr + q_tr;
+  float total = at_r + (start_y - r_tr.y);
+
+  bool right = center_to_point.x >= 0.0;
+  bool bottom = center_to_point.y >= 0.0;
+  float s;
+  if (is_near_rounded_corner) {
+    float arc = ellipse_arc_length(corner_radii_xy,
+                                   ellipse_nearest_angle(corner_center_to_point, corner_radii_xy));
+    if (right) {
+      s = bottom ? at_br + arc : at_tr + q_tr - arc;
+    } else {
+      s = bottom ? at_bl + q_bl - arc : at_tl + arc;
+    }
+  } else if (corner_to_point.y > corner_to_point.x) {
+    // Nearest a horizontal edge.
+    s = bottom ? at_b + (size.x - r_br.x - point.x) : at_t + (point.x - r_tl.x);
+  } else if (right) {
+    s = point.y >= start_y ? point.y - start_y : at_r + (point.y - r_tr.y);
   } else {
-    return min(dv1, dv2);
+    s = at_l + (size.y - r_bl.y - point.y);
   }
+
+  float2 from_corner = -corner_to_point;
+  float horizontal_width = bottom ? quad.border_widths.bottom : quad.border_widths.top;
+  float vertical_width = right ? quad.border_widths.right : quad.border_widths.left;
+  float width = from_corner.y * vertical_width < from_corner.x * horizontal_width
+    ? horizontal_width
+    : vertical_width;
+  float dash = 3.0 * width;
+  if (dash <= 0.0) {
+    return 1.0;
+  }
+  float count = total / dash;
+  if (count < 4.0) {
+    return 1.0;
+  }
+  float gap = dash;
+  if ((int(count) & 1) == 1 && fract(count) > 0.0) {
+    gap += dash / (count / 2.0);
+  }
+  return dash_alpha(s + dash, dash + gap, dash, 1.0, antialias_threshold);
+}
+
+// The arc length of an ellipse of radii `r` from parametric angle 0 (the end of its horizontal
+// radius) to `t`: Simpson's rule over eight steps, exact for a circle.
+float ellipse_arc_length(float2 r, float t) {
+  if (r.x == r.y) {
+    return r.x * t;
+  }
+  float h = t / 8.0;
+  float sum = 0.0;
+  for (int i = 0; i <= 8; i++) {
+    float a = h * float(i);
+    float weight = (i == 0 || i == 8) ? 1.0 : ((i & 1) == 1 ? 4.0 : 2.0);
+    sum += weight * length(float2(r.x * sin(a), r.y * cos(a)));
+  }
+  return sum * h / 3.0;
+}
+
+// The parametric angle of the point of an ellipse of radii `r` (centered at the origin) nearest
+// to `p`, both components of `p` at least 0: where the ellipse's normal through `p` meets it. Three
+// iterations of the evolute method; exact for a circle.
+float ellipse_nearest_angle(float2 p, float2 r) {
+  if (r.x == r.y) {
+    return atan2(p.y, p.x);
+  }
+  float2 t = float2(0.70710678);
+  for (int i = 0; i < 3; i++) {
+    float2 e = float2((r.x * r.x - r.y * r.y) * t.x * t.x * t.x / r.x,
+                      (r.y * r.y - r.x * r.x) * t.y * t.y * t.y / r.y);
+    float2 q = p - e;
+    float scale = length(r * t - e) / max(length(q), 1e-4);
+    t = clamp((q * scale + e) / r, 0.0, 1.0);
+    t /= max(length(t), 1e-4);
+  }
+  return atan2(t.y, t.x);
 }
 
 // Returns alpha used to render antialiased dashes.
@@ -1387,11 +1382,6 @@ float2 pick_corner_radii_xy(float2 center_to_point, Corners_ScaledPixels x, Corn
 
 float2 corner_pair(float x, float y) {
   return (x <= 0.0 || y <= 0.0) ? float2(0.0) : float2(x, y);
-}
-
-// The length of a quarter ellipse of radii `r` (Ramanujan's approximation; exact for a circle).
-float quarter_arc_length(float2 r) {
-  return (M_PI_F / 4.0) * (3.0 * (r.x + r.y) - sqrt((3.0 * r.x + r.y) * (r.x + 3.0 * r.y)));
 }
 
 Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y) {
