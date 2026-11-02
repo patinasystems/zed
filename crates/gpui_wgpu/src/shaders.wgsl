@@ -2200,7 +2200,8 @@ fn clip_output(color: vec4<f32>, clip: f32) -> vec4<f32> {
 
 // --- instance records (`gpui::InstanceTables`) --- //
 // Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
+// distinct content masks (3 texels, and a 4th, the vertical radii, when the index has
+// MASK_ELLIPTICAL set), transformations (2 texels, the identity at texel 0) and
 // each primitive's aux record. The transports load records and table texels
 // (`load_*_record`, `load_table_texel`); `load_*` below expand them into the full layouts.
 
@@ -2283,11 +2284,17 @@ fn texel_hsla(texel: vec4<f32>) -> Hsla {
 }
 
 fn load_content_mask(index: u32) -> ContentMask {
+    let at = index & 0x7fffffffu;
+    // A circular mask has no fourth texel (`MASK_ELLIPTICAL`).
+    var radii_y = vec4<f32>(0.0);
+    if (index & 0x80000000u) != 0u {
+        radii_y = load_table_texel(at + 3u);
+    }
     return ContentMask(
-        texel_bounds(load_table_texel(index)),
-        texel_corners(load_table_texel(index + 1u)),
-        texel_bounds(load_table_texel(index + 2u)),
-        texel_corners(load_table_texel(index + 3u)),
+        texel_bounds(load_table_texel(at)),
+        texel_corners(load_table_texel(at + 1u)),
+        texel_bounds(load_table_texel(at + 2u)),
+        texel_corners(radii_y),
     );
 }
 
