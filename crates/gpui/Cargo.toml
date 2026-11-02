@@ -61,6 +61,8 @@ hot-reload = [
 path = "src/gpui.rs"
 
 [dependencies]
+# Graphemes for missing-glyph reports (`missing_graphemes`).
+unicode-segmentation.workspace = true
 accesskit.workspace = true
 anyhow.workspace = true
 async-task.workspace = true
@@ -185,7 +187,6 @@ gpui_util.workspace = true
 lyon = { version = "1.0", features = ["extra"] }
 rand = { workspace = true, default-features = true }
 scheduler = { workspace = true, features = ["test-support"] }
-unicode-segmentation.workspace = true
 util_macros.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
