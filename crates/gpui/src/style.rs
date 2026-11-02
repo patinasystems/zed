@@ -1857,7 +1857,8 @@ mod overflow_mask_tests {
 
         // A circular corner inset by unequal borders follows the padding box's elliptical
         // curve: 20 px less a 4 px side border across, less a 12 px top border down.
-        style.corner_radii = Corners::all(px(20.).into());
+        let twenty: LengthOrPercent = px(20.).into();
+        style.corner_radii = Corners { top_left: twenty, top_right: twenty, bottom_right: twenty, bottom_left: twenty };
         style.border_widths = Edges { top: px(12.).into(), right: px(4.).into(), bottom: px(12.).into(), left: px(4.).into() };
         let mask = style.overflow_mask(bounds, px(16.)).unwrap();
         assert_eq!(mask.corner_radii, Corners::all(px(16.)));
