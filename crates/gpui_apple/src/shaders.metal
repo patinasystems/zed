@@ -90,6 +90,10 @@ struct PathRasterizationVertex {
 };
 
 ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index);
+Bounds_ScaledPixels texel_bounds(float4 texel);
+Corners_ScaledPixels texel_corners(float4 texel);
+float4 bounds_texel(Bounds_ScaledPixels bounds);
+float4 corners_texel(Corners_ScaledPixels corners);
 TransformationMatrix load_transformation(constant float4 *tables, uint index);
 Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id);
 Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id);
@@ -113,6 +117,22 @@ struct QuadVertexOutput {
   // A gradient's position (`gradient_vertex`) and stop range.
   float2 gradient_point;
   float4 gradient_stops [[flat]];
+  // The quad as the fragment stage shades it, resolved once per vertex from its record and
+  // the scene's tables: a fragment reads no instance buffer (the dependent table reads cost
+  // every pixel of a large fill).
+  float4 quad_bounds [[flat]];
+  float4 corner_radii [[flat]];
+  float4 corner_radii_y [[flat]];
+  float4 border_widths [[flat]];
+  float4 mask_bounds [[flat]];
+  float4 mask_radii [[flat]];
+  float4 mask_rounded_bounds [[flat]];
+  // Background: angle or pattern height, the two stop percentages, the first color's alpha.
+  float4 background_params [[flat]];
+  // Border style, background tag and color space, then the corner shapes and the gradient.
+  uint4 quad_info [[flat]];
+  // The transformation's axis scales; zero when the quad is not transformed.
+  float2 transform_scale [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -127,6 +147,22 @@ struct QuadFragmentInput {
   // A gradient's position (`gradient_vertex`) and stop range.
   float2 gradient_point;
   float4 gradient_stops [[flat]];
+  // The quad as the fragment stage shades it, resolved once per vertex from its record and
+  // the scene's tables: a fragment reads no instance buffer (the dependent table reads cost
+  // every pixel of a large fill).
+  float4 quad_bounds [[flat]];
+  float4 corner_radii [[flat]];
+  float4 corner_radii_y [[flat]];
+  float4 border_widths [[flat]];
+  float4 mask_bounds [[flat]];
+  float4 mask_radii [[flat]];
+  float4 mask_rounded_bounds [[flat]];
+  // Background: angle or pattern height, the two stop percentages, the first color's alpha.
+  float4 background_params [[flat]];
+  // Border style, background tag and color space, then the corner shapes and the gradient.
+  uint4 quad_info [[flat]];
+  // The transformation's axis scales; zero when the quad is not transformed.
+  float2 transform_scale [[flat]];
 };
 
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
@@ -179,6 +215,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
     gradient_stops = vertex_gradient.stops;
   }
 
+  bool transformed = is_transformed(quad.transformation);
   return QuadVertexOutput{
       quad_id,
       device_position,
@@ -189,20 +226,58 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       gradient.color1,
       gradient_point,
       gradient_stops,
+      bounds_texel(quad.bounds),
+      corners_texel(quad.corner_radii),
+      corners_texel(quad.corner_radii_y),
+      float4(quad.border_widths.top, quad.border_widths.right, quad.border_widths.bottom,
+             quad.border_widths.left),
+      bounds_texel(quad.content_mask.bounds),
+      corners_texel(quad.content_mask.corner_radii),
+      bounds_texel(quad.content_mask.rounded_bounds),
+      float4(quad.background.gradient_angle_or_pattern_height,
+             quad.background.colors[0].percentage, quad.background.colors[1].percentage,
+             quad.background.colors[0].color.a),
+      uint4((uint)quad.border_style | ((uint)quad.background.tag << 4) |
+                ((uint)quad.background.color_space << 8),
+            quad.corner_shapes[0], quad.corner_shapes[1], quad.background.gradient),
+      transformed ? transformation_scale(quad.transformation) : float2(0.),
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// The quad a fragment shades, from its vertex's flat varyings (see `QuadVertexOutput`).
+Quad fragment_quad(QuadFragmentInput input) {
+  Quad quad = {};
+  quad.bounds = texel_bounds(input.quad_bounds);
+  quad.corner_radii = texel_corners(input.corner_radii);
+  quad.corner_radii_y = texel_corners(input.corner_radii_y);
+  quad.border_widths.top = input.border_widths.x;
+  quad.border_widths.right = input.border_widths.y;
+  quad.border_widths.bottom = input.border_widths.z;
+  quad.border_widths.left = input.border_widths.w;
+  quad.content_mask.bounds = texel_bounds(input.mask_bounds);
+  quad.content_mask.corner_radii = texel_corners(input.mask_radii);
+  quad.content_mask.rounded_bounds = texel_bounds(input.mask_rounded_bounds);
+  uint info = input.quad_info.x;
+  quad.border_style = (BorderStyle)(info & 0xf);
+  quad.background.tag = (decltype(quad.background.tag))((info >> 4) & 0xf);
+  quad.background.color_space = (decltype(quad.background.color_space))((info >> 8) & 0xf);
+  quad.background.gradient_angle_or_pattern_height = input.background_params.x;
+  quad.background.colors[0].percentage = input.background_params.y;
+  quad.background.colors[1].percentage = input.background_params.z;
+  quad.background.colors[0].color.a = input.background_params.w;
+  quad.background.gradient = input.quad_info.w;
+  quad.corner_shapes[0] = input.quad_info.y;
+  quad.corner_shapes[1] = input.quad_info.z;
+  return quad;
+}
+
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant QuadRecord *quads
-                              [[buffer(QuadInputIndex_Quads)]],
                               constant float4 *gradients
-                              [[buffer(QuadInputIndex_Gradients)]],
-                              constant float4 *tables
-                              [[buffer(QuadInputIndex_Tables)]]) {
-  Quad quad = load_quad(quads, tables, input.quad_id);
+                              [[buffer(QuadInputIndex_Gradients)]]) {
+  Quad quad = fragment_quad(input);
   float clip_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
   float2 position = input.position.xy;
-  bool transformed = is_transformed(quad.transformation);
+  bool transformed = input.transform_scale.x != 0.;
   float4 background_color = quad.background.tag == 4
     ? gradient_fill(gradients, quad.background.gradient, input.gradient_point,
         input.gradient_stops, input.background_solid, input.background_color0,
@@ -213,7 +288,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     // antialias over about one pixel.
     // Circular corners stay circular: they take the smaller axis scale. Elliptical ones scale
     // each radius by its own axis.
-    float2 scale = transformation_scale(quad.transformation);
+    float2 scale = input.transform_scale;
     position = input.local_position * scale;
     quad.bounds = scale_bounds(quad.bounds, scale);
     if (corners_equal(quad.corner_radii, quad.corner_radii_y)) {
@@ -2504,6 +2579,14 @@ Corners_ScaledPixels texel_corners(float4 texel) {
   corners.bottom_right = texel.z;
   corners.bottom_left = texel.w;
   return corners;
+}
+
+float4 bounds_texel(Bounds_ScaledPixels bounds) {
+  return float4(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height);
+}
+
+float4 corners_texel(Corners_ScaledPixels corners) {
+  return float4(corners.top_left, corners.top_right, corners.bottom_right, corners.bottom_left);
 }
 
 Hsla texel_hsla(float4 texel) {
