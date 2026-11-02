@@ -2931,7 +2931,17 @@ impl WgpuRendererCore {
             ..
         } = records;
         tables.clear();
-        encode(quads, &scene.quads, |quad| tables.quad(quad));
+        // Quads are fill-heavy (a few large primitives cover most pixels): storage backends upload
+        // them whole and their shaders read each quad in place, so a fragment does no table walk.
+        // Expanding a record per pixel cost fill-bound quad scenes 12-17% GPU time on M4 Max
+        // (PR 4793). The many small primitives (glyphs, underlines, shadows, paths) use compact
+        // records indexing the scene's table, which cut upload bytes. WebGL's texture transport
+        // reads quads as records too: a whole quad there is as many texel fetches.
+        let webgl = self.uses_webgl_instance_data;
+        quads.clear();
+        if webgl {
+            encode(quads, &scene.quads, |quad| tables.quad(quad));
+        }
         encode(shadows, &scene.shadows, |shadow| tables.shadow(shadow));
         encode(underlines, &scene.underlines, |underline| {
             tables.underline(underline)
@@ -2961,7 +2971,11 @@ impl WgpuRendererCore {
             rebase(&mut path_records, base);
         }
         Ok(InstanceBindings {
-            quads: self.write_instance_binding("quads_bind_group", instance_offset, quads)?,
+            quads: if webgl {
+                self.write_instance_binding("quads_bind_group", instance_offset, quads)?
+            } else {
+                self.write_instance_binding("quads_bind_group", instance_offset, &scene.quads)?
+            },
             shadows: self.write_instance_binding("shadows_bind_group", instance_offset, shadows)?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
@@ -5163,7 +5177,7 @@ mod tests {
                 0,
                 0,
                 flags,
-                2 | gpui::MASK_ROUNDED | gpui::MASK_ELLIPTICAL,
+                2 | gpui::MASK_ELLIPTICAL,
                 6,
                 8,
             ]

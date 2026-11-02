@@ -2200,9 +2200,8 @@ fn clip_output(color: vec4<f32>, clip: f32) -> vec4<f32> {
 
 // --- instance records (`gpui::InstanceTables`) --- //
 // Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (their bounds, then radii and rounded bounds when the index has
-// MASK_ROUNDED set, then vertical radii when it has MASK_ELLIPTICAL set), transformations
-// (2 texels, the identity at texel 0, never read) and
+// distinct content masks (3 texels, and a 4th, the vertical radii, when the index has
+// MASK_ELLIPTICAL set), transformations (2 texels, the identity at texel 0) and
 // each primitive's aux record. The transports load records and table texels
 // (`load_*_record`, `load_table_texel`); `load_*` below expand them into the full layouts.
 
@@ -2284,33 +2283,22 @@ fn texel_hsla(texel: vec4<f32>) -> Hsla {
     return Hsla(texel.x, texel.y, texel.z, texel.w);
 }
 
-// Reads only what the mask has (`MASK_ROUNDED`): a rectangular clip's radii are zero.
 fn load_content_mask(index: u32) -> ContentMask {
-    let at = index & 0x3fffffffu;
-    let bounds = load_table_texel(at);
-    var radii = vec4<f32>(0.0);
-    var rounded_bounds = bounds;
-    if (index & 0x40000000u) != 0u {
-        radii = load_table_texel(at + 1u);
-        rounded_bounds = load_table_texel(at + 2u);
-    }
+    let at = index & 0x7fffffffu;
+    // A circular mask has no fourth texel (`MASK_ELLIPTICAL`).
     var radii_y = vec4<f32>(0.0);
     if (index & 0x80000000u) != 0u {
         radii_y = load_table_texel(at + 3u);
     }
     return ContentMask(
-        texel_bounds(bounds),
-        texel_corners(radii),
-        texel_bounds(rounded_bounds),
+        texel_bounds(load_table_texel(at)),
+        texel_corners(load_table_texel(at + 1u)),
+        texel_bounds(load_table_texel(at + 2u)),
         texel_corners(radii_y),
     );
 }
 
 fn load_transformation(index: u32) -> TransformationMatrix {
-    if index == 0u {
-        // The identity: no table read.
-        return TransformationMatrix(mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0)), vec2<f32>(0.0));
-    }
     let rotation_scale = load_table_texel(index);
     let translation = load_table_texel(index + 1u);
     return TransformationMatrix(
@@ -2343,8 +2331,9 @@ fn load_background(flags: u32, block: u32, solid: Hsla) -> Background {
     return background;
 }
 
-fn load_quad(instance_id: u32) -> Quad {
-    let record = load_quad_record(instance_id);
+// A quad from its record (WebGL's transport; storage backends read whole quads, see
+// `shaders_storage.wgsl`).
+fn expand_quad_record(record: QuadRecord) -> Quad {
     var quad: Quad;
     quad.border_style = record.flags & QUAD_DASHED;
     quad.bounds = record.bounds;
