@@ -3991,6 +3991,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
 
+    /// The warm-up frame draws one path batch, inside its content mask (a culled path would
+    /// compile nothing).
+    #[test]
+    fn warm_scene_draws_one_path() {
+        let scene = warm_scene();
+        let batches: Vec<_> = scene.batches().collect();
+        assert!(
+            matches!(batches.as_slice(), [PrimitiveBatch::Paths(range)] if range.len() == 1),
+            "{:?}",
+            batches.iter().map(|b| b.label()).collect::<Vec<_>>()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
         Size {
