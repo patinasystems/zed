@@ -3,9 +3,9 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
-    Path, PlatformAtlas as _, Point, PrimitiveBatch, RetainedShapesDraw, RetainedUpload,
-    ScaledPixels, Scene, ShapeInstance, Size, point, size,
+    AtlasTextureId, BackdropFilter, Bounds, ContentMask, DevicePixels, InstanceTables,
+    PaintSurface, Path, PathRecord, PlatformAtlas as _, PrimitiveBatch, RetainedShapesDraw,
+    RetainedUpload, ScaledPixels, Scene, ShapeInstance, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
@@ -63,6 +63,8 @@ pub unsafe fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// The scenes' record tables, kept between frames for their capacity.
+    tables: InstanceTables,
 }
 
 impl Default for InstanceBufferPool {
@@ -70,6 +72,7 @@ impl Default for InstanceBufferPool {
         Self {
             buffer_size: 2 * 1024 * 1024,
             buffers: Vec::new(),
+            tables: InstanceTables::default(),
         }
     }
 }
@@ -225,16 +228,6 @@ pub struct MetalRenderer {
     headless_render_target: Option<metal::Texture>,
     /// Whether the last [`MetalRenderer::draw`] committed its frame.
     rendered: bool,
-}
-
-#[repr(C)]
-pub struct PathRasterizationVertex {
-    pub xy_position: Point<ScaledPixels>,
-    pub st_position: Point<f32>,
-    pub color: Background,
-    pub bounds: Bounds<ScaledPixels>,
-    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
-    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -971,10 +964,12 @@ impl MetalRenderer {
                     self.draw_quads(range, instance_bindings, viewport_size, open(&mut encoder))
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
+                    let paths = &scene.paths[range.clone()];
                     close_encoder(&mut encoder);
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        &instance_bindings.path_records[range],
+                        &instance_bindings.tables,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -1505,6 +1500,8 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        path_records: &[PathRecord],
+        tables: &InstanceBinding,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -1517,17 +1514,14 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-                content_mask: path.content_mask,
-            }));
-        }
-        let vertex_instance_bindings = writer.write(&vertices)?;
+        let vertex_count = paths.iter().map(|path| path.vertices.len()).sum::<usize>();
+        let vertex_instance_bindings = writer.write_counted(
+            paths
+                .iter()
+                .zip(path_records)
+                .flat_map(|(path, &record)| InstanceTables::path_vertices(path, record)),
+            vertex_count,
+        )?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -1572,10 +1566,15 @@ impl MetalRenderer {
             Some(&vertex_instance_bindings.buffer),
             vertex_instance_bindings.offset as u64,
         );
+        set_tables(
+            command_encoder,
+            PathRasterizationInputIndex::Tables as u64,
+            tables,
+        );
         command_encoder.draw_primitives(
             metal::MTLPrimitiveType::Triangle,
             0,
-            vertices.len() as u64,
+            vertex_count as u64,
         );
 
         command_encoder.end_encoding();
@@ -1615,6 +1614,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        set_tables(
+            command_encoder,
+            ShadowInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1667,6 +1671,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        set_tables(
+            command_encoder,
+            QuadInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1998,6 +2007,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        set_tables(
+            command_encoder,
+            UnderlineInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2054,6 +2068,11 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
+        set_tables(
+            command_encoder,
+            SpriteInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2115,6 +2134,11 @@ impl MetalRenderer {
         };
         command_encoder.set_fragment_sampler_state(0, Some(sampler));
 
+        set_tables(
+            command_encoder,
+            SpriteInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2654,6 +2678,20 @@ struct InstanceBindings {
     surfaces: InstanceBinding,
     /// The window scene's gradient records, which quads in every scene refer to.
     gradients: InstanceBinding,
+    /// The scene's record table ([`InstanceTables`]), which its records index.
+    tables: InstanceBinding,
+    /// Each path's record in `tables`, which its vertices share.
+    path_records: Vec<PathRecord>,
+}
+
+/// Binds a scene's record table to both stages at `index`.
+fn set_tables(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    index: u64,
+    tables: &InstanceBinding,
+) {
+    command_encoder.set_vertex_buffer(index, Some(&tables.buffer), tables.offset as u64);
+    command_encoder.set_fragment_buffer(index, Some(&tables.buffer), tables.offset as u64);
 }
 
 /// Writes the window scene's gradient records once per frame; every scene's quads
@@ -2666,24 +2704,48 @@ fn write_gradients(root: &Scene, writer: &mut InstanceBufferWriter) -> Result<In
     }
 }
 
-/// Writes `scene`'s instances; its quads read `gradients` (the window scene's).
+/// Writes `scene`'s records and then their table; its quads read `gradients` (the window
+/// scene's).
 fn write_instances(
     gradients: &InstanceBinding,
     scene: &Scene,
     writer: &mut InstanceBufferWriter,
 ) -> Result<InstanceBindings> {
-    Ok(InstanceBindings {
-        gradients: gradients.clone(),
-        quads: writer.write(&scene.quads)?,
-        shadows: writer.write(&scene.shadows)?,
-        underlines: writer.write(&scene.underlines)?,
-        monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
-        polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
-        surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
-            bounds: surface.bounds,
-            content_mask: surface.content_mask,
-        }))?,
-    })
+    let mut tables = mem::take(&mut writer.tables);
+    tables.clear();
+    let result: Result<InstanceBindings> = (|| {
+        Ok(InstanceBindings {
+            gradients: gradients.clone(),
+            quads: writer.write_iter(scene.quads.iter().map(|quad| tables.quad(quad)))?,
+            shadows: writer.write_iter(scene.shadows.iter().map(|shadow| tables.shadow(shadow)))?,
+            underlines: writer.write_iter(
+                scene
+                    .underlines
+                    .iter()
+                    .map(|underline| tables.underline(underline)),
+            )?,
+            monochrome_sprites: writer.write_iter(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| tables.monochrome_sprite(sprite)),
+            )?,
+            polychrome_sprites: writer.write_iter(
+                scene
+                    .polychrome_sprites
+                    .iter()
+                    .map(|sprite| tables.polychrome_sprite(sprite)),
+            )?,
+            surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+            }))?,
+            path_records: scene.paths.iter().map(|path| tables.path(path)).collect(),
+            tables: writer.write(tables.texels())?,
+        })
+    })();
+    writer.tables = tables;
+    result
 }
 
 struct InstanceBufferWriter {
@@ -2693,6 +2755,10 @@ struct InstanceBufferWriter {
     filled: Vec<(InstanceBuffer, usize)>,
     current: InstanceBuffer,
     offset: usize,
+    /// The record table each scene is encoded through, the pool's between frames.
+    tables: InstanceTables,
+    /// Bytes written this frame, for upload measurements.
+    written: usize,
 }
 
 impl InstanceBufferWriter {
@@ -2701,7 +2767,10 @@ impl InstanceBufferWriter {
         pool: &Arc<Mutex<InstanceBufferPool>>,
         unified_memory: bool,
     ) -> Self {
-        let current = pool.lock().acquire(device, unified_memory);
+        let mut locked = pool.lock();
+        let current = locked.acquire(device, unified_memory);
+        let tables = mem::take(&mut locked.tables);
+        drop(locked);
         Self {
             device: device.clone(),
             pool: pool.clone(),
@@ -2709,6 +2778,8 @@ impl InstanceBufferWriter {
             filled: Vec::new(),
             current,
             offset: 0,
+            tables,
+            written: 0,
         }
     }
 
@@ -2720,6 +2791,7 @@ impl InstanceBufferWriter {
             offset = 0;
         }
         self.offset = offset + size;
+        self.written += size;
 
         let binding = InstanceBinding {
             buffer: self.current.metal_buffer.clone(),
@@ -2750,10 +2822,23 @@ impl InstanceBufferWriter {
         &mut self,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<InstanceBinding> {
-        let (binding, destination) = self.allocate::<T>(values.len())?;
+        let count = values.len();
+        self.write_counted(values, count)
+    }
+
+    /// Writes the `count` items `values` yields.
+    fn write_counted<T>(
+        &mut self,
+        values: impl Iterator<Item = T>,
+        count: usize,
+    ) -> Result<InstanceBinding> {
+        let (binding, destination) = self.allocate::<T>(count)?;
+        let mut written = 0;
         for (slot, value) in destination.iter_mut().zip(values) {
             slot.write(value);
+            written += 1;
         }
+        anyhow::ensure!(written == count, "wrote {written} of {count} instances");
         Ok(binding)
     }
 
@@ -2785,12 +2870,17 @@ impl InstanceBufferWriter {
 
     fn finish(self) -> InstanceBuffer {
         let Self {
+            pool,
             unified_memory,
             filled,
             current,
             offset,
+            tables,
+            written,
             ..
         } = self;
+        retained_stats::record_instances(written);
+        pool.lock().tables = tables;
 
         if !unified_memory {
             for (buffer, written) in &filled {
@@ -2822,6 +2912,7 @@ enum ShadowInputIndex {
     Vertices = 0,
     Shadows = 1,
     ViewportSize = 2,
+    Tables = 3,
 }
 
 #[repr(C)]
@@ -2830,6 +2921,7 @@ enum QuadInputIndex {
     Quads = 1,
     ViewportSize = 2,
     Gradients = 3,
+    Tables = 4,
 }
 
 #[repr(C)]
@@ -2837,6 +2929,7 @@ enum UnderlineInputIndex {
     Vertices = 0,
     Underlines = 1,
     ViewportSize = 2,
+    Tables = 3,
 }
 
 #[repr(C)]
@@ -2846,6 +2939,7 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
+    Tables = 5,
 }
 
 #[repr(C)]
@@ -2862,6 +2956,7 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+    Tables = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2917,6 +3012,7 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Point;
 
     /// Frame cost of 100k retained shapes under a moving camera, offscreen at
     /// 2800x1800: CPU to encode, GPU time, and bytes uploaded after the first
@@ -3326,6 +3422,100 @@ mod tests {
         }
     }
 
+    /// Instance-bound frames: many small primitives, so each frame's cost is mostly the
+    /// instance records the GPU fetches, not the pixels it shades. Two scenes at 2400x1600:
+    /// 40k 10 px quads under 400 rounded masks (half with borders), and the same quads plus
+    /// 10k underlines. Scenes alternate each round; each line is the median GPU time
+    /// (command buffer start to end) and the median CPU time of `render_scene_to_image`.
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib instance_frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn instance_frame_cost() {
+        use gpui::{ContentMask, Corners, Edges, Quad, ScaledPixels, Scene, TransformationMatrix, Underline};
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
+        let (width, height) = (2400i32, 1600i32);
+        let px = |x: f32| ScaledPixels(x);
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let scene = |underlines: usize| {
+            let mut scene = Scene::default();
+            // 400 masks of 120 x 80 px (20 x 20 of them), each rounded by 12 px.
+            let mask = |i: usize| {
+                let (mx, my) = ((i % 20) as f32 * 120., ((i / 20) % 20) as f32 * 80.);
+                ContentMask::rounded(rect(mx, my, 120., 80.), Corners::all(px(12.)))
+            };
+            for i in 0..40_000usize {
+                let (x, y) = ((i % 240) as f32 * 10., ((i / 240) % 160) as f32 * 10.);
+                let m = (x / 120.) as usize + 20 * (y / 80.) as usize;
+                let bordered = i % 2 == 0;
+                scene.insert_primitive(Quad {
+                    bounds: rect(x + 1., y + 1., 8., 8.),
+                    content_mask: mask(m),
+                    background: gpui::Hsla { h: (i % 7) as f32 / 7., s: 0.5, l: 0.5, a: 1. }.into(),
+                    border_widths: if bordered { Edges::all(px(1.)) } else { Edges::default() },
+                    border_color: gpui::Hsla { h: 0., s: 0., l: 0.1, a: 1. },
+                    corner_radii: Corners::all(px(2.)),
+                    ..Default::default()
+                });
+            }
+            for i in 0..underlines {
+                let (x, y) = ((i % 60) as f32 * 40., ((i / 60) % 160) as f32 * 10. + 8.);
+                scene.insert_primitive(Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: rect(x, y, 36., 1.),
+                    content_mask: mask((x / 120.) as usize + 20 * (y / 80.) as usize),
+                    color: gpui::Hsla { h: 0.6, s: 0.8, l: 0.4, a: 1. },
+                    thickness: px(1.),
+                    wavy: false.into(),
+                    transformation: TransformationMatrix::unit(),
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let scenes = [("40k quads", scene(0)), ("40k quads + 10k underlines", scene(10_000))];
+        let viewport = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let mut gpu = vec![Vec::new(); scenes.len()];
+        let mut cpu = vec![Vec::new(); scenes.len()];
+        for round in 0..65 {
+            for (k, (_, scene)) in scenes.iter().enumerate() {
+                let t = std::time::Instant::now();
+                gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, viewport)
+                    .expect("render");
+                let elapsed = t.elapsed().as_secs_f64() * 1000.;
+                // The completion handler runs after the wait returns: let it record.
+                let mut recorded = retained_stats::take_gpu();
+                for _ in 0..100 {
+                    if !recorded.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    recorded = retained_stats::take_gpu();
+                }
+                if round >= 5 {
+                    gpu[k].extend(recorded);
+                    cpu[k].push(elapsed);
+                }
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for (k, (name, _)) in scenes.iter().enumerate() {
+            println!(
+                "INSTANCE_FRAME_COST {name}: GPU {:.3} ms, CPU {:.3} ms per frame (median of {})",
+                median(&mut gpu[k]),
+                median(&mut cpu[k]),
+                cpu[k].len()
+            );
+        }
+    }
+
     /// Frame costs with and without compositing groups. Run with
     /// `cargo test -p gpui_apple --release --lib group_frame_cost -- --ignored --nocapture`.
     #[test]
@@ -3645,10 +3835,10 @@ mod tests {
                 };
                 scene.insert_primitive(Quad {
                     bounds: bounds(0.),
-                    content_mask: ContentMask {
-                        bounds: bounds(8.),
-                        corner_radii: Corners::all(ScaledPixels(radius)),
-                    },
+                    content_mask: ContentMask::rounded(
+                        bounds(8.),
+                        Corners::all(ScaledPixels(radius)),
+                    ),
                     background: gpui::Hsla {
                         h: 0.6,
                         s: 0.5,
@@ -4390,6 +4580,8 @@ mod retained_stats {
         encode: Vec<f64>,
         gpu: Vec<f64>,
         uploaded: Vec<usize>,
+        /// Instance buffer bytes written per frame: records, tables, gradients, vertices.
+        instances: Vec<usize>,
     }
 
     static STATS: Mutex<Option<Stats>> = Mutex::new(None);
@@ -4407,6 +4599,15 @@ mod retained_stats {
 
     pub fn record_upload(bytes: usize) {
         with(|s| s.uploaded.push(bytes));
+    }
+
+    /// Records a frame's instance buffer bytes; `GPUI_INSTANCE_BYTES` prints each frame's.
+    pub fn record_instances(bytes: usize) {
+        static PRINT: OnceLock<bool> = OnceLock::new();
+        if *PRINT.get_or_init(|| std::env::var_os("GPUI_INSTANCE_BYTES").is_some()) {
+            eprintln!("GPUI_INSTANCE_BYTES {bytes}");
+        }
+        with(|s| s.instances.push(bytes));
     }
 
     pub fn record_gpu(ms: f64) {
@@ -4436,15 +4637,24 @@ mod retained_stats {
                 };
                 let uploads = s.uploaded.iter().filter(|b| **b > 0).count();
                 let bytes: usize = s.uploaded.iter().sum();
+                s.instances.sort_unstable();
+                let instance_bytes = |p: f64| {
+                    s.instances
+                        .get(((s.instances.len() as f64 * p) as usize).min(s.instances.len().max(1) - 1))
+                        .copied()
+                        .unwrap_or(0)
+                };
                 eprintln!(
-                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {}",
+                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {} instance_bytes p50 {} max {}",
                     s.encode.len(),
                     q(&mut s.encode, 0.5),
                     q(&mut s.encode, 0.95),
                     q(&mut s.gpu, 0.5),
                     q(&mut s.gpu, 0.95),
                     uploads,
-                    bytes
+                    bytes,
+                    instance_bytes(0.5),
+                    instance_bytes(1.0),
                 );
                 *s = Stats::default();
             }

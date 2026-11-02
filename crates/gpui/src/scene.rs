@@ -38,6 +38,12 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+impl From<PaddedBool32> for bool {
+    fn from(value: PaddedBool32) -> Self {
+        value.0 != 0
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -575,7 +581,7 @@ impl Scene {
     /// further right and down: a group's scene moves to its own image's origin.
     fn translate(&mut self, offset: Point<ScaledPixels>) {
         let bounds = |b: &mut Bounds<ScaledPixels>| b.origin = b.origin + offset;
-        let mask = |m: &mut ContentMask<ScaledPixels>| m.bounds.origin = m.bounds.origin + offset;
+        let mask = |m: &mut ContentMask<ScaledPixels>| *m = m.translate(offset);
         // A transformation applied to content in window pixels, conjugated: content
         // moved by `offset`, transformed, lands `offset` from where it did.
         let conjugate = |t: &mut TransformationMatrix| {
@@ -1463,7 +1469,7 @@ impl BackdropFilter {
     /// The same filter moved by `offset` (bounds and content mask).
     pub fn translated(mut self, offset: Point<ScaledPixels>) -> Self {
         self.bounds.origin = self.bounds.origin + offset;
-        self.content_mask.bounds.origin = self.content_mask.bounds.origin + offset;
+        self.content_mask = self.content_mask.translate(offset);
         self
     }
 
@@ -2015,10 +2021,7 @@ impl OpenGroup {
             mask: None,
             masked_out: false,
             effects: GroupEffects {
-                content_mask: ContentMask {
-                    bounds,
-                    corner_radii: Corners::default(),
-                },
+                content_mask: ContentMask::from(bounds),
                 ..GroupEffects::default()
             },
             scene: Scene {
@@ -2843,7 +2846,9 @@ pub mod element_transformation_test_scene {
             corner_radii_y: Corners::default(),
             content_mask: full,
             color: color(1., 1., 0.),
-            element_bounds: bounds(40., 40., 12., 12.),
+            // Its element is 100 px left, off the scene (`box-shadow: 100px 0`): a drop shadow
+            // paints only outside its element (CSS Backgrounds 3 §7.1.1).
+            element_bounds: bounds(-60., 40., 12., 12.),
             element_corner_radii: Corners::default(),
             element_corner_radii_y: Corners::default(),
             inset: 0,
@@ -3501,9 +3506,8 @@ pub mod rounded_clip_test_scene {
             background: color(1., 1., 1.).into(),
             ..Default::default()
         });
-        let masks = MASKS.map(|[x, y, w, h]| ContentMask {
-            bounds: bounds(x, y, w, h),
-            corner_radii: Corners::all(ScaledPixels(RADIUS)),
+        let masks = MASKS.map(|[x, y, w, h]| {
+            ContentMask::rounded(bounds(x, y, w, h), Corners::all(ScaledPixels(RADIUS)))
         });
         // Each primitive overfills its mask by 4 px on every side.
         let over = |m: &ContentMask<ScaledPixels>| {
@@ -3529,7 +3533,13 @@ pub mod rounded_clip_test_scene {
             corner_radii_y: Corners::default(),
             content_mask: masks[1],
             color: color(0., 1., 0.),
-            element_bounds: over(&masks[1]),
+            // The element sits off the scene (`box-shadow: 0 100px`): a drop shadow paints only
+            // outside its element (CSS Backgrounds 3 §7.1.1), so here only the mask clips it.
+            element_bounds: {
+                let mut element = over(&masks[1]);
+                element.origin.y.0 -= 100.;
+                element
+            },
             element_corner_radii: Corners::default(),
             element_corner_radii_y: Corners::default(),
             inset: 0,
@@ -4100,7 +4110,13 @@ pub mod elliptical_shadow_test_scene {
     /// The scene's size in device pixels.
     pub const SIZE: (i32, i32) = (80, 100);
 
-    /// A black shadow of a 64 x 36 oval at (8, 8) with no blur, and one at (8, 56) with a blur of 4.
+    /// How far right of its shadow each oval element sits (`box-shadow: -40px 0 ...`). A drop
+    /// shadow paints only outside its element (CSS Backgrounds 3 §7.1.1), so a shadow that its
+    /// own element covered would show nothing.
+    pub const ELEMENT_OFFSET: f32 = 40.;
+
+    /// A black shadow of a 64 x 36 oval at (8, 8) with no blur, and one at (8, 56) with a blur of 4,
+    /// each cast by an oval element 40 px to its right.
     pub fn scene() -> Scene {
         let full = ContentMask::from(Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
@@ -4117,6 +4133,7 @@ pub mod elliptical_shadow_test_scene {
         });
         for (y, blur) in [(8., 0.), (56., 4.)] {
             let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(y)), size(ScaledPixels(64.), ScaledPixels(36.)));
+            let element_bounds = Bounds::new(point(ScaledPixels(8. + ELEMENT_OFFSET), ScaledPixels(y)), bounds.size);
             scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: ScaledPixels(blur),
@@ -4125,7 +4142,7 @@ pub mod elliptical_shadow_test_scene {
                 corner_radii_y: Corners::all(ScaledPixels(18.)),
                 content_mask: full,
                 color: black,
-                element_bounds: bounds,
+                element_bounds,
                 element_corner_radii: Corners::all(ScaledPixels(32.)),
                 element_corner_radii_y: Corners::all(ScaledPixels(18.)),
                 inset: 0,
@@ -4154,6 +4171,12 @@ pub mod elliptical_shadow_test_scene {
         assert!(corner > edge + 40, "blurred corner {corner} against center {edge}");
         // A sharp circle of radius 32 would reach (40, 8 + 4): the oval's top edge at x = 40 is y = 8.
         assert!(at(40, 10) < 60, "the oval's top edge is shadowed: {}", at(40, 10));
+        // Under the element (an oval centered at (80, 26)) the shadow is clipped away, though
+        // (64, 26) is inside the shadow's oval too. Left of the element's tip (x = 48) it stays.
+        assert!(at(64, 26) > 235, "no shadow under its element: {}", at(64, 26));
+        assert!(at(44, 26) < 20, "shadowed left of the element's tip: {}", at(44, 26));
+        // (52, 12) is inside the element's box but outside its oval: the clip is the oval, not the box.
+        assert!(at(52, 12) < 20, "the clip follows the element's oval: {}", at(52, 12));
     }
 }
 

@@ -79,6 +79,32 @@ GradientVertex gradient_vertex(constant float4 *gradients, uint start, float2 po
 float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float4 stops,
                      float4 header, float4 first, float4 last, float opacity);
 
+// ---- Instance records (`gpui::InstanceTables`) ----
+// Renderers upload a compact record per primitive and one table of texels per scene: its
+// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
+// each primitive's aux record. `load_*` expand a record into the primitive's full layout.
+
+// A path vertex expanded from its `PathVertexRecord` and its path's record.
+struct PathRasterizationVertex {
+  Point_ScaledPixels xy_position;
+  Point_f32 st_position;
+  Background color;
+  Bounds_ScaledPixels bounds;
+  ContentMask_ScaledPixels content_mask;
+};
+
+ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index);
+TransformationMatrix load_transformation(constant float4 *tables, uint index);
+Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id);
+Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id);
+Underline load_underline(constant UnderlineRecord *underlines, constant float4 *tables, uint id);
+MonochromeSprite load_monochrome_sprite(constant SpriteRecord *sprites, constant float4 *tables,
+                                        uint id);
+PolychromeSprite load_polychrome_sprite(constant PolychromeSpriteRecord *sprites,
+                                        constant float4 *tables, uint id);
+PathRasterizationVertex load_path_vertex(constant PathVertexRecord *vertices,
+                                         constant float4 *tables, uint id);
+
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];
@@ -111,14 +137,16 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     uint quad_id [[instance_id]],
                                     constant float2 *unit_vertices
                                     [[buffer(QuadInputIndex_Vertices)]],
-                                    constant Quad *quads
+                                    constant QuadRecord *quads
                                     [[buffer(QuadInputIndex_Quads)]],
                                     constant Size_DevicePixels *viewport_size
                                     [[buffer(QuadInputIndex_ViewportSize)]],
                                     constant float4 *gradients
-                                    [[buffer(QuadInputIndex_Gradients)]]) {
+                                    [[buffer(QuadInputIndex_Gradients)]],
+                                    constant float4 *tables
+                                    [[buffer(QuadInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Quad quad = quads[quad_id];
+  Quad quad = load_quad(quads, tables, quad_id);
   Bounds_ScaledPixels geometry = quad.bounds;
   float4 device_position;
   float4 clip_distance;
@@ -169,12 +197,14 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
 }
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant Quad *quads
+                              constant QuadRecord *quads
                               [[buffer(QuadInputIndex_Quads)]],
                               constant float4 *gradients
-                              [[buffer(QuadInputIndex_Gradients)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, quads[input.quad_id].content_mask);
-  Quad quad = quads[input.quad_id];
+                              [[buffer(QuadInputIndex_Gradients)]],
+                              constant float4 *tables
+                              [[buffer(QuadInputIndex_Tables)]]) {
+  Quad quad = load_quad(quads, tables, input.quad_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
   float2 position = input.position.xy;
   bool transformed = is_transformed(quad.transformation);
   float4 background_color = quad.background.tag == 4
@@ -595,11 +625,12 @@ struct ShadowFragmentInput {
 vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
-    constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
+    constant ShadowRecord *shadows [[buffer(ShadowInputIndex_Shadows)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant float4 *tables [[buffer(ShadowInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Shadow shadow = shadows[shadow_id];
+  Shadow shadow = load_shadow(shadows, tables, shadow_id);
 
   Bounds_ScaledPixels bounds;
   if (shadow.inset != 0u) {
@@ -639,10 +670,12 @@ vertex ShadowVertexOutput shadow_vertex(
 }
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
-                                constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, shadows[input.shadow_id].content_mask);
-  Shadow shadow = shadows[input.shadow_id];
+                                constant ShadowRecord *shadows
+                                [[buffer(ShadowInputIndex_Shadows)]],
+                                constant float4 *tables
+                                [[buffer(ShadowInputIndex_Tables)]]) {
+  Shadow shadow = load_shadow(shadows, tables, input.shadow_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, shadow.content_mask);
   float2 position = input.position.xy;
   if (is_transformed(shadow.transformation)) {
     // Shade in the shadow's own frame, scaled to device pixels.
@@ -734,11 +767,12 @@ struct UnderlineFragmentInput {
 vertex UnderlineVertexOutput underline_vertex(
     uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
-    constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
+    constant UnderlineRecord *underlines [[buffer(UnderlineInputIndex_Underlines)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(UnderlineInputIndex_ViewportSize)]],
+    constant float4 *tables [[buffer(UnderlineInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Underline underline = underlines[underline_id];
+  Underline underline = load_underline(underlines, tables, underline_id);
   Bounds_ScaledPixels geometry = underline.bounds;
   float4 device_position;
   float4 clip_distance;
@@ -764,13 +798,15 @@ vertex UnderlineVertexOutput underline_vertex(
 }
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
-                                   constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, underlines[input.underline_id].content_mask);
+                                   constant UnderlineRecord *underlines
+                                   [[buffer(UnderlineInputIndex_Underlines)]],
+                                   constant float4 *tables
+                                   [[buffer(UnderlineInputIndex_Tables)]]) {
+  Underline underline = load_underline(underlines, tables, input.underline_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
-  Underline underline = underlines[input.underline_id];
   float2 position = input.position.xy;
   bool transformed = is_transformed(underline.transformation);
   if (transformed) {
@@ -828,13 +864,14 @@ struct MonochromeSpriteFragmentInput {
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant SpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
-    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  MonochromeSprite sprite = sprites[sprite_id];
+  MonochromeSprite sprite = load_monochrome_sprite(sprites, tables, sprite_id);
   float4 device_position =
       to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
@@ -851,9 +888,11 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, sprites[input.sprite_id].content_mask);
+    constant SpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
+  float clip_alpha = content_mask_alpha(
+      input.position.xy, load_content_mask(tables, sprites[input.sprite_id].content_mask));
   if (any(input.clip_distance < float4(0.0))) {
     return clip_alpha_straight(float4(0.0), clip_alpha);
   }
@@ -886,14 +925,15 @@ struct PolychromeSpriteFragmentInput {
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant PolychromeSpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
-    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  PolychromeSprite sprite = sprites[sprite_id];
+  PolychromeSprite sprite = load_polychrome_sprite(sprites, tables, sprite_id);
   float4 device_position = to_device_position_transformed(
       unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(
@@ -912,12 +952,13 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant PolychromeSpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
     // Linear, or nearest for an external texture that asks for it.
-    sampler atlas_texture_sampler [[sampler(0)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, sprites[input.sprite_id].content_mask);
-  PolychromeSprite sprite = sprites[input.sprite_id];
+    sampler atlas_texture_sampler [[sampler(0)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
+  PolychromeSprite sprite = load_polychrome_sprite(sprites, tables, input.sprite_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
   // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
   // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
   float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
@@ -957,10 +998,11 @@ struct PathRasterizationFragmentInput {
 
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant PathVertexRecord *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]],
+  constant float4 *tables [[buffer(PathRasterizationInputIndex_Tables)]]
 ) {
-  PathRasterizationVertex v = vertices[vertex_id];
+  PathRasterizationVertex v = load_path_vertex(vertices, tables, vertex_id);
   float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
   float4 position = float4(
     vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
@@ -982,13 +1024,14 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+  constant PathVertexRecord *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant float4 *tables [[buffer(PathRasterizationInputIndex_Tables)]]
 ) {
-  float clip_alpha = content_mask_alpha(input.position.xy, vertices[input.vertex_id].content_mask);
+  PathRasterizationVertex v = load_path_vertex(vertices, tables, input.vertex_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, v.content_mask);
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
-  PathRasterizationVertex v = vertices[input.vertex_id];
   Background background = v.color;
   Bounds_ScaledPixels path_bounds = v.bounds;
   float alpha;
@@ -2418,17 +2461,206 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the vertex stage's clip distances; a square
-// mask costs this one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the vertex stage's
+// clip distances; a square mask costs this one test.
 float content_mask_alpha(float2 position, ContentMask_ScaledPixels mask) {
   Corners_ScaledPixels r = mask.corner_radii;
   if (r.top_left <= 0. && r.top_right <= 0. && r.bottom_right <= 0. && r.bottom_left <= 0.) {
     return 1.;
   }
-  return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+  return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
 }
 
 float4 clip_alpha_straight(float4 color, float alpha) {
   return float4(color.rgb, color.a * alpha);
+}
+
+// ---- Instance records (`gpui::InstanceTables`) ----
+
+Bounds_ScaledPixels texel_bounds(float4 texel) {
+  Bounds_ScaledPixels bounds;
+  bounds.origin.x = texel.x;
+  bounds.origin.y = texel.y;
+  bounds.size.width = texel.z;
+  bounds.size.height = texel.w;
+  return bounds;
+}
+
+Corners_ScaledPixels texel_corners(float4 texel) {
+  Corners_ScaledPixels corners;
+  corners.top_left = texel.x;
+  corners.top_right = texel.y;
+  corners.bottom_right = texel.z;
+  corners.bottom_left = texel.w;
+  return corners;
+}
+
+Hsla texel_hsla(float4 texel) {
+  Hsla color;
+  color.h = texel.x;
+  color.s = texel.y;
+  color.l = texel.z;
+  color.a = texel.w;
+  return color;
+}
+
+ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) {
+  ContentMask_ScaledPixels mask;
+  mask.bounds = texel_bounds(tables[index]);
+  mask.corner_radii = texel_corners(tables[index + 1]);
+  mask.rounded_bounds = texel_bounds(tables[index + 2]);
+  return mask;
+}
+
+TransformationMatrix load_transformation(constant float4 *tables, uint index) {
+  float4 rotation_scale = tables[index];
+  float4 translation = tables[index + 1];
+  TransformationMatrix transformation;
+  transformation.rotation_scale[0][0] = rotation_scale.x;
+  transformation.rotation_scale[0][1] = rotation_scale.y;
+  transformation.rotation_scale[1][0] = rotation_scale.z;
+  transformation.rotation_scale[1][1] = rotation_scale.w;
+  transformation.translation[0] = translation.x;
+  transformation.translation[1] = translation.y;
+  return transformation;
+}
+
+// A background from its tag and color space (`flags`, bits 1-3 and 4), its solid color and,
+// unless solid, its block at `block`: the angle or pattern height, the gradient record and the
+// gradient's opacity, then a linear gradient's two stops.
+Background load_background(constant float4 *tables, uint flags, uint block, Hsla solid) {
+  Background background = {};
+  background.tag = (BackgroundTag)((flags >> BACKGROUND_TAG_SHIFT) & 7u);
+  background.color_space = (ColorSpace)((flags & BACKGROUND_OKLAB) != 0 ? 1u : 0u);
+  background.solid = solid;
+  if (background.tag != 0) {
+    float4 head = tables[block];
+    background.gradient_angle_or_pattern_height = head.x;
+    background.gradient = as_type<uint>(head.y);
+    background.colors[0].color.a = head.z;
+    if (background.tag == 1) {
+      background.colors[0].color = texel_hsla(tables[block + 1]);
+      background.colors[1].color = texel_hsla(tables[block + 2]);
+      background.colors[0].percentage = tables[block + 3].x;
+      background.colors[1].percentage = tables[block + 3].y;
+    }
+  }
+  return background;
+}
+
+// `QuadRecord::flags` bits (`QUAD_*`) come from the generated scene header.
+
+Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id) {
+  QuadRecord record = quads[id];
+  Quad quad = {};
+  quad.border_style = (BorderStyle)(record.flags & QUAD_DASHED);
+  quad.bounds = record.bounds;
+  quad.content_mask = load_content_mask(tables, record.content_mask);
+  quad.corner_radii = record.corner_radii;
+  quad.corner_radii_y = record.corner_radii;
+  quad.transformation = load_transformation(tables, record.transformation);
+  uint aux = record.aux;
+  if ((record.flags & QUAD_BORDER) != 0) {
+    float4 widths = tables[aux];
+    quad.border_widths.top = widths.x;
+    quad.border_widths.right = widths.y;
+    quad.border_widths.bottom = widths.z;
+    quad.border_widths.left = widths.w;
+    quad.border_color = texel_hsla(tables[aux + 1]);
+    aux += 2;
+  }
+  if ((record.flags & QUAD_ELLIPTICAL) != 0) {
+    quad.corner_radii_y = texel_corners(tables[aux]);
+    aux += 1;
+  }
+  if ((record.flags & QUAD_SHAPED) != 0) {
+    float4 shapes = tables[aux];
+    quad.corner_shapes[0] = as_type<uint>(shapes.x);
+    quad.corner_shapes[1] = as_type<uint>(shapes.y);
+    aux += 1;
+  }
+  quad.background = load_background(tables, record.flags, aux, record.background);
+  return quad;
+}
+
+Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id) {
+  ShadowRecord record = shadows[id];
+  Shadow shadow = {};
+  shadow.blur_radius = record.blur_radius;
+  shadow.bounds = record.bounds;
+  shadow.corner_radii = record.corner_radii;
+  shadow.corner_radii_y = record.corner_radii;
+  shadow.content_mask = load_content_mask(tables, record.content_mask);
+  shadow.color = record.color;
+  shadow.element_bounds = record.element_bounds;
+  shadow.element_corner_radii = record.element_corner_radii;
+  shadow.element_corner_radii_y = record.element_corner_radii;
+  shadow.inset = record.info & 1u;
+  uint aux = record.info >> 1;
+  if (aux != 0) {
+    shadow.corner_radii_y = texel_corners(tables[aux]);
+    shadow.element_corner_radii_y = texel_corners(tables[aux + 1]);
+  }
+  shadow.transformation = load_transformation(tables, record.transformation);
+  return shadow;
+}
+
+Underline load_underline(constant UnderlineRecord *underlines, constant float4 *tables, uint id) {
+  UnderlineRecord record = underlines[id];
+  Underline underline = {};
+  underline.bounds = record.bounds;
+  underline.content_mask = load_content_mask(tables, record.content_mask);
+  underline.color = record.color;
+  underline.thickness = record.thickness;
+  underline.wavy = record.wavy;
+  underline.transformation = load_transformation(tables, record.transformation);
+  return underline;
+}
+
+MonochromeSprite load_monochrome_sprite(constant SpriteRecord *sprites, constant float4 *tables,
+                                        uint id) {
+  SpriteRecord record = sprites[id];
+  MonochromeSprite sprite = {};
+  sprite.tile.bounds = record.tile_bounds;
+  sprite.bounds = record.bounds;
+  sprite.content_mask = load_content_mask(tables, record.content_mask);
+  sprite.color = record.color;
+  sprite.transformation = load_transformation(tables, record.transformation);
+  return sprite;
+}
+
+PolychromeSprite load_polychrome_sprite(constant PolychromeSpriteRecord *sprites,
+                                        constant float4 *tables, uint id) {
+  PolychromeSpriteRecord record = sprites[id];
+  PolychromeSprite sprite = {};
+  sprite.exact_scale = record.info & 1u;
+  sprite.tile.bounds = record.tile_bounds;
+  sprite.grayscale = (record.info >> 1) & 1u;
+  sprite.opacity = record.opacity;
+  sprite.bounds = record.bounds;
+  sprite.content_mask = load_content_mask(tables, record.content_mask);
+  sprite.corner_radii = record.corner_radii;
+  sprite.corner_radii_y = record.corner_radii;
+  uint aux = record.info >> 2;
+  if (aux != 0) {
+    sprite.corner_radii_y = texel_corners(tables[aux]);
+  }
+  sprite.transformation = load_transformation(tables, record.transformation);
+  return sprite;
+}
+
+PathRasterizationVertex load_path_vertex(constant PathVertexRecord *vertices,
+                                         constant float4 *tables, uint id) {
+  PathVertexRecord record = vertices[id];
+  uint path = record.path;
+  float4 info = tables[path + 2];
+  uint flags = as_type<uint>(info.x);
+  PathRasterizationVertex out;
+  out.xy_position = record.xy_position;
+  out.st_position = record.st_position;
+  out.bounds = texel_bounds(tables[path]);
+  out.content_mask = load_content_mask(tables, record.content_mask);
+  out.color = load_background(tables, flags, path + 3, texel_hsla(tables[path + 1]));
+  return out;
 }

@@ -30,6 +30,7 @@ mod gradient;
 #[cfg(gpui_hot_reload)]
 mod hot_reload;
 mod input;
+mod instance_records;
 mod inspector;
 mod interactive;
 mod key_dispatch;
@@ -206,6 +207,7 @@ pub use refineable::*;
 pub use marks::*;
 pub use retained_shapes::*;
 pub use scene::*;
+pub use instance_records::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

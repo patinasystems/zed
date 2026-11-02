@@ -3,8 +3,10 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path,
-    Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropFilter, Bounds, DevicePixels, GpuSpecs, InstanceTables, Path,
+    PathRecord, PathVertexRecord, PolychromeSpriteRecord, PrimitiveBatch, QuadRecord, RebaseRecord,
+    ScaledPixels, Scene, ShadowRecord, Size, SpriteRecord, UnderlineRecord,
+    get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -107,15 +109,24 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug)]
-#[repr(C)]
-struct PathRasterizationVertex {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
-    content_mask: ContentMask<ScaledPixels>,
+/// Encoded records waiting for their scene's table to be written (whose first texel WebGL
+/// offsets their indices by), kept between frames for their capacity.
+#[derive(Default)]
+struct RecordScratch {
+    tables: InstanceTables,
+    quads: Vec<QuadRecord>,
+    shadows: Vec<ShadowRecord>,
+    underlines: Vec<UnderlineRecord>,
+    monochrome_sprites: Vec<SpriteRecord>,
+    subpixel_sprites: Vec<SpriteRecord>,
+    polychrome_sprites: Vec<PolychromeSpriteRecord>,
+    path_vertices: Vec<PathVertexRecord>,
+}
+
+fn rebase<R: RebaseRecord>(records: &mut [R], base: u32) {
+    for record in records {
+        record.rebase(base);
+    }
 }
 
 pub struct WgpuSurfaceConfig {
@@ -401,6 +412,11 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    /// The scene's record table ([`InstanceTables`]) at `@group(3)`, which its records index.
+    tables: InstanceBinding,
+    /// Each path's record in the table (offset like the other records' indices), which its
+    /// vertices share.
+    path_records: Vec<PathRecord>,
 }
 
 struct WgpuBindGroupLayouts {
@@ -482,6 +498,7 @@ struct WgpuRendererCore {
     max_instance_data_size: u64,
     instance_data_alignment: u64,
     uses_webgl_instance_data: bool,
+    records: RecordScratch,
     rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
@@ -1013,12 +1030,19 @@ impl WgpuRendererCore {
                                globals_layout: &wgpu::BindGroupLayout,
                                data_layout: &wgpu::BindGroupLayout,
                                texture_layout: Option<&wgpu::BindGroupLayout>,
+                               tables_layout: Option<&wgpu::BindGroupLayout>,
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32,
                                module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
+            if texture_layout.is_some() || tables_layout.is_some() {
+                bind_group_layouts.push(texture_layout);
+            }
+            // `@group(3)`: the scene's record table, for pipelines that draw records.
+            if tables_layout.is_some() {
+                bind_group_layouts.push(tables_layout);
+            }
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
@@ -1068,6 +1092,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.instances),
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1081,6 +1106,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1094,6 +1120,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleList,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1111,6 +1138,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1128,6 +1156,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1141,6 +1170,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1168,6 +1198,7 @@ impl WgpuRendererCore {
                 &layouts.globals,
                 &layouts.instances,
                 Some(&layouts.texture),
+                Some(&layouts.instances),
                 wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -1188,6 +1219,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1200,6 +1232,7 @@ impl WgpuRendererCore {
             "fs_surface",
             &layouts.globals,
             &layouts.surfaces,
+            None,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
@@ -1214,6 +1247,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.retained_uniforms),
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -1804,6 +1838,7 @@ impl WgpuRendererCore {
             max_instance_data_size,
             instance_data_alignment,
             uses_webgl_instance_data,
+            records: RecordScratch::default(),
             rendering_params,
             is_bgr: false,
             dual_source_blending,
@@ -2123,6 +2158,7 @@ impl WgpuRendererCore {
                     pass.set_bind_group(2, &frame.gradients.bind_group, &[]);
                     self.draw_instances(
                         &instance_bindings.quads,
+                        &instance_bindings.tables,
                         &self.resources().pipelines.quads,
                         instance_range(range),
                         pass,
@@ -2130,19 +2166,26 @@ impl WgpuRendererCore {
                 }
                 PrimitiveBatch::Shadows(range) => self.draw_instances(
                     &instance_bindings.shadows,
+                    &instance_bindings.tables,
                     &self.resources().pipelines.shadows,
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
+                    let paths = &scene.paths[range.clone()];
                     if paths.is_empty() {
                         continue;
                     }
 
                     pass = None;
-                    let rasterized =
-                        self.draw_paths_to_intermediate(encoder, paths, instance_offset, size)?;
+                    let rasterized = self.draw_paths_to_intermediate(
+                        encoder,
+                        paths,
+                        &instance_bindings.path_records[range],
+                        &instance_bindings.tables,
+                        instance_offset,
+                        size,
+                    )?;
                     if rasterized {
                         self.draw_paths_from_intermediate(
                             paths,
@@ -2153,6 +2196,7 @@ impl WgpuRendererCore {
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_instances(
                     &instance_bindings.underlines,
+                    &instance_bindings.tables,
                     &self.resources().pipelines.underlines,
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
@@ -2160,6 +2204,7 @@ impl WgpuRendererCore {
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                     self.draw_sprites(
                         &instance_bindings.monochrome_sprites,
+                        &instance_bindings.tables,
                         texture_id,
                         &self.resources().pipelines.mono_sprites,
                         instance_range(range),
@@ -2170,6 +2215,7 @@ impl WgpuRendererCore {
                     let resources = self.resources();
                     self.draw_sprites(
                         &instance_bindings.subpixel_sprites,
+                        &instance_bindings.tables,
                         texture_id,
                         resources
                             .pipelines
@@ -2183,6 +2229,7 @@ impl WgpuRendererCore {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_sprites(
                         &instance_bindings.polychrome_sprites,
+                        &instance_bindings.tables,
                         texture_id,
                         &self.resources().pipelines.poly_sprites,
                         instance_range(range),
@@ -2850,42 +2897,94 @@ impl WgpuRendererCore {
         pass.draw(0..4, 0..1);
     }
 
+    /// Writes `scene`'s record table, then its records, whose table indices WebGL offsets by
+    /// the table's first texel.
     fn write_instances(
         &mut self,
         scene: &Scene,
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
+        let mut records = std::mem::take(&mut self.records);
+        let result = self.write_scene_records(scene, instance_offset, &mut records);
+        self.records = records;
+        result
+    }
+
+    fn write_scene_records(
+        &mut self,
+        scene: &Scene,
+        instance_offset: &mut u64,
+        records: &mut RecordScratch,
+    ) -> Result<InstanceBindings> {
+        fn encode<P, R>(out: &mut Vec<R>, primitives: &[P], record: impl FnMut(&P) -> R) {
+            out.clear();
+            out.extend(primitives.iter().map(record));
+        }
+        let RecordScratch {
+            tables,
+            quads,
+            shadows,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            ..
+        } = records;
+        tables.clear();
+        encode(quads, &scene.quads, |quad| tables.quad(quad));
+        encode(shadows, &scene.shadows, |shadow| tables.shadow(shadow));
+        encode(underlines, &scene.underlines, |underline| {
+            tables.underline(underline)
+        });
+        encode(monochrome_sprites, &scene.monochrome_sprites, |sprite| {
+            tables.monochrome_sprite(sprite)
+        });
+        encode(subpixel_sprites, &scene.subpixel_sprites, |sprite| {
+            tables.subpixel_sprite(sprite)
+        });
+        encode(polychrome_sprites, &scene.polychrome_sprites, |sprite| {
+            tables.polychrome_sprite(sprite)
+        });
+        let mut path_records: Vec<PathRecord> =
+            scene.paths.iter().map(|path| tables.path(path)).collect();
+
+        let table_binding =
+            self.write_instance_binding("tables_bind_group", instance_offset, tables.texels())?;
+        if self.uses_webgl_instance_data {
+            let base = table_binding.first_instance;
+            rebase(quads, base);
+            rebase(shadows, base);
+            rebase(underlines, base);
+            rebase(monochrome_sprites, base);
+            rebase(subpixel_sprites, base);
+            rebase(polychrome_sprites, base);
+            rebase(&mut path_records, base);
+        }
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
+            quads: self.write_instance_binding("quads_bind_group", instance_offset, quads)?,
+            shadows: self.write_instance_binding("shadows_bind_group", instance_offset, shadows)?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
                 instance_offset,
-                &scene.underlines,
+                underlines,
             )?,
             monochrome_sprites: self.write_instance_binding(
                 "monochrome_sprites_bind_group",
                 instance_offset,
-                &scene.monochrome_sprites,
+                monochrome_sprites,
             )?,
             subpixel_sprites: self.write_instance_binding(
                 "subpixel_sprites_bind_group",
                 instance_offset,
-                &scene.subpixel_sprites,
+                subpixel_sprites,
             )?,
             polychrome_sprites: self.write_instance_binding(
                 "polychrome_sprites_bind_group",
                 instance_offset,
-                &scene.polychrome_sprites,
+                polychrome_sprites,
             )?,
+            tables: table_binding,
+            path_records,
         })
     }
 
@@ -2978,6 +3077,7 @@ impl WgpuRendererCore {
     fn draw_instances(
         &self,
         instances: &InstanceBinding,
+        tables: &InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
@@ -2988,6 +3088,7 @@ impl WgpuRendererCore {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.set_bind_group(3, &tables.bind_group, &[]);
         pass.draw(
             0..4,
             instances.first_instance + range.start..instances.first_instance + range.end,
@@ -2997,6 +3098,7 @@ impl WgpuRendererCore {
     fn draw_sprites(
         &self,
         sprite_instances: &InstanceBinding,
+        tables: &InstanceBinding,
         texture_id: AtlasTextureId,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
@@ -3015,6 +3117,7 @@ impl WgpuRendererCore {
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
+        pass.set_bind_group(3, &tables.bind_group, &[]);
         pass.draw(
             0..4,
             sprite_instances.first_instance + range.start
@@ -3070,30 +3173,27 @@ impl WgpuRendererCore {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        path_records: &[PathRecord],
+        tables: &InstanceBinding,
         instance_offset: &mut u64,
         size: Size<DevicePixels>,
     ) -> Result<bool> {
-        let mut vertices = Vec::new();
-        for path in paths {
-            let bounds = path.clipped_bounds();
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds,
-                content_mask: path.content_mask,
-            }));
+        let mut vertices = std::mem::take(&mut self.records.path_vertices);
+        vertices.clear();
+        for (path, &record) in paths.iter().zip(path_records) {
+            vertices.extend(InstanceTables::path_vertices(path, record));
         }
-
-        if vertices.is_empty() {
+        let vertex_count = vertices.len() as u32;
+        let vertex_binding = if vertices.is_empty() {
+            Ok(None)
+        } else {
+            self.write_instance_binding("path_rasterization_bind_group", instance_offset, &vertices)
+                .map(Some)
+        };
+        self.records.path_vertices = vertices;
+        let Some(vertex_binding) = vertex_binding? else {
             return Ok(false);
-        }
-
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
+        };
 
         let resources = self.resources();
         let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
@@ -3127,12 +3227,12 @@ impl WgpuRendererCore {
             pass.set_pipeline(&resources.pipelines.path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
+            pass.set_bind_group(3, &tables.bind_group, &[]);
             // The path rasterization shader loads records by vertex index
             // rather than instance index, so the allocation's base shifts the
             // vertex range here.
             pass.draw(
-                vertex_binding.first_instance
-                    ..vertex_binding.first_instance + vertices.len() as u32,
+                vertex_binding.first_instance..vertex_binding.first_instance + vertex_count,
                 0..1,
             );
         }
@@ -3949,9 +4049,8 @@ pub(crate) fn begin_load_pass<'a>(
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite,
-        PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, TransformationMatrix, Underline,
-        linear_color_stop, linear_gradient,
+        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, Point, Quad, Size,
+        TransformationMatrix, linear_color_stop, linear_gradient,
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
@@ -4930,18 +5029,17 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 46 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<QuadRecord>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<ShadowRecord>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PathVertexRecord>(), 6 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
+        assert_eq!(std::mem::size_of::<UnderlineRecord>(), 12 * 4);
+        assert_eq!(std::mem::size_of::<SpriteRecord>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSpriteRecord>(), 16 * 4);
     }
 
     #[test]
-    fn webgl_quad_layout_matches_fixed_decoder() {
+    fn webgl_quad_record_matches_fixed_decoder() {
         let quad = Quad {
             order: 41,
             border_style: BorderStyle::Dashed,
@@ -4971,6 +5069,16 @@ mod tests {
                     top_right: 91.0.into(),
                     bottom_right: 92.0.into(),
                     bottom_left: 93.0.into(),
+                },
+                rounded_bounds: Bounds {
+                    origin: Point {
+                        x: 94.0.into(),
+                        y: 95.0.into(),
+                    },
+                    size: Size {
+                        width: 96.0.into(),
+                        height: 97.0.into(),
+                    },
                 },
             },
             background: linear_gradient(
@@ -5026,67 +5134,56 @@ mod tests {
             corner_shapes: [0; 2],
         };
 
-        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };
+        let mut tables = InstanceTables::default();
+        let record = tables.quad(&quad);
+        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&record)) };
         let words: &[u32] = bytemuck::cast_slice(bytes);
+        let f = |value: f32| value.to_bits();
+        // Dashed, a linear gradient (tag 1), Oklab, a border and elliptical corners.
+        let flags = 1 | 1 << 1 | 1 << 4 | 1 << 5 | 1 << 6;
         assert_eq!(
             words,
             &[
-                41,
-                1,
-                1.0_f32.to_bits(),
-                2.0_f32.to_bits(),
-                3.0_f32.to_bits(),
-                4.0_f32.to_bits(),
-                5.0_f32.to_bits(),
-                6.0_f32.to_bits(),
-                7.0_f32.to_bits(),
-                8.0_f32.to_bits(),
-                90.0_f32.to_bits(),
-                91.0_f32.to_bits(),
-                92.0_f32.to_bits(),
-                93.0_f32.to_bits(),
-                1,
-                1,
+                f(1.0),
+                f(2.0),
+                f(3.0),
+                f(4.0),
+                f(26.0),
+                f(27.0),
+                f(28.0),
+                f(29.0),
                 0,
                 0,
                 0,
                 0,
-                11.0_f32.to_bits(),
-                12.0_f32.to_bits(),
-                13.0_f32.to_bits(),
-                14.0_f32.to_bits(),
-                15.0_f32.to_bits(),
-                16.0_f32.to_bits(),
-                17.0_f32.to_bits(),
-                18.0_f32.to_bits(),
-                19.0_f32.to_bits(),
-                20.0_f32.to_bits(),
-                21.0_f32.to_bits(),
-                0,
-                22.0_f32.to_bits(),
-                23.0_f32.to_bits(),
-                24.0_f32.to_bits(),
-                25.0_f32.to_bits(),
-                26.0_f32.to_bits(),
-                27.0_f32.to_bits(),
-                28.0_f32.to_bits(),
-                29.0_f32.to_bits(),
-                40.0_f32.to_bits(),
-                41.0_f32.to_bits(),
-                42.0_f32.to_bits(),
-                43.0_f32.to_bits(),
-                30.0_f32.to_bits(),
-                31.0_f32.to_bits(),
-                32.0_f32.to_bits(),
-                33.0_f32.to_bits(),
-                34.0_f32.to_bits(),
-                35.0_f32.to_bits(),
-                36.0_f32.to_bits(),
-                37.0_f32.to_bits(),
-                38.0_f32.to_bits(),
-                39.0_f32.to_bits(),
-                0,
-                0,
+                flags,
+                2,
+                5,
+                7,
+            ]
+        );
+        let texels: Vec<[u32; 4]> = tables
+            .texels()
+            .iter()
+            .map(|texel| texel.map(f32::to_bits))
+            .collect();
+        assert_eq!(
+            texels,
+            [
+                [f(1.0), 0, 0, f(1.0)],
+                [0, 0, 0, 0],
+                [f(5.0), f(6.0), f(7.0), f(8.0)],
+                [f(90.0), f(91.0), f(92.0), f(93.0)],
+                [f(94.0), f(95.0), f(96.0), f(97.0)],
+                [f(34.0), f(35.0), f(36.0), f(37.0)],
+                [f(38.0), f(39.0), 0, 0],
+                [f(30.0), f(31.0), f(32.0), f(33.0)],
+                [f(22.0), f(23.0), f(24.0), f(25.0)],
+                [f(40.0), f(41.0), f(42.0), f(43.0)],
+                [f(11.0), 0, f(15.0), 0],
+                [f(12.0), f(13.0), f(14.0), f(15.0)],
+                [f(17.0), f(18.0), f(19.0), f(20.0)],
+                [f(16.0), f(21.0), 0, 0],
             ]
         );
     }

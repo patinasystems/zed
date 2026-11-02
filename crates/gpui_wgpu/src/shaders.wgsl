@@ -114,6 +114,7 @@ struct Corners {
 struct ContentMask {
     bounds: Bounds,
     corner_radii: Corners,
+    rounded_bounds: Bounds,
 }
 
 struct Edges {
@@ -1682,7 +1683,8 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
-    // The content mask (`ContentMask`): bounds, then corner radii.
+    // The content mask's rounded rectangle (`ContentMask::rounded_bounds`), then its corner
+    // radii; the square clip is `clip_distances`.
     @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(4) @interpolate(flat) mask_radii: vec4<f32>,
 }
@@ -1698,7 +1700,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
-    out.mask_bounds = vec4<f32>(sprite.content_mask.bounds.origin, sprite.content_mask.bounds.size);
+    out.mask_bounds = vec4<f32>(sprite.content_mask.rounded_bounds.origin, sprite.content_mask.rounded_bounds.size);
     let r = sprite.content_mask.corner_radii;
     out.mask_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
     return out;
@@ -1717,6 +1719,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let mask = ContentMask(
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_radii.x, input.mask_radii.y, input.mask_radii.z, input.mask_radii.w),
+        Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
     );
     let clip_alpha = content_mask_alpha(input.position.xy, mask);
     return clip_output(blend_color(input.color, alpha_corrected), clip_alpha);
@@ -2150,15 +2153,15 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the clip distances; a square mask costs this
-// one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the clip distances';
+// a square mask costs this one test.
 fn content_mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     let r = mask.corner_radii;
     if (r.top_left <= 0.0 && r.top_right <= 0.0 && r.bottom_right <= 0.0 && r.bottom_left <= 0.0) {
         return 1.0;
     }
-    return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
 }
 
 // A fragment's color with its content mask coverage applied, in the target's alpha
@@ -2168,4 +2171,233 @@ fn clip_output(color: vec4<f32>, clip: f32) -> vec4<f32> {
         return color * clip;
     }
     return vec4<f32>(color.rgb, color.a * clip);
+}
+
+// --- instance records (`gpui::InstanceTables`) --- //
+// Renderers upload a compact record per primitive and one table of texels per scene: its
+// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
+// each primitive's aux record. The transports load records and table texels
+// (`load_*_record`, `load_table_texel`); `load_*` below expand them into the full layouts.
+
+struct QuadRecord {
+    bounds: Bounds,
+    corner_radii: Corners,
+    background: Hsla,
+    flags: u32,
+    content_mask: u32,
+    transformation: u32,
+    aux: u32,
+}
+
+struct ShadowRecord {
+    bounds: Bounds,
+    corner_radii: Corners,
+    color: Hsla,
+    element_bounds: Bounds,
+    element_corner_radii: Corners,
+    blur_radius: f32,
+    content_mask: u32,
+    transformation: u32,
+    // Bit 0: inset. Bits 1 and up: the vertical radii's texel, or 0.
+    info: u32,
+}
+
+struct UnderlineRecord {
+    bounds: Bounds,
+    color: Hsla,
+    thickness: f32,
+    wavy: u32,
+    content_mask: u32,
+    transformation: u32,
+}
+
+struct SpriteRecord {
+    tile_bounds: AtlasBounds,
+    bounds: Bounds,
+    color: Hsla,
+    content_mask: u32,
+    transformation: u32,
+    pad: vec2<u32>,
+}
+
+struct PolychromeSpriteRecord {
+    tile_bounds: AtlasBounds,
+    bounds: Bounds,
+    corner_radii: Corners,
+    opacity: f32,
+    content_mask: u32,
+    transformation: u32,
+    // Bit 0: exact scale. Bit 1: grayscale. Bits 2 and up: the vertical radii's texel, or 0.
+    info: u32,
+}
+
+struct PathVertexRecord {
+    xy_position: vec2<f32>,
+    st_position: vec2<f32>,
+    // The first texel of the path's record.
+    path: u32,
+    content_mask: u32,
+}
+
+// `gpui::QuadRecord::flags`.
+const QUAD_DASHED: u32 = 1u;
+const QUAD_BORDER: u32 = 32u;
+const QUAD_ELLIPTICAL: u32 = 64u;
+const QUAD_SHAPED: u32 = 128u;
+
+fn texel_bounds(texel: vec4<f32>) -> Bounds {
+    return Bounds(texel.xy, texel.zw);
+}
+
+fn texel_corners(texel: vec4<f32>) -> Corners {
+    return Corners(texel.x, texel.y, texel.z, texel.w);
+}
+
+fn texel_hsla(texel: vec4<f32>) -> Hsla {
+    return Hsla(texel.x, texel.y, texel.z, texel.w);
+}
+
+fn load_content_mask(index: u32) -> ContentMask {
+    return ContentMask(
+        texel_bounds(load_table_texel(index)),
+        texel_corners(load_table_texel(index + 1u)),
+        texel_bounds(load_table_texel(index + 2u)),
+    );
+}
+
+fn load_transformation(index: u32) -> TransformationMatrix {
+    let rotation_scale = load_table_texel(index);
+    let translation = load_table_texel(index + 1u);
+    return TransformationMatrix(
+        mat2x2<f32>(rotation_scale.xy, rotation_scale.zw),
+        translation.xy,
+    );
+}
+
+// A background from its tag and color space (`flags`, bits 1-3 and 4), its solid color and,
+// unless solid, its block at `block`: the angle or pattern height, the gradient record and the
+// gradient's opacity, then a linear gradient's two stops.
+fn load_background(flags: u32, block: u32, solid: Hsla) -> Background {
+    var background: Background;
+    background.tag = (flags >> 1u) & 7u;
+    background.color_space = (flags >> 4u) & 1u;
+    background.solid = solid;
+    if (background.tag != 0u) {
+        let head = load_table_texel(block);
+        background.gradient_angle_or_pattern_height = head.x;
+        background.gradient = bitcast<u32>(head.y);
+        background.colors[0].color.a = head.z;
+        if (background.tag == 1u) {
+            background.colors[0].color = texel_hsla(load_table_texel(block + 1u));
+            background.colors[1].color = texel_hsla(load_table_texel(block + 2u));
+            let percentages = load_table_texel(block + 3u);
+            background.colors[0].percentage = percentages.x;
+            background.colors[1].percentage = percentages.y;
+        }
+    }
+    return background;
+}
+
+fn load_quad(instance_id: u32) -> Quad {
+    let record = load_quad_record(instance_id);
+    var quad: Quad;
+    quad.border_style = record.flags & QUAD_DASHED;
+    quad.bounds = record.bounds;
+    quad.content_mask = load_content_mask(record.content_mask);
+    quad.corner_radii = record.corner_radii;
+    quad.corner_radii_y = record.corner_radii;
+    quad.transformation = load_transformation(record.transformation);
+    var aux = record.aux;
+    if ((record.flags & QUAD_BORDER) != 0u) {
+        let widths = load_table_texel(aux);
+        quad.border_widths = Edges(widths.x, widths.y, widths.z, widths.w);
+        quad.border_color = texel_hsla(load_table_texel(aux + 1u));
+        aux += 2u;
+    }
+    if ((record.flags & QUAD_ELLIPTICAL) != 0u) {
+        quad.corner_radii_y = texel_corners(load_table_texel(aux));
+        aux += 1u;
+    }
+    if ((record.flags & QUAD_SHAPED) != 0u) {
+        quad.corner_shapes = bitcast<vec2<u32>>(load_table_texel(aux).xy);
+        aux += 1u;
+    }
+    quad.background = load_background(record.flags, aux, record.background);
+    return quad;
+}
+
+fn load_shadow(instance_id: u32) -> Shadow {
+    let record = load_shadow_record(instance_id);
+    var shadow: Shadow;
+    shadow.blur_radius = record.blur_radius;
+    shadow.bounds = record.bounds;
+    shadow.corner_radii = record.corner_radii;
+    shadow.corner_radii_y = record.corner_radii;
+    shadow.content_mask = load_content_mask(record.content_mask);
+    shadow.color = record.color;
+    shadow.element_bounds = record.element_bounds;
+    shadow.element_corner_radii = record.element_corner_radii;
+    shadow.element_corner_radii_y = record.element_corner_radii;
+    shadow.inset = record.info & 1u;
+    let aux = record.info >> 1u;
+    if (aux != 0u) {
+        shadow.corner_radii_y = texel_corners(load_table_texel(aux));
+        shadow.element_corner_radii_y = texel_corners(load_table_texel(aux + 1u));
+    }
+    shadow.transformation = load_transformation(record.transformation);
+    return shadow;
+}
+
+fn load_underline(instance_id: u32) -> Underline {
+    let record = load_underline_record(instance_id);
+    var underline: Underline;
+    underline.bounds = record.bounds;
+    underline.content_mask = load_content_mask(record.content_mask);
+    underline.color = record.color;
+    underline.thickness = record.thickness;
+    underline.wavy = record.wavy;
+    underline.transformation = load_transformation(record.transformation);
+    return underline;
+}
+
+fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
+    let record = load_mono_sprite_record(instance_id);
+    var sprite: MonochromeSprite;
+    sprite.tile.bounds = record.tile_bounds;
+    sprite.bounds = record.bounds;
+    sprite.content_mask = load_content_mask(record.content_mask);
+    sprite.color = record.color;
+    sprite.transformation = load_transformation(record.transformation);
+    return sprite;
+}
+
+fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
+    let record = load_poly_sprite_record(instance_id);
+    var sprite: PolychromeSprite;
+    sprite.exact_scale = record.info & 1u;
+    sprite.tile.bounds = record.tile_bounds;
+    sprite.grayscale = (record.info >> 1u) & 1u;
+    sprite.opacity = record.opacity;
+    sprite.bounds = record.bounds;
+    sprite.content_mask = load_content_mask(record.content_mask);
+    sprite.corner_radii = record.corner_radii;
+    sprite.corner_radii_y = record.corner_radii;
+    let aux = record.info >> 2u;
+    if (aux != 0u) {
+        sprite.corner_radii_y = texel_corners(load_table_texel(aux));
+    }
+    sprite.transformation = load_transformation(record.transformation);
+    return sprite;
+}
+
+fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
+    let record = load_path_vertex_record(vertex_id);
+    let info = load_table_texel(record.path + 2u);
+    return PathRasterizationVertex(
+        record.xy_position,
+        record.st_position,
+        load_background(bitcast<u32>(info.x), record.path + 3u, texel_hsla(load_table_texel(record.path + 1u))),
+        texel_bounds(load_table_texel(record.path)),
+        load_content_mask(record.content_mask),
+    );
 }

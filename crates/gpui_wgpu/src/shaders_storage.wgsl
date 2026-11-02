@@ -5,23 +5,23 @@
 // All buffers share `@group(1) @binding(0)` because each pipeline binds only the
 // buffer its own entry points read.
 
-@group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
-@group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
-@group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
+@group(1) @binding(0) var<storage, read> b_quads: array<QuadRecord>;
+@group(1) @binding(0) var<storage, read> b_shadows: array<ShadowRecord>;
+@group(1) @binding(0) var<storage, read> b_path_vertices: array<PathVertexRecord>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
-@group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
-@group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
-@group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+@group(1) @binding(0) var<storage, read> b_underlines: array<UnderlineRecord>;
+@group(1) @binding(0) var<storage, read> b_mono_sprites: array<SpriteRecord>;
+@group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSpriteRecord>;
 
-fn load_quad(instance_id: u32) -> Quad {
+fn load_quad_record(instance_id: u32) -> QuadRecord {
     return b_quads[instance_id];
 }
 
-fn load_shadow(instance_id: u32) -> Shadow {
+fn load_shadow_record(instance_id: u32) -> ShadowRecord {
     return b_shadows[instance_id];
 }
 
-fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
+fn load_path_vertex_record(vertex_id: u32) -> PathVertexRecord {
     return b_path_vertices[vertex_id];
 }
 
@@ -29,16 +29,23 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
     return b_path_sprites[instance_id];
 }
 
-fn load_underline(instance_id: u32) -> Underline {
+fn load_underline_record(instance_id: u32) -> UnderlineRecord {
     return b_underlines[instance_id];
 }
 
-fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
+fn load_mono_sprite_record(instance_id: u32) -> SpriteRecord {
     return b_mono_sprites[instance_id];
 }
 
-fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
+fn load_poly_sprite_record(instance_id: u32) -> PolychromeSpriteRecord {
     return b_poly_sprites[instance_id];
+}
+
+// The scene's record table (`gpui::InstanceTables`), which the records index.
+@group(3) @binding(0) var<storage, read> b_tables: array<vec4<f32>>;
+
+fn load_table_texel(index: u32) -> vec4<f32> {
+    return b_tables[index];
 }
 
 @group(1) @binding(0) var<storage, read> b_retained_shapes: array<RetainedShape>;
