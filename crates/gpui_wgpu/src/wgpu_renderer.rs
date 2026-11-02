@@ -283,6 +283,9 @@ fn plan_path_atlas(
     if scene.paths.is_empty() {
         return plan;
     }
+    let max = max_texture_size.min(i32::MAX as u32) as i32;
+    // A larger target is not drawn (render_frame and draw_group refuse it).
+    let viewport = [viewport[0].min(max), viewport[1].min(max)];
     let mut batches: Vec<Vec<(PixelRect, Vec<usize>)>> = Vec::new();
     let mut touched = Vec::new();
     for batch in scene.batches() {
@@ -297,7 +300,6 @@ fn plan_path_atlas(
             batches.push(path_regions(&touched));
         }
     }
-    let max = max_texture_size.min(i32::MAX as u32) as i32;
     let rects = || batches.iter().flatten().map(|(rect, _)| rect);
     let area: f64 = rects()
         .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
@@ -312,7 +314,7 @@ fn plan_path_atlas(
     let finish_chunk = |plan: &mut PathAtlasPlan, packer: &ShelfPacker, start: usize| {
         let height =
             ((packer.height().max(1) as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
-        let size = size(DevicePixels(width), DevicePixels(height));
+        let size = size(DevicePixels(packer.width), DevicePixels(height));
         plan.chunks.push((size, start..plan.batches.len()));
     };
     let mut packer = ShelfPacker::new(width, max);
@@ -328,15 +330,35 @@ fn plan_path_atlas(
         }
         if places.is_none() {
             // Regions that together do not fit an empty atlas copy their union, which
-            // is within the target, so it fits.
+            // is within the target, so it fits a chunk at least as wide as it.
             let union = rects.iter().copied().reduce(|a, b| a.union(&b));
             let mut indices: Vec<usize> = regions.drain(..).flat_map(|(_, i)| i).collect();
             indices.sort_unstable();
             regions.extend(union.map(|union| (union, indices)));
             rects = regions.iter().map(|(rect, _)| *rect).collect();
+            let wide = rects.iter().map(PixelRect::width).max().unwrap_or(0);
+            if wide > packer.width {
+                if !packer.is_empty() {
+                    finish_chunk(&mut plan, &packer, chunk_start);
+                    chunk_start = plan.batches.len();
+                }
+                let chunk_width =
+                    ((wide as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
+                packer = ShelfPacker::new(chunk_width, max);
+            }
             places = packer.place_all(&rects);
         }
-        let places = places.unwrap_or_default();
+        // Each region is within the target, clamped to the largest texture, so the
+        // union fits; a batch that still does not draws nothing rather than elsewhere.
+        let Some(places) = places else {
+            log::error!("path batch regions {rects:?} do not fit a {max} px atlas; not drawn");
+            plan.batches.push(PlannedPathBatch {
+                chunk: plan.chunks.len(),
+                paths: Vec::new(),
+                sprites: Vec::new(),
+            });
+            continue;
+        };
         let mut paths = Vec::new();
         let mut sprites = Vec::with_capacity(regions.len());
         for ((rect, indices), (x, y)) in regions.iter().zip(places) {
@@ -4605,7 +4627,7 @@ mod tests {
     /// region placed once, within its chunk.
     #[test]
     fn path_atlas_plan_packs_regions_into_chunks() {
-        let full = scaled_bounds(0., 0., 400., 400.);
+        let full = scaled_bounds(0., 0., 256., 256.);
         let mut scene = Scene::default();
         for i in 0..6 {
             // A quad over everything between each path splits the paths into six batches.
@@ -4614,18 +4636,18 @@ mod tests {
                 content_mask: ContentMask::from(full),
                 ..Default::default()
             });
-            let x = 10. + 60. * i as f32;
-            scene.insert_primitive(rect_path(x, 10., x + 50., 110., gpui::red(), full));
+            let x = 10. + 25. * i as f32;
+            scene.insert_primitive(rect_path(x, 10., x + 100., 110., gpui::red(), full));
         }
         scene.finish();
         let mut tables = InstanceTables::default();
         let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
-        // Room for two 50 × 100 regions per 128 × 128 atlas... at most.
-        let plan = plan_path_atlas(&scene, [400, 400], 128, &mut tables, &records);
+        // Four 100 × 100 regions fit a 256 × 256 atlas.
+        let plan = plan_path_atlas(&scene, [256, 256], 256, &mut tables, &records);
         assert_eq!(plan.batches.len(), 6);
-        assert!(plan.chunks.len() >= 3, "{} chunks", plan.chunks.len());
+        assert!(plan.chunks.len() >= 2, "{} chunks", plan.chunks.len());
         for (chunk, (size, batches)) in plan.chunks.iter().enumerate() {
-            assert!(size.width.0 <= 128 && size.height.0 <= 128, "{size:?}");
+            assert!(size.width.0 <= 256 && size.height.0 <= 256, "{size:?}");
             let mut placed = Vec::new();
             for batch in &plan.batches[batches.clone()] {
                 assert_eq!(batch.chunk, chunk);
@@ -4644,6 +4666,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A batch whose regions do not fit an empty chunk copies their union, in a chunk
+    /// as wide as the union (wider than the atlas planned for the scene's regions).
+    #[test]
+    fn path_atlas_plan_widens_a_chunk_for_a_union() {
+        let full = scaled_bounds(0., 0., 256., 256.);
+        let mut scene = Scene::default();
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(0., 0., 16., 228., gpui::red(), full));
+        scene.insert_primitive(rect_path(130., 0., 252., 32., gpui::red(), full));
+        scene.pop_layer();
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        let plan = plan_path_atlas(&scene, [256, 256], 256, &mut tables, &records);
+        assert_eq!(plan.batches.len(), 1);
+        let batch = &plan.batches[0];
+        assert_eq!(batch.paths, [0, 1]);
+        assert_eq!(batch.sprites.len(), 1);
+        assert_eq!(batch.sprites[0].bounds.size.width.0, 252.);
+        let (size, _) = plan.chunks[batch.chunk];
+        assert!(size.width.0 >= 252 && size.width.0 <= 256, "{size:?}");
     }
 
     /// Paths rasterize in the atlas and draw back where they belong: translucent paths of
