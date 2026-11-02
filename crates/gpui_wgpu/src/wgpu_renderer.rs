@@ -142,18 +142,153 @@ pub struct WgpuSurfaceConfig {
 }
 
 struct WgpuPipelines {
-    quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
+    quads: MaskPipelines,
+    shadows: MaskPipelines,
+    path_rasterization: MaskPipelines,
     paths: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
-    mono_sprites: wgpu::RenderPipeline,
-    subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
+    underlines: MaskPipelines,
+    mono_sprites: MaskPipelines,
+    subpixel_sprites: Option<MaskPipelines>,
+    poly_sprites: MaskPipelines,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     retained_shapes: wgpu::RenderPipeline,
     backdrop: BackdropPipelines,
+}
+
+impl WgpuPipelines {
+    fn mask_pipelines(&self) -> impl Iterator<Item = &MaskPipelines> {
+        [
+            &self.quads,
+            &self.shadows,
+            &self.path_rasterization,
+            &self.underlines,
+            &self.mono_sprites,
+            &self.poly_sprites,
+        ]
+        .into_iter()
+        .chain(self.subpixel_sprites.as_ref())
+    }
+
+    /// Makes the elliptical-mask variants on a background thread, so the first scene with an
+    /// elliptical mask does not compile them.
+    #[cfg(not(target_family = "wasm"))]
+    fn prewarm(&self) {
+        let jobs: Vec<_> = self
+            .mask_pipelines()
+            .map(|pipelines| (pipelines.spec.clone(), pipelines.elliptical.clone()))
+            .collect();
+        let spawned = std::thread::Builder::new()
+            .name("gpui-wgpu-pipeline-prewarm".into())
+            .spawn(move || {
+                for (spec, elliptical) in jobs {
+                    elliptical.get_or_init(|| spec.build(Some(true)));
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not start the pipeline prewarm thread: {error}");
+        }
+    }
+
+    /// The web has no threads here: the elliptical variants are made at first use.
+    #[cfg(target_family = "wasm")]
+    fn prewarm(&self) {}
+}
+
+/// What a render pipeline is made from, kept so its elliptical-mask variant can be made later
+/// (on the prewarm thread, or at first use where there are no threads).
+#[derive(Clone)]
+struct PipelineSpec {
+    device: wgpu::Device,
+    name: String,
+    layout: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
+    vs_entry: &'static str,
+    fs_entry: &'static str,
+    topology: wgpu::PrimitiveTopology,
+    targets: Vec<Option<wgpu::ColorTargetState>>,
+    sample_count: u32,
+}
+
+impl PipelineSpec {
+    /// The pipeline, with `ELLIPTICAL_MASKS` set to `elliptical_masks` when given (the shader's
+    /// default, true, otherwise).
+    fn build(&self, elliptical_masks: Option<bool>) -> wgpu::RenderPipeline {
+        let constants: &[(&str, f64)] = match elliptical_masks {
+            Some(true) => &[("ELLIPTICAL_MASKS", 1.0)],
+            Some(false) => &[("ELLIPTICAL_MASKS", 0.0)],
+            None => &[],
+        };
+        let compilation_options =
+            wgpu::PipelineCompilationOptions { constants, ..wgpu::PipelineCompilationOptions::default() };
+        let label = match elliptical_masks {
+            Some(true) => format!("{}_elliptical", self.name),
+            _ => self.name.clone(),
+        };
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&label),
+            layout: Some(&self.layout),
+            vertex: wgpu::VertexState {
+                module: &self.module,
+                entry_point: Some(self.vs_entry),
+                buffers: &[],
+                compilation_options: compilation_options.clone(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.module,
+                entry_point: Some(self.fs_entry),
+                targets: &self.targets,
+                compilation_options,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: self.topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: self.sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+}
+
+/// A pipeline that reads content masks, specialized on `ELLIPTICAL_MASKS` (`shaders.wgsl`):
+/// most scenes have no elliptical mask and draw with code that has no elliptical path. The
+/// elliptical variant is made on a background thread after startup where there are threads
+/// ([`WgpuPipelines::prewarm`]), so the first scene with one waits only if it is not ready yet,
+/// and at first use on the web.
+struct MaskPipelines {
+    circular: wgpu::RenderPipeline,
+    elliptical: Arc<std::sync::OnceLock<wgpu::RenderPipeline>>,
+    spec: PipelineSpec,
+}
+
+impl MaskPipelines {
+    fn new(spec: PipelineSpec) -> Self {
+        Self {
+            circular: spec.build(Some(false)),
+            elliptical: Arc::default(),
+            spec,
+        }
+    }
+
+    /// The variant for a scene that has (`elliptical_masks`) or lacks elliptical masks.
+    fn get(&self, elliptical_masks: bool) -> &wgpu::RenderPipeline {
+        if elliptical_masks {
+            self.elliptical.get_or_init(|| self.spec.build(Some(true)))
+        } else {
+            &self.circular
+        }
+    }
 }
 
 /// Backdrop filter passes (`shaders_backdrop.wgsl`).
@@ -417,6 +552,9 @@ struct InstanceBindings {
     /// Each path's record in the table (offset like the other records' indices), which its
     /// vertices share.
     path_records: Vec<PathRecord>,
+    /// Whether any primitive has an elliptical content mask: the scene draws with the
+    /// elliptical variants of [`MaskPipelines`].
+    elliptical_masks: bool,
 }
 
 struct WgpuBindGroupLayouts {
@@ -1024,17 +1162,17 @@ impl WgpuRendererCore {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               texture_layout: Option<&wgpu::BindGroupLayout>,
-                               tables_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
+        let create_spec = |name: &str,
+                           vs_entry: &'static str,
+                           fs_entry: &'static str,
+                           globals_layout: &wgpu::BindGroupLayout,
+                           data_layout: &wgpu::BindGroupLayout,
+                           texture_layout: Option<&wgpu::BindGroupLayout>,
+                           tables_layout: Option<&wgpu::BindGroupLayout>,
+                           topology: wgpu::PrimitiveTopology,
+                           color_targets: &[Option<wgpu::ColorTargetState>],
+                           sample_count: u32,
+                           module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             if texture_layout.is_some() || tables_layout.is_some() {
                 bind_group_layouts.push(texture_layout);
@@ -1043,49 +1181,79 @@ impl WgpuRendererCore {
             if tables_layout.is_some() {
                 bind_group_layouts.push(tables_layout);
             }
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
                 immediate_size: 0,
             });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
+            PipelineSpec {
+                device: device.clone(),
+                name: name.to_string(),
+                layout,
+                module: module.clone(),
+                vs_entry,
+                fs_entry,
+                topology,
+                targets: color_targets.to_vec(),
+                sample_count,
+            }
+        };
+        // Pipelines that read no content mask take the shader's default.
+        let create_pipeline = |name: &str,
+                               vs_entry: &'static str,
+                               fs_entry: &'static str,
+                               globals_layout: &wgpu::BindGroupLayout,
+                               data_layout: &wgpu::BindGroupLayout,
+                               texture_layout: Option<&wgpu::BindGroupLayout>,
+                               tables_layout: Option<&wgpu::BindGroupLayout>,
+                               topology: wgpu::PrimitiveTopology,
+                               color_targets: &[Option<wgpu::ColorTargetState>],
+                               sample_count: u32,
+                               module: &wgpu::ShaderModule| {
+            create_spec(
+                name,
+                vs_entry,
+                fs_entry,
+                globals_layout,
+                data_layout,
+                texture_layout,
+                tables_layout,
+                topology,
+                color_targets,
+                sample_count,
+                module,
+            )
+            .build(None)
+        };
+        // Pipelines that read content masks: a circular variant now, an elliptical one later.
+        let create_mask_pipelines = |name: &str,
+                                     vs_entry: &'static str,
+                                     fs_entry: &'static str,
+                                     globals_layout: &wgpu::BindGroupLayout,
+                                     data_layout: &wgpu::BindGroupLayout,
+                                     texture_layout: Option<&wgpu::BindGroupLayout>,
+                                     tables_layout: Option<&wgpu::BindGroupLayout>,
+                                     topology: wgpu::PrimitiveTopology,
+                                     color_targets: &[Option<wgpu::ColorTargetState>],
+                                     sample_count: u32,
+                                     module: &wgpu::ShaderModule| {
+            MaskPipelines::new(create_spec(
+                name,
+                vs_entry,
+                fs_entry,
+                globals_layout,
+                data_layout,
+                texture_layout,
+                tables_layout,
+                topology,
+                color_targets,
+                sample_count,
+                module,
+            ))
         };
 
         // `@group(2)` holds the frame's gradient records, bound like instance data.
-        let quads = create_pipeline(
+        let quads = create_mask_pipelines(
             "quads",
             "vs_quad",
             "fs_quad",
@@ -1099,7 +1267,7 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let shadows = create_pipeline(
+        let shadows = create_mask_pipelines(
             "shadows",
             "vs_shadow",
             "fs_shadow",
@@ -1113,7 +1281,7 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let path_rasterization = create_pipeline(
+        let path_rasterization = create_mask_pipelines(
             "path_rasterization",
             "vs_path_rasterization",
             "fs_path_rasterization",
@@ -1149,7 +1317,7 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let underlines = create_pipeline(
+        let underlines = create_mask_pipelines(
             "underlines",
             "vs_underline",
             "fs_underline",
@@ -1163,7 +1331,7 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let mono_sprites = create_pipeline(
+        let mono_sprites = create_mask_pipelines(
             "mono_sprites",
             "vs_mono_sprite",
             "fs_mono_sprite",
@@ -1191,7 +1359,7 @@ impl WgpuRendererCore {
                 },
             };
 
-            Some(create_pipeline(
+            Some(create_mask_pipelines(
                 "subpixel_sprites",
                 "vs_subpixel_sprite",
                 "fs_subpixel_sprite",
@@ -1212,7 +1380,7 @@ impl WgpuRendererCore {
             None
         };
 
-        let poly_sprites = create_pipeline(
+        let poly_sprites = create_mask_pipelines(
             "poly_sprites",
             "vs_poly_sprite",
             "fs_poly_sprite",
@@ -1256,7 +1424,7 @@ impl WgpuRendererCore {
 
         let backdrop = Self::create_backdrop_pipelines(device, &layouts.texture, surface_format);
 
-        WgpuPipelines {
+        let pipelines = WgpuPipelines {
             backdrop,
             retained_shapes,
             quads,
@@ -1268,7 +1436,9 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
-        }
+        };
+        pipelines.prewarm();
+        pipelines
     }
 
     fn create_backdrop_pipelines(
@@ -2159,7 +2329,7 @@ impl WgpuRendererCore {
                     self.draw_instances(
                         &instance_bindings.quads,
                         &instance_bindings.tables,
-                        &self.resources().pipelines.quads,
+                        self.resources().pipelines.quads.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         pass,
                     )
@@ -2167,7 +2337,7 @@ impl WgpuRendererCore {
                 PrimitiveBatch::Shadows(range) => self.draw_instances(
                     &instance_bindings.shadows,
                     &instance_bindings.tables,
-                    &self.resources().pipelines.shadows,
+                    self.resources().pipelines.shadows.get(instance_bindings.elliptical_masks),
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
@@ -2183,6 +2353,7 @@ impl WgpuRendererCore {
                         paths,
                         &instance_bindings.path_records[range],
                         &instance_bindings.tables,
+                        instance_bindings.elliptical_masks,
                         instance_offset,
                         size,
                     )?;
@@ -2197,7 +2368,7 @@ impl WgpuRendererCore {
                 PrimitiveBatch::Underlines(range) => self.draw_instances(
                     &instance_bindings.underlines,
                     &instance_bindings.tables,
-                    &self.resources().pipelines.underlines,
+                    self.resources().pipelines.underlines.get(instance_bindings.elliptical_masks),
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
@@ -2206,7 +2377,7 @@ impl WgpuRendererCore {
                         &instance_bindings.monochrome_sprites,
                         &instance_bindings.tables,
                         texture_id,
-                        &self.resources().pipelines.mono_sprites,
+                        self.resources().pipelines.mono_sprites.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2221,7 +2392,8 @@ impl WgpuRendererCore {
                             .pipelines
                             .subpixel_sprites
                             .as_ref()
-                            .unwrap_or(&resources.pipelines.mono_sprites),
+                            .unwrap_or(&resources.pipelines.mono_sprites)
+                            .get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2231,7 +2403,7 @@ impl WgpuRendererCore {
                         &instance_bindings.polychrome_sprites,
                         &instance_bindings.tables,
                         texture_id,
-                        &self.resources().pipelines.poly_sprites,
+                        self.resources().pipelines.poly_sprites.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2999,6 +3171,13 @@ impl WgpuRendererCore {
             )?,
             tables: table_binding,
             path_records,
+            // Quads uploaded whole carry their masks outside the table.
+            elliptical_masks: tables.has_elliptical_masks()
+                || (!webgl
+                    && scene
+                        .quads
+                        .iter()
+                        .any(|quad| quad.content_mask.corner_radii_y != gpui::Corners::default())),
         })
     }
 
@@ -3189,6 +3368,7 @@ impl WgpuRendererCore {
         paths: &[Path<ScaledPixels>],
         path_records: &[PathRecord],
         tables: &InstanceBinding,
+        elliptical_masks: bool,
         instance_offset: &mut u64,
         size: Size<DevicePixels>,
     ) -> Result<bool> {
@@ -3238,7 +3418,7 @@ impl WgpuRendererCore {
 
             // The target may be smaller than the intermediate texture (a group's image).
             pass.set_viewport(0., 0., size.width.0 as f32, size.height.0 as f32, 0., 1.);
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_pipeline(resources.pipelines.path_rasterization.get(elliptical_masks));
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
             pass.set_bind_group(3, &tables.bind_group, &[]);
@@ -4559,6 +4739,49 @@ mod tests {
             image.save(std::path::Path::new(&dir).join("elliptical_corners_wgpu.png"))?;
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        Ok(())
+    }
+
+    /// A quad clipped by an elliptical content mask (10 px wide, 40 px tall corners) draws with
+    /// the elliptical pipeline variant, though quads upload whole and their masks are not in the
+    /// record table; the same quad under a circular mask draws with the circular variant.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn quads_under_elliptical_masks_use_the_elliptical_variant() -> anyhow::Result<()> {
+        use gpui::{ContentMask, Corners, DevicePixels, PlatformHeadlessRenderer, Quad, ScaledPixels};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let bounds = Bounds::new(gpui::point(ScaledPixels(0.), ScaledPixels(0.)), gpui::size(ScaledPixels(100.), ScaledPixels(100.)));
+        let scene = |mask: ContentMask<ScaledPixels>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: mask,
+                background: gpui::Hsla { h: 0., s: 0., l: 1., a: 1. }.into(),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let size = Size { width: DevicePixels(100), height: DevicePixels(100) };
+        let alpha_at = |renderer: &mut WgpuHeadlessRenderer, mask| -> anyhow::Result<u8> {
+            let image = renderer.render_scene_to_image(&scene(mask), size)?;
+            assert_eq!(image.get_pixel(50, 50).0[3], 255, "the quad's middle is drawn");
+            // Inside a 10 px circular corner, outside a 10 x 40 px elliptical one.
+            Ok(image.get_pixel(2, 8).0[3])
+        };
+        let circular = alpha_at(&mut renderer, ContentMask::rounded(bounds, Corners::all(ScaledPixels(10.))))?;
+        let elliptical = alpha_at(
+            &mut renderer,
+            ContentMask::<ScaledPixels>::elliptical(bounds, Corners::all(ScaledPixels(10.)), Corners::all(ScaledPixels(40.))),
+        )?;
+        assert!(circular > 192, "circular corner covers (2, 8): {circular}");
+        assert!(elliptical < 64, "elliptical corner leaves (2, 8) out: {elliptical}");
         Ok(())
     }
 

@@ -97,6 +97,10 @@ struct GammaParams {
 @group(2) @binding(1) var s_sprite: sampler;
 
 const M_PI_F: f32 = 3.1415926;
+// Whether a pipeline may meet elliptical content masks (`corner_radii_y`). Each pipeline that
+// reads masks is made twice: most scenes draw with the variant where this is false, whose code
+// has no elliptical path; a scene with an elliptical mask uses the one where it is true.
+override ELLIPTICAL_MASKS: bool = true;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
 struct Bounds {
@@ -2176,7 +2180,8 @@ fn content_mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
         return 1.0;
     }
     let y = mask.corner_radii_y;
-    if (y.top_left <= 0.0 && y.top_right <= 0.0 && y.bottom_right <= 0.0 && y.bottom_left <= 0.0) {
+    if (!ELLIPTICAL_MASKS
+        || (y.top_left <= 0.0 && y.top_right <= 0.0 && y.bottom_right <= 0.0 && y.bottom_left <= 0.0)) {
         return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
     }
     // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
@@ -2285,9 +2290,9 @@ fn texel_hsla(texel: vec4<f32>) -> Hsla {
 
 fn load_content_mask(index: u32) -> ContentMask {
     let at = index & 0x7fffffffu;
-    // A circular mask has no fourth texel (`MASK_ELLIPTICAL`).
+    // A circular mask has no fourth texel (`MASK_ELLIPTICAL`); circular pipelines compile it out.
     var radii_y = vec4<f32>(0.0);
-    if (index & 0x80000000u) != 0u {
+    if ELLIPTICAL_MASKS && (index & 0x80000000u) != 0u {
         radii_y = load_table_texel(at + 3u);
     }
     return ContentMask(
