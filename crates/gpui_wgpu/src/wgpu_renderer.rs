@@ -5267,6 +5267,47 @@ mod tests {
             .expect("shader should validate");
     }
 
+    /// The WebGL shaders take `ELLIPTICAL_MASKS` either way through the GLSL ES 3.00 writer
+    /// wgpu's GL backend uses, for the stages that read content masks.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn webgl_shaders_specialize_on_elliptical_masks() {
+        use naga::back::glsl;
+        let module = naga::front::wgsl::parse_str(WEBGL_SHADERS).expect("shader should parse");
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+            .validate(&module)
+            .expect("shader should validate");
+        let entries = [
+            ("vs_quad", naga::ShaderStage::Vertex),
+            ("fs_quad", naga::ShaderStage::Fragment),
+            ("vs_mono_sprite", naga::ShaderStage::Vertex),
+            ("fs_mono_sprite", naga::ShaderStage::Fragment),
+            ("fs_underline", naga::ShaderStage::Fragment),
+        ];
+        for elliptical_masks in [0.0, 1.0] {
+            let mut constants = naga::back::PipelineConstants::default();
+            constants.insert("ELLIPTICAL_MASKS".to_string(), elliptical_masks);
+            for (entry_point, stage) in entries {
+                let (module, info) =
+                    naga::back::pipeline_constants::process_overrides(&module, &info, Some((stage, entry_point)), &constants)
+                        .expect("overrides should apply");
+                let options = glsl::Options {
+                    version: glsl::Version::Embedded { version: 300, is_webgl: true },
+                    ..Default::default()
+                };
+                let pipeline_options = glsl::PipelineOptions {
+                    shader_stage: stage,
+                    entry_point: entry_point.to_string(),
+                    multiview: None,
+                };
+                let mut out = String::new();
+                glsl::Writer::new(&mut out, &module, &info, &options, &pipeline_options, Default::default())
+                    .and_then(|mut writer| writer.write())
+                    .unwrap_or_else(|error| panic!("{entry_point} with ELLIPTICAL_MASKS = {elliptical_masks}: {error}"));
+            }
+        }
+    }
+
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<QuadRecord>(), 16 * 4);

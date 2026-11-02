@@ -59,6 +59,8 @@ wgpu = { workspace = true, features = ["webgl"] }
 
 [dev-dependencies]
 criterion.workspace = true
+# Writes the WebGL shaders as GLSL ES, as wgpu's GL backend does, in tests.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "3b3506ea31154edc04de64debda0e780cba2639c", features = ["wgsl-in", "glsl-out"] }
 gpui = { workspace = true, features = ["bench-support"] }
 image.workspace = true
 
