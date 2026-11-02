@@ -471,6 +471,27 @@ impl WgpuResources {
     }
 }
 
+/// What [`WgpuRendererCore::warm_pipelines`] draws first: a primitive for each program a
+/// page may first use mid-session. A path draws the path rasterization program into the
+/// path intermediate and the path sprite program into the frame (quads, shadows, sprites
+/// and retained shapes are in nearly every first frame). A two-pixel triangle at the origin.
+fn warm_scene() -> Scene {
+    let corner = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    let mut path = Path::new(corner(0., 0.));
+    path.line_to(corner(2., 0.));
+    path.line_to(corner(0., 2.));
+    path.color = gpui::black().into();
+    let mut path = path.scale(1.);
+    path.content_mask = ContentMask {
+        bounds: path.bounds,
+        ..Default::default()
+    };
+    let mut scene = Scene::default();
+    scene.insert_primitive(path);
+    scene.finish();
+    scene
+}
+
 struct WgpuRendererCore {
     resources: WgpuResources,
     /// Pipelines of custom shaders (`gpui::Shader`).
@@ -490,6 +511,12 @@ struct WgpuRendererCore {
     max_texture_size: u32,
     /// The frame's `GlobalParams::premultiplied_alpha`, for group globals.
     premultiplied_alpha: bool,
+    /// Whether the next frame first draws [`warm_scene`] (GL only, WebGL included): a GL
+    /// driver compiles a program for the state it draws in at its first draw, not when
+    /// wgpu links it, and a software one (SwiftShader, llvmpipe) takes 100–400 ms for the
+    /// path rasterization program. Without the warm frame that cost lands on the first
+    /// frame that paints a path, mid-interaction.
+    warm_pipelines: bool,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1807,6 +1834,7 @@ impl WgpuRendererCore {
             rendering_params,
             is_bgr: false,
             dual_source_blending,
+            warm_pipelines: context.adapter.get_info().backend == wgpu::Backend::Gl,
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
@@ -1913,6 +1941,13 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
+        if std::mem::take(&mut self.warm_pipelines) {
+            // Into the frame's own targets, so each program compiles for the state it draws
+            // in; the frame's clear then covers it.
+            if let Err(error) = self.record_frame(&warm_scene(), target_view, size, clear_color) {
+                warn!("pipeline warm-up frame failed: {error:#}");
+            }
+        }
         self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
