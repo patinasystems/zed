@@ -3,6 +3,13 @@
 
 using namespace metal;
 
+// Whether the scene has elliptical content masks (`InstanceTables::has_elliptical_masks`): the
+// renderer specializes the pipelines that read masks both ways, so a scene of circular and
+// rectangular clips runs code with no elliptical path.
+constant bool elliptical_masks_constant [[function_constant(0)]];
+constant bool ELLIPTICAL_MASKS =
+    is_function_constant_defined(elliptical_masks_constant) && elliptical_masks_constant;
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -2480,7 +2487,8 @@ float content_mask_alpha(float2 position, ContentMask_ScaledPixels mask) {
     return 1.;
   }
   Corners_ScaledPixels y = mask.corner_radii_y;
-  if (y.top_left <= 0. && y.top_right <= 0. && y.bottom_right <= 0. && y.bottom_left <= 0.) {
+  if (!ELLIPTICAL_MASKS ||
+      (y.top_left <= 0. && y.top_right <= 0. && y.bottom_right <= 0. && y.bottom_left <= 0.)) {
     return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
   }
   // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
@@ -2537,8 +2545,9 @@ ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) 
     mask.corner_radii = texel_corners(float4(0.));
     mask.rounded_bounds = mask.bounds;
   }
-  mask.corner_radii_y = (index & 0x80000000u) != 0 ? texel_corners(tables[at + 3])
-                                                   : texel_corners(float4(0.));
+  mask.corner_radii_y = ELLIPTICAL_MASKS && (index & 0x80000000u) != 0
+                            ? texel_corners(tables[at + 3])
+                            : texel_corners(float4(0.));
   return mask;
 }
 

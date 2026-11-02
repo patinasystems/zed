@@ -140,6 +140,16 @@ impl PipelineCache {
         pipeline
     }
 
+    /// The pipeline for `descriptor`, made the first time it is drawn with: one most renderers
+    /// never use (a specialization), so it is compiled only when needed, archive or not.
+    pub(crate) fn build_deferred(&self, descriptor: &RenderPipelineDescriptorRef) -> Pipeline {
+        let shared = &self.shared;
+        if shared.path.is_some() {
+            shared.descriptors.borrow_mut().push(descriptor.to_owned());
+        }
+        Pipeline { state: OnceCell::new(), descriptor: Some(descriptor.to_owned()), shared: shared.clone() }
+    }
+
     /// Writes the archive when a pipeline was missing from it. Failures are logged: the next
     /// launch compiles again.
     pub(crate) fn finish(self) {

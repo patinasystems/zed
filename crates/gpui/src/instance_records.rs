@@ -229,6 +229,7 @@ pub struct InstanceTables {
     masks: FxHashMap<[u32; 16], u32>,
     last_mask: Option<([u32; 16], u32)>,
     transforms: FxHashMap<[u32; 6], u32>,
+    elliptical_masks: bool,
 }
 
 impl Default for InstanceTables {
@@ -238,6 +239,7 @@ impl Default for InstanceTables {
             masks: FxHashMap::default(),
             last_mask: None,
             transforms: FxHashMap::default(),
+            elliptical_masks: false,
         };
         tables.clear();
         tables
@@ -313,12 +315,19 @@ impl InstanceTables {
         &self.texels
     }
 
+    /// Whether a mask in the table has elliptical corners ([`MASK_ELLIPTICAL`]): renderers draw
+    /// a scene without any with shaders that have no elliptical path.
+    pub fn has_elliptical_masks(&self) -> bool {
+        self.elliptical_masks
+    }
+
     /// Empties the table for another scene.
     pub fn clear(&mut self) {
         self.texels.clear();
         self.masks.clear();
         self.last_mask = None;
         self.transforms.clear();
+        self.elliptical_masks = false;
         // The identity transformation, at texel 0.
         self.texels.push([1., 0., 0., 1.]);
         self.texels.push([0.; 4]);
@@ -351,6 +360,7 @@ impl InstanceTables {
                 ]);
             }
             if elliptical {
+                self.elliptical_masks = true;
                 self.texels.push(corners_texel(&mask.corner_radii_y));
             }
         }
@@ -720,11 +730,25 @@ mod tests {
         let rounded = ContentMask::rounded(rect(0., 0., 100., 100.), Corners::all(sp(8.)));
         let index = tables.content_mask(&rounded);
         assert_eq!(index, 2 | MASK_ROUNDED);
+        assert!(!tables.has_elliptical_masks());
         assert_eq!(index & MASK_INDEX, 2);
         assert_eq!(tables.texels().len(), 5);
         assert_eq!(tables.texels()[3], [8.; 4]);
         assert_eq!(tables.content_mask(&mask(0.)), 5);
         assert_eq!(tables.texels().len(), 6);
+    }
+
+    #[test]
+    fn elliptical_masks_carry_vertical_radii_and_mark_the_table() {
+        let mut tables = InstanceTables::default();
+        let oval = ContentMask::<ScaledPixels>::elliptical(rect(0., 0., 100., 50.), Corners::all(sp(20.)), Corners::all(sp(6.)));
+        let index = tables.content_mask(&oval);
+        assert_eq!(index, 2 | MASK_ROUNDED | MASK_ELLIPTICAL);
+        assert_eq!(tables.texels().len(), 6);
+        assert_eq!(tables.texels()[5], [6.; 4]);
+        assert!(tables.has_elliptical_masks());
+        tables.clear();
+        assert!(!tables.has_elliptical_masks());
     }
 
     #[test]

@@ -177,13 +177,13 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: Pipeline,
+    paths_rasterization_pipeline_state: MaskPipelines,
     path_sprites_pipeline_state: Pipeline,
-    shadows_pipeline_state: Pipeline,
-    quads_pipeline_state: Pipeline,
-    underlines_pipeline_state: Pipeline,
-    monochrome_sprites_pipeline_state: Pipeline,
-    polychrome_sprites_pipeline_state: Pipeline,
+    shadows_pipeline_state: MaskPipelines,
+    quads_pipeline_state: MaskPipelines,
+    underlines_pipeline_state: MaskPipelines,
+    monochrome_sprites_pipeline_state: MaskPipelines,
+    polychrome_sprites_pipeline_state: MaskPipelines,
     surfaces_pipeline_state: Pipeline,
     retained_shapes_pipeline_state: Pipeline,
     backdrop_copy_pipeline_state: Pipeline,
@@ -410,15 +410,18 @@ impl MetalRenderer {
             );
             texture
         };
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &pipelines,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
+        let paths_rasterization_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_path_rasterization_pipeline_state(
+                &pipelines,
+                &library,
+                "paths_rasterization",
+                "path_rasterization_vertex",
+                "path_rasterization_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                PATH_SAMPLE_COUNT,
+                elliptical_masks,
+            )
+        });
         let backdrop_copy_pipeline_state = build_opaque_pipeline_state(
             &pipelines,
             &library,
@@ -452,46 +455,61 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let shadows_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let shadows_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "shadows",
+                "shadow_vertex",
+                "shadow_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let quads_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "quads",
+                "quad_vertex",
+                "quad_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let underlines_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "underlines",
+                "underline_vertex",
+                "underline_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let monochrome_sprites_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "monochrome_sprites",
+                "monochrome_sprite_vertex",
+                "monochrome_sprite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let polychrome_sprites_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "polychrome_sprites",
+                "polychrome_sprite_vertex",
+                "polychrome_sprite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
         let surfaces_pipeline_state = build_pipeline_state(
             &pipelines,
             &library,
@@ -499,6 +517,7 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
 
         let retained_shapes_pipeline_state = build_pipeline_state(
@@ -508,6 +527,7 @@ impl MetalRenderer {
             "retained_shape_vertex",
             "retained_shape_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
 
         pipelines.finish();
@@ -970,6 +990,7 @@ impl MetalRenderer {
                         paths,
                         &instance_bindings.path_records[range],
                         &instance_bindings.tables,
+                        instance_bindings.elliptical_masks,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -1502,6 +1523,7 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         path_records: &[PathRecord],
         tables: &InstanceBinding,
+        elliptical_masks: bool,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -1550,7 +1572,7 @@ impl MetalRenderer {
             znear: 0.0,
             zfar: 1.0,
         });
-        command_encoder.set_render_pipeline_state(self.paths_rasterization_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.paths_rasterization_pipeline_state.state(elliptical_masks));
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&vertex_instance_bindings.buffer),
@@ -1592,7 +1614,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.shadows_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.shadows_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1639,7 +1661,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.quads_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.quads_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1985,7 +2007,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.underlines_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.underlines_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2040,7 +2062,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(self.monochrome_sprites_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.monochrome_sprites_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2101,7 +2123,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(self.polychrome_sprites_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.polychrome_sprites_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2334,13 +2356,10 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    elliptical_masks: bool,
 ) -> Pipeline {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+    let vertex_fn = mask_function(library, vertex_fn_name, elliptical_masks);
+    let fragment_fn = mask_function(library, fragment_fn_name, elliptical_masks);
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
@@ -2356,7 +2375,12 @@ fn build_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    pipelines.build(&descriptor)
+    if elliptical_masks {
+        // Made when a scene first has an elliptical mask.
+        pipelines.build_deferred(&descriptor)
+    } else {
+        pipelines.build(&descriptor)
+    }
 }
 
 /// A pipeline that overwrites its target (backdrop copies and blur passes).
@@ -2634,13 +2658,10 @@ fn build_path_rasterization_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
     path_sample_count: u32,
+    elliptical_masks: bool,
 ) -> Pipeline {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+    let vertex_fn = mask_function(library, vertex_fn_name, elliptical_masks);
+    let fragment_fn = mask_function(library, fragment_fn_name, elliptical_masks);
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
@@ -2660,7 +2681,44 @@ fn build_path_rasterization_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    pipelines.build(&descriptor)
+    if elliptical_masks {
+        // Made when a scene first has an elliptical mask.
+        pipelines.build_deferred(&descriptor)
+    } else {
+        pipelines.build(&descriptor)
+    }
+}
+
+/// `name` from `library`, specialized for scenes with or without elliptical content masks (the
+/// shaders' `ELLIPTICAL_MASKS`).
+fn mask_function(library: &metal::LibraryRef, name: &str, elliptical_masks: bool) -> metal::Function {
+    let constants = metal::FunctionConstantValues::new();
+    constants.set_constant_value_at_index(
+        &elliptical_masks as *const bool as *const c_void,
+        metal::MTLDataType::Bool,
+        0,
+    );
+    library
+        .get_function(name, Some(constants))
+        .unwrap_or_else(|error| panic!("error locating function {name}: {error}"))
+}
+
+/// A pipeline that reads content masks, specialized two ways: most scenes have no elliptical
+/// mask and draw with code that has no elliptical path; the elliptical variant is made the first
+/// time a scene has one.
+struct MaskPipelines {
+    circular: Pipeline,
+    elliptical: Pipeline,
+}
+
+impl MaskPipelines {
+    fn new(build: impl Fn(bool) -> Pipeline) -> Self {
+        Self { circular: build(false), elliptical: build(true) }
+    }
+
+    fn state(&self, elliptical_masks: bool) -> &metal::RenderPipelineState {
+        if elliptical_masks { self.elliptical.state() } else { self.circular.state() }
+    }
 }
 
 #[derive(Clone)]
@@ -2682,6 +2740,8 @@ struct InstanceBindings {
     tables: InstanceBinding,
     /// Each path's record in `tables`, which its vertices share.
     path_records: Vec<PathRecord>,
+    /// Whether a mask in `tables` is elliptical: its draws use the elliptical pipelines.
+    elliptical_masks: bool,
 }
 
 /// Binds a scene's record table to both stages at `index`.
@@ -2742,6 +2802,7 @@ fn write_instances(
             }))?,
             path_records: scene.paths.iter().map(|path| tables.path(path)).collect(),
             tables: writer.write(tables.texels())?,
+            elliptical_masks: tables.has_elliptical_masks(),
         })
     })();
     writer.tables = tables;
@@ -2813,6 +2874,7 @@ impl InstanceBufferWriter {
                 values.as_ptr(),
                 destination.as_mut_ptr().cast::<T>(),
                 values.len(),
+                false,
             );
         }
         Ok(binding)
