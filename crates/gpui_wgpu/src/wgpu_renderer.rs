@@ -5139,7 +5139,7 @@ mod tests {
                 0,
                 0,
                 flags,
-                2 | gpui::MASK_ROUNDED,
+                2,
                 5,
                 7,
             ]
