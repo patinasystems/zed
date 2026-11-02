@@ -81,7 +81,8 @@ float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float
 
 // ---- Instance records (`gpui::InstanceTables`) ----
 // Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (4 texels), transformations (2 texels, the identity at texel 0) and
+// distinct content masks (3 texels, and a 4th, the vertical radii, when the index has
+// MASK_ELLIPTICAL set), transformations (2 texels, the identity at texel 0) and
 // each primitive's aux record. `load_*` expand a record into the primitive's full layout.
 
 // A path vertex expanded from its `PathVertexRecord` and its path's record.
@@ -2524,10 +2525,13 @@ Hsla texel_hsla(float4 texel) {
 
 ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) {
   ContentMask_ScaledPixels mask;
-  mask.bounds = texel_bounds(tables[index]);
-  mask.corner_radii = texel_corners(tables[index + 1]);
-  mask.rounded_bounds = texel_bounds(tables[index + 2]);
-  mask.corner_radii_y = texel_corners(tables[index + 3]);
+  uint at = index & 0x7fffffffu;
+  mask.bounds = texel_bounds(tables[at]);
+  mask.corner_radii = texel_corners(tables[at + 1]);
+  mask.rounded_bounds = texel_bounds(tables[at + 2]);
+  // A circular mask has no fourth texel (`MASK_ELLIPTICAL`).
+  mask.corner_radii_y = (index & 0x80000000u) != 0 ? texel_corners(tables[at + 3])
+                                                   : texel_corners(float4(0.));
   return mask;
 }
 
