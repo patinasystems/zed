@@ -156,6 +156,15 @@ struct WgpuPipelines {
     backdrop: BackdropPipelines,
 }
 
+/// Whether pipelines may be made on a background thread while the renderer draws. Not on GL:
+/// wgpu-hal's GL backend holds one exclusive context lock while it makes a pipeline, and panics
+/// when another GL call waits on it more than a second, so a cold compile there could stall or
+/// abort the frames drawn meanwhile. There, as on the web, an elliptical variant is made at
+/// first use.
+fn prewarms_off_thread(adapter: &wgpu::AdapterInfo) -> bool {
+    adapter.backend != wgpu::Backend::Gl
+}
+
 impl WgpuPipelines {
     fn mask_pipelines(&self) -> impl Iterator<Item = &MaskPipelines> {
         [
@@ -171,7 +180,7 @@ impl WgpuPipelines {
     }
 
     /// Makes the elliptical-mask variants on a background thread, so the first scene with an
-    /// elliptical mask does not compile them.
+    /// elliptical mask does not compile them. Only where [`prewarms_off_thread`].
     #[cfg(not(target_family = "wasm"))]
     fn prewarm(&self) {
         let jobs: Vec<_> = self
@@ -263,9 +272,9 @@ impl PipelineSpec {
 
 /// A pipeline that reads content masks, specialized on `ELLIPTICAL_MASKS` (`shaders.wgsl`):
 /// most scenes have no elliptical mask and draw with code that has no elliptical path. The
-/// elliptical variant is made on a background thread after startup where there are threads
+/// elliptical variant is made on a background thread after startup where that is safe
 /// ([`WgpuPipelines::prewarm`]), so the first scene with one waits only if it is not ready yet,
-/// and at first use on the web.
+/// and at first use on the web and on GL ([`prewarms_off_thread`]).
 struct MaskPipelines {
     circular: wgpu::RenderPipeline,
     elliptical: Arc<std::sync::OnceLock<wgpu::RenderPipeline>>,
@@ -1106,6 +1115,7 @@ impl WgpuRendererCore {
         path_sample_count: u32,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
+        prewarm_off_thread: bool,
     ) -> WgpuPipelines {
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
@@ -1437,7 +1447,9 @@ impl WgpuRendererCore {
             poly_sprites,
             surfaces,
         };
-        pipelines.prewarm();
+        if prewarm_off_thread {
+            pipelines.prewarm();
+        }
         pipelines
     }
 
@@ -1711,6 +1723,7 @@ impl WgpuRenderer {
             core.rendering_params.path_sample_count,
             core.dual_source_blending,
             core.uses_webgl_instance_data,
+            prewarms_off_thread(&core.adapter_info),
         );
 
         if let RendererState::Ready { surface, core } = &self.state {
@@ -1867,6 +1880,7 @@ impl WgpuRendererCore {
             rendering_params.path_sample_count,
             dual_source_blending,
             uses_webgl_instance_data,
+            prewarms_off_thread(&context.adapter.get_info()),
         );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
