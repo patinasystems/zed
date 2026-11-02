@@ -2527,12 +2527,22 @@ macro_rules! content_mask_elliptical {
     ($unit:ty) => {
         impl ContentMask<$unit> {
             /// A mask that rounds its own bounds' corners by `radii_x` horizontally and `radii_y`
-            /// vertically (CSS `border-radius: x / y`); equal radii make a circular corner.
+            /// vertically (CSS `border-radius: x / y`); equal radii make a circular corner, and a
+            /// zero radius on either axis a square one.
             pub fn elliptical(
                 bounds: Bounds<$unit>,
-                radii_x: Corners<$unit>,
+                mut radii_x: Corners<$unit>,
                 radii_y: Corners<$unit>,
             ) -> Self {
+                let square = |x: &mut $unit, y: $unit| {
+                    if y.0 <= 0. {
+                        *x = <$unit>::from(0.);
+                    }
+                };
+                square(&mut radii_x.top_left, radii_y.top_left);
+                square(&mut radii_x.top_right, radii_y.top_right);
+                square(&mut radii_x.bottom_right, radii_y.bottom_right);
+                square(&mut radii_x.bottom_left, radii_y.bottom_left);
                 ContentMask {
                     corner_radii_y: radii_y,
                     ..ContentMask::rounded(bounds, radii_x)
@@ -2880,6 +2890,12 @@ mod content_mask_tests {
         // Equal radii are a circular mask, stored as one.
         let round = ContentMask::<Pixels>::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), Corners::all(px(3.)));
         assert_eq!(round, ContentMask::rounded(rect(0., 0., 10., 10.), Corners::all(px(3.))));
+        // A corner flat on either axis is square (CSS Backgrounds 3 5.1).
+        let flat = Corners { top_left: px(0.), ..Corners::all(px(3.)) };
+        let half = ContentMask::<Pixels>::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), flat);
+        assert_eq!(half.corner_radii.top_left, px(0.));
+        assert!(half.contains(&point(px(0.2), px(0.2))));
+        assert_eq!(half.corner_radii.top_right, px(3.));
         // A square clip inside keeps the ellipse.
         let tile = ContentMask::from(rect(0., 0., 30., 30.)).intersect(&card);
         assert_eq!(tile.corner_radii_y, card.corner_radii_y);
