@@ -13,6 +13,10 @@
 //! ([`Pipeline::state`]): a page that draws quads and glyphs never makes the other pipelines,
 //! which cost about 40 KB each even from the archive. Without one, it compiles them all at once,
 //! as the archive is written from them.
+//!
+//! Variants most frames never draw with (the elliptical-mask specializations) are prewarmed: made
+//! on a background thread once the renderer is built ([`PipelineCache::build_prewarmed`]), so the
+//! first frame that needs one does not compile it, and archived only once drawn with.
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -21,7 +25,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -57,7 +61,12 @@ struct Shared {
     missed: Cell<bool>,
     /// A pipeline made after construction missed the archive, and the archive was written again.
     rewritten: Cell<bool>,
+    /// Pipelines to make on a background thread once the renderer is built ([`PipelineCache::build_prewarmed`]).
+    prewarm: RefCell<Vec<(RenderPipelineDescriptor, Arc<Prewarmed>)>>,
 }
+
+/// A pipeline made on the prewarm thread: its state, and whether the archive held its code.
+type Prewarmed = OnceLock<Result<(metal::RenderPipelineState, bool), String>>;
 
 /// A renderer's pipeline: made when built ([`PipelineCache::build`]) without an archive to read,
 /// else when first drawn with ([`Self::state`]).
@@ -65,6 +74,8 @@ pub(crate) struct Pipeline {
     state: OnceCell<metal::RenderPipelineState>,
     /// The descriptor to make it from, until it is made.
     descriptor: Option<RenderPipelineDescriptor>,
+    /// Made on the prewarm thread: the first draw waits for it if it is not ready yet.
+    prewarmed: Option<Arc<Prewarmed>>,
     shared: Rc<Shared>,
 }
 
@@ -75,10 +86,26 @@ impl Pipeline {
         self.state.get_or_init(|| {
             let descriptor = self.descriptor.as_deref().expect("a deferred pipeline keeps its descriptor");
             let shared = &self.shared;
-            if let Some(state) = shared.archived(descriptor) {
+            if let Some(prewarmed) = &self.prewarmed {
+                let (state, archived) = match prewarmed.wait() {
+                    Ok(made) => made.clone(),
+                    Err(error) => panic!("could not create render pipeline state: {error}"),
+                };
+                if !archived {
+                    // Keep it for the next launch, writing the archive off this thread: writing
+                    // compiles every pipeline in it.
+                    shared.descriptors.borrow_mut().push(descriptor.to_owned());
+                    shared.write_in_background();
+                }
                 return state;
             }
-            let state = shared.compile(descriptor);
+            let (state, archived) = match shared.archived(descriptor) {
+                Some(state) => (state, true),
+                None => (shared.compile(descriptor), false),
+            };
+            if archived {
+                return state;
+            }
             if !shared.rewritten.replace(true) {
                 // The new archive holds every pipeline's code: the others read it, not the stale one.
                 shared.write();
@@ -120,6 +147,7 @@ impl PipelineCache {
                 descriptors: RefCell::default(),
                 missed: Cell::new(false),
                 rewritten: Cell::new(false),
+                prewarm: RefCell::default(),
             }),
         }
     }
@@ -131,7 +159,8 @@ impl PipelineCache {
         if shared.path.is_some() {
             shared.descriptors.borrow_mut().push(descriptor.to_owned());
         }
-        let pipeline = Pipeline { state: OnceCell::new(), descriptor: None, shared: shared.clone() };
+        let pipeline =
+            Pipeline { state: OnceCell::new(), descriptor: None, prewarmed: None, shared: shared.clone() };
         if shared.archive.borrow().is_some() {
             return Pipeline { descriptor: Some(descriptor.to_owned()), ..pipeline };
         }
@@ -140,14 +169,20 @@ impl PipelineCache {
         pipeline
     }
 
-    /// The pipeline for `descriptor`, made the first time it is drawn with: one most renderers
-    /// never use (a specialization), so it is compiled only when needed, archive or not.
-    pub(crate) fn build_deferred(&self, descriptor: &RenderPipelineDescriptorRef) -> Pipeline {
-        let shared = &self.shared;
-        if shared.path.is_some() {
-            shared.descriptors.borrow_mut().push(descriptor.to_owned());
+    /// The pipeline for `descriptor`, made on a background thread after [`Self::finish`] (from
+    /// the archive when it holds it): a variant most frames never draw with, ready before the
+    /// first that does, which waits for it only if it is still being made.
+    /// It joins the archive only once drawn with, so a renderer that never uses it neither
+    /// compiles it at launch nor archives it.
+    pub(crate) fn build_prewarmed(&self, descriptor: &RenderPipelineDescriptorRef) -> Pipeline {
+        let prewarmed = Arc::new(Prewarmed::new());
+        self.shared.prewarm.borrow_mut().push((descriptor.to_owned(), prewarmed.clone()));
+        Pipeline {
+            state: OnceCell::new(),
+            descriptor: Some(descriptor.to_owned()),
+            prewarmed: Some(prewarmed),
+            shared: self.shared.clone(),
         }
-        Pipeline { state: OnceCell::new(), descriptor: Some(descriptor.to_owned()), shared: shared.clone() }
     }
 
     /// Writes the archive when a pipeline was missing from it. Failures are logged: the next
@@ -155,6 +190,30 @@ impl PipelineCache {
     pub(crate) fn finish(self) {
         if self.shared.missed.get() {
             self.shared.write();
+        }
+        let jobs = self.shared.prewarm.take();
+        if jobs.is_empty() {
+            return;
+        }
+        let device = self.shared.device.clone();
+        let archive = self.shared.archive.borrow().clone();
+        let spawned = std::thread::Builder::new().name("gpui-pipeline-prewarm".into()).spawn(move || {
+            for (descriptor, prewarmed) in jobs {
+                let archived = archive.as_ref().and_then(|archive| {
+                    descriptor.set_binary_archives(&[archive]);
+                    let state = archived_pipeline(&device, &descriptor);
+                    descriptor.set_binary_archives(&[]);
+                    state
+                });
+                let made = match archived {
+                    Some(state) => Ok((state, true)),
+                    None => device.new_render_pipeline_state(&descriptor).map(|state| (state, false)),
+                };
+                let _ = prewarmed.set(made);
+            }
+        });
+        if let Err(error) = spawned {
+            panic!("could not start the pipeline prewarm thread: {error}");
         }
     }
 }
@@ -174,6 +233,18 @@ impl Shared {
         self.device
             .new_render_pipeline_state(descriptor)
             .expect("could not create render pipeline state")
+    }
+
+    /// [`Self::write`] on another thread.
+    fn write_in_background(&self) {
+        let Some(path) = self.path.clone() else { return };
+        let device = self.device.clone();
+        let descriptors = self.descriptors.borrow().clone();
+        let _ = std::thread::Builder::new().name("gpui-pipeline-archive".into()).spawn(move || {
+            if let Err(error) = write_archive(&device, &descriptors, &path) {
+                log::warn!("writing the pipeline archive {}: {error}", path.display());
+            }
+        });
     }
 
     /// Writes the archive from every pipeline's descriptor. Failures are logged.
@@ -278,6 +349,39 @@ mod tests {
             .unwrap()
             .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
         descriptor
+    }
+
+    #[test]
+    fn prewarmed_pipelines_are_made_off_thread_and_archived_once_used() {
+        let Some(device) = metal::Device::system_default() else { return };
+        let library = device
+            .new_library_with_source(SHADERS, &metal::CompileOptions::new())
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("gpui-pipelines-prewarm-{}", std::process::id()));
+        let path = dir.join("test.metalar");
+        let _ = std::fs::remove_file(&path);
+
+        let cache = PipelineCache::at(&device, Some(path.clone()));
+        let red = cache.build(&descriptor(&library, "red"));
+        let blue = cache.build_prewarmed(&descriptor(&library, "blue"));
+        assert!(!blue.is_made());
+        let shared = cache.shared.clone();
+        cache.finish();
+        // Not in the archive the launch wrote: a renderer that never draws it never archives it.
+        assert_eq!(shared.descriptors.borrow().len(), 1);
+        let prewarmed = blue.prewarmed.clone().unwrap();
+        // The prewarm thread makes it without a draw.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while prewarmed.get().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(prewarmed.get().is_some(), "the prewarm thread made it");
+        let _ = blue.state();
+        assert!(blue.is_made());
+        // Drawn with: it joins the archive.
+        assert_eq!(shared.descriptors.borrow().len(), 2);
+        let _ = red.state();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

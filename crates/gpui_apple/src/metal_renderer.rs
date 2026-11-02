@@ -2376,8 +2376,8 @@ fn build_pipeline_state(
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     if elliptical_masks {
-        // Made when a scene first has an elliptical mask.
-        pipelines.build_deferred(&descriptor)
+        // Made on the prewarm thread: ready before the first scene with an elliptical mask.
+        pipelines.build_prewarmed(&descriptor)
     } else {
         pipelines.build(&descriptor)
     }
@@ -2682,8 +2682,8 @@ fn build_path_rasterization_pipeline_state(
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     if elliptical_masks {
-        // Made when a scene first has an elliptical mask.
-        pipelines.build_deferred(&descriptor)
+        // Made on the prewarm thread: ready before the first scene with an elliptical mask.
+        pipelines.build_prewarmed(&descriptor)
     } else {
         pipelines.build(&descriptor)
     }
@@ -2704,8 +2704,8 @@ fn mask_function(library: &metal::LibraryRef, name: &str, elliptical_masks: bool
 }
 
 /// A pipeline that reads content masks, specialized two ways: most scenes have no elliptical
-/// mask and draw with code that has no elliptical path; the elliptical variant is made the first
-/// time a scene has one.
+/// mask and draw with code that has no elliptical path; the elliptical variant is made on a
+/// background thread after startup, so the first scene with one does not compile it.
 struct MaskPipelines {
     circular: Pipeline,
     elliptical: Pipeline,
@@ -2874,7 +2874,6 @@ impl InstanceBufferWriter {
                 values.as_ptr(),
                 destination.as_mut_ptr().cast::<T>(),
                 values.len(),
-                false,
             );
         }
         Ok(binding)
@@ -3480,6 +3479,61 @@ mod tests {
                 "{fill:?}: GPU {:.3} ms per frame (median of {})",
                 times[times.len() / 2],
                 times.len()
+            );
+        }
+    }
+
+    /// Wall time of the first frame with an elliptical content mask, against later ones: the
+    /// elliptical pipeline variants are made on a background thread after startup, so that frame
+    /// should not compile them. Renders `circular_frames` frames of a circular-mask scene first
+    /// (0: the elliptical scene is the renderer's first frame). Run with
+    /// `cargo test -p gpui_apple --release --lib first_elliptical_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn first_elliptical_frame_cost() {
+        use gpui::{ContentMask, Corners, Quad, ScaledPixels};
+        let px = |x: f32| ScaledPixels(x);
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let scene = |elliptical: bool| {
+            let mut scene = Scene::default();
+            for i in 0..200usize {
+                let (x, y) = ((i % 20) as f32 * 60., (i / 20) as f32 * 40.);
+                let mask = if elliptical {
+                    ContentMask::<ScaledPixels>::elliptical(rect(x, y, 60., 40.), Corners::all(px(18.)), Corners::all(px(9.)))
+                } else {
+                    ContentMask::rounded(rect(x, y, 60., 40.), Corners::all(px(9.)))
+                };
+                scene.insert_primitive(Quad {
+                    bounds: rect(x, y, 60., 40.),
+                    content_mask: mask,
+                    background: gpui::Hsla { h: 0.6, s: 0.5, l: 0.5, a: 1. }.into(),
+                    ..Default::default()
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let (circular, elliptical) = (scene(false), scene(true));
+        let viewport = size(DevicePixels(1200), DevicePixels(400));
+        let frame = |renderer: &mut MetalHeadlessRenderer, scene: &Scene| {
+            let t = std::time::Instant::now();
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(renderer, scene, viewport).expect("render");
+            t.elapsed().as_secs_f64() * 1000.
+        };
+        // The renderer's first frame; after 30 circular frames; and after a second more (an app
+        // that shows an elliptical mask a moment after launch).
+        for (circular_frames, idle_ms) in [(0, 0), (30, 0), (30, 1000)] {
+            let mut renderer = MetalHeadlessRenderer::new();
+            for _ in 0..circular_frames {
+                frame(&mut renderer, &circular);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(idle_ms));
+            let first = frame(&mut renderer, &elliptical);
+            let mut later: Vec<f64> = (0..9).map(|_| frame(&mut renderer, &elliptical)).collect();
+            later.sort_by(f64::total_cmp);
+            println!(
+                "FIRST_ELLIPTICAL_FRAME after {circular_frames} circular frames and {idle_ms} ms: {first:.2} ms, later {:.2} ms",
+                later[later.len() / 2]
             );
         }
     }
