@@ -645,7 +645,7 @@ fn warm_scene() -> Scene {
     path.line_to(corner(0., 2.));
     path.color = gpui::black().into();
     let mut path = path.scale(1.);
-    path.content_mask = ContentMask {
+    path.content_mask = gpui::ContentMask {
         bounds: path.bounds,
         ..Default::default()
     };
