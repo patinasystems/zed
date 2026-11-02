@@ -870,9 +870,6 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "33bc76
     "stream",
 ], package = "zed-reqwest", version = "0.12.15-zed" }
 resvg = { version = "0.46.0", default-features = false, features = [
-    "text",
-    "system-fonts",
-    "memmap-fonts",
     "raster-images",
 ] }
 rsa = { version = "0.9", default-features = false, features = ["std", "u64_digit"] }

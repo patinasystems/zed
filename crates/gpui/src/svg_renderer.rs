@@ -5,77 +5,7 @@ use crate::{
 use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
-use std::{
-    hash::Hash,
-    sync::{Arc, LazyLock, OnceLock},
-};
-
-#[cfg(target_os = "macos")]
-const EMOJI_FONT_FAMILIES: &[&str] = &["Apple Color Emoji", ".AppleColorEmojiUI"];
-
-#[cfg(target_os = "windows")]
-const EMOJI_FONT_FAMILIES: &[&str] = &["Segoe UI Emoji", "Segoe UI Symbol"];
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-const EMOJI_FONT_FAMILIES: &[&str] = &[
-    "Noto Color Emoji",
-    "Emoji One",
-    "Twitter Color Emoji",
-    "JoyPixels",
-];
-
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "windows",
-    target_os = "linux",
-    target_os = "freebsd",
-)))]
-const EMOJI_FONT_FAMILIES: &[&str] = &[];
-
-fn is_emoji_presentation(c: char) -> bool {
-    static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
-    let mut buf = [0u8; 4];
-    EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
-}
-
-fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
-    db.with_face_data(id, |font_data, face_index| {
-        ttf_parser::Face::parse(font_data, face_index)
-            .ok()
-            .and_then(|face| face.glyph_index(ch))
-            .is_some()
-    })
-    .unwrap_or(false)
-}
-
-fn select_emoji_font(
-    ch: char,
-    fonts: &[usvg::fontdb::ID],
-    db: &usvg::fontdb::Database,
-    families: &[&str],
-) -> Option<usvg::fontdb::ID> {
-    for family_name in families {
-        let query = usvg::fontdb::Query {
-            families: &[usvg::fontdb::Family::Name(family_name)],
-            weight: usvg::fontdb::Weight(400),
-            stretch: usvg::fontdb::Stretch::Normal,
-            style: usvg::fontdb::Style::Normal,
-        };
-
-        let Some(id) = db.query(&query) else {
-            continue;
-        };
-
-        if fonts.contains(&id) || !font_has_char(db, id, ch) {
-            continue;
-        }
-
-        return Some(id);
-    }
-
-    None
-}
+use std::{hash::Hash, sync::Arc};
 
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
@@ -122,64 +52,12 @@ impl From<f32> for SvgSize {
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
-        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
-            let mut db = usvg::fontdb::Database::new();
-            db.load_system_fonts();
-            Arc::new(db)
-        });
-
-        // Build the enriched font DB lazily on first SVG render rather than
-        // eagerly at construction time. This avoids the expensive deep-clone
-        // of the system font database for code paths that never render SVGs
-        // (e.g. tests).
-        let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
-
-        let default_font_resolver = usvg::FontResolver::default_font_selector();
-        let font_resolver = Box::new({
-            let asset_source = asset_source.clone();
-            move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
-                if db.is_empty() {
-                    let fontdb = enriched_fontdb.get_or_init(|| {
-                        let mut db = (**SYSTEM_FONT_DB).clone();
-                        load_bundled_fonts(&*asset_source, &mut db);
-                        fix_generic_font_families(&mut db);
-                        Arc::new(db)
-                    });
-                    *db = fontdb.clone();
-                }
-                if let Some(id) = default_font_resolver(font, db) {
-                    return Some(id);
-                }
-                // fontdb doesn't recognize CSS system font keywords like "system-ui"
-                // or "ui-sans-serif", so fall back to sans-serif before any face.
-                let sans_query = usvg::fontdb::Query {
-                    families: &[usvg::fontdb::Family::SansSerif],
-                    ..Default::default()
-                };
-                db.query(&sans_query)
-                    .or_else(|| db.faces().next().map(|f| f.id))
-            }
-        });
-        let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
-        let fallback_selection = Box::new(
-            move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
-                if is_emoji_presentation(ch) {
-                    if let Some(id) = select_emoji_font(ch, fonts, db.as_ref(), EMOJI_FONT_FAMILIES)
-                    {
-                        return Some(id);
-                    }
-                }
-
-                default_fallback_selection(ch, fonts, db)
-            },
-        );
-        let options = usvg::Options {
-            font_resolver: usvg::FontResolver {
-                select_font: font_resolver,
-                select_fallback: fallback_selection,
-            },
-            ..Default::default()
-        };
+        // `<text>` in SVGs: fonts, fallback and emoji (the `svg-text` feature: resvg's text
+        // layout over fontdb). Without it, text in an SVG draws nothing.
+        #[cfg(feature = "svg-text")]
+        let options = svg_text::options(asset_source.clone());
+        #[cfg(not(feature = "svg-text"))]
+        let options = usvg::Options::default();
         Self {
             asset_source,
             usvg_options: Arc::new(options),
@@ -306,48 +184,187 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     Ok(pixmap)
 }
 
-fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
-    let font_paths = [
-        "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
-        "fonts/lilex/Lilex-Regular.ttf",
+
+
+/// `<text>` in SVGs (the `svg-text` feature): the system's and the bundled fonts, CSS system
+/// font keywords and emoji fallback, for resvg's text layout over fontdb.
+#[cfg(feature = "svg-text")]
+mod svg_text {
+    use super::*;
+    use std::sync::{LazyLock, OnceLock};
+
+    #[cfg(target_os = "macos")]
+    pub(super) const EMOJI_FONT_FAMILIES: &[&str] = &["Apple Color Emoji", ".AppleColorEmojiUI"];
+
+    #[cfg(target_os = "windows")]
+    pub(super) const EMOJI_FONT_FAMILIES: &[&str] = &["Segoe UI Emoji", "Segoe UI Symbol"];
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) const EMOJI_FONT_FAMILIES: &[&str] = &[
+        "Noto Color Emoji",
+        "Emoji One",
+        "Twitter Color Emoji",
+        "JoyPixels",
     ];
-    for path in font_paths {
-        match asset_source.load(path) {
-            Ok(Some(data)) => db.load_font_data(data.into_owned()),
-            Ok(None) => log::warn!("Bundled font not found: {path}"),
-            Err(error) => log::warn!("Failed to load bundled font {path}: {error}"),
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "freebsd",
+    )))]
+    pub(super) const EMOJI_FONT_FAMILIES: &[&str] = &[];
+
+    pub(super) fn is_emoji_presentation(c: char) -> bool {
+        static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
+        let mut buf = [0u8; 4];
+        EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
+    }
+
+    pub(super) fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {
+        db.with_face_data(id, |font_data, face_index| {
+            ttf_parser::Face::parse(font_data, face_index)
+                .ok()
+                .and_then(|face| face.glyph_index(ch))
+                .is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    pub(super) fn select_emoji_font(
+        ch: char,
+        fonts: &[usvg::fontdb::ID],
+        db: &usvg::fontdb::Database,
+        families: &[&str],
+    ) -> Option<usvg::fontdb::ID> {
+        for family_name in families {
+            let query = usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::Name(family_name)],
+                weight: usvg::fontdb::Weight(400),
+                stretch: usvg::fontdb::Stretch::Normal,
+                style: usvg::fontdb::Style::Normal,
+            };
+
+            let Some(id) = db.query(&query) else {
+                continue;
+            };
+
+            if fonts.contains(&id) || !font_has_char(db, id, ch) {
+                continue;
+            }
+
+            return Some(id);
+        }
+
+        None
+    }
+
+    /// The parse options: fonts load on the first text that needs them.
+    pub(super) fn options(asset_source: Arc<dyn AssetSource>) -> usvg::Options<'static> {
+        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        });
+
+        // Build the enriched font DB lazily on first SVG render rather than
+        // eagerly at construction time. This avoids the expensive deep-clone
+        // of the system font database for code paths that never render SVGs
+        // (e.g. tests).
+        let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
+
+        let default_font_resolver = usvg::FontResolver::default_font_selector();
+        let font_resolver = Box::new({
+            let asset_source = asset_source.clone();
+            move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
+                if db.is_empty() {
+                    let fontdb = enriched_fontdb.get_or_init(|| {
+                        let mut db = (**SYSTEM_FONT_DB).clone();
+                        load_bundled_fonts(&*asset_source, &mut db);
+                        fix_generic_font_families(&mut db);
+                        Arc::new(db)
+                    });
+                    *db = fontdb.clone();
+                }
+                if let Some(id) = default_font_resolver(font, db) {
+                    return Some(id);
+                }
+                // fontdb doesn't recognize CSS system font keywords like "system-ui"
+                // or "ui-sans-serif", so fall back to sans-serif before any face.
+                let sans_query = usvg::fontdb::Query {
+                    families: &[usvg::fontdb::Family::SansSerif],
+                    ..Default::default()
+                };
+                db.query(&sans_query)
+                    .or_else(|| db.faces().next().map(|f| f.id))
+            }
+        });
+        let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
+        let fallback_selection = Box::new(
+            move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
+                if is_emoji_presentation(ch) {
+                    if let Some(id) = select_emoji_font(ch, fonts, db.as_ref(), EMOJI_FONT_FAMILIES)
+                    {
+                        return Some(id);
+                    }
+                }
+
+                default_fallback_selection(ch, fonts, db)
+            },
+        );
+        usvg::Options {
+            font_resolver: usvg::FontResolver {
+                select_font: font_resolver,
+                select_fallback: fallback_selection,
+            },
+            ..Default::default()
         }
     }
-}
 
-// fontdb defaults generic families to Microsoft fonts ("Arial", "Times New Roman")
-// which aren't installed on most Linux systems. fontconfig normally overrides these,
-// but when it fails the defaults remain and all generic family queries return None.
-fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
-    use usvg::fontdb::{Family, Query};
+    pub(super) fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
+        let font_paths = [
+            "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+            "fonts/lilex/Lilex-Regular.ttf",
+        ];
+        for path in font_paths {
+            match asset_source.load(path) {
+                Ok(Some(data)) => db.load_font_data(data.into_owned()),
+                Ok(None) => log::warn!("Bundled font not found: {path}"),
+                Err(error) => log::warn!("Failed to load bundled font {path}: {error}"),
+            }
+        }
+    }
 
-    let families_and_fallbacks: &[(Family<'_>, &str)] = &[
-        (Family::SansSerif, "IBM Plex Sans"),
-        // No serif font bundled; use sans-serif as best available fallback.
-        (Family::Serif, "IBM Plex Sans"),
-        (Family::Monospace, "Lilex"),
-        (Family::Cursive, "IBM Plex Sans"),
-        (Family::Fantasy, "IBM Plex Sans"),
-    ];
+    // fontdb defaults generic families to Microsoft fonts ("Arial", "Times New Roman")
+    // which aren't installed on most Linux systems. fontconfig normally overrides these,
+    // but when it fails the defaults remain and all generic family queries return None.
+    pub(super) fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
+        use usvg::fontdb::{Family, Query};
 
-    for (family, fallback_name) in families_and_fallbacks {
-        let query = Query {
-            families: &[*family],
-            ..Default::default()
-        };
-        if db.query(&query).is_none() {
-            match family {
-                Family::SansSerif => db.set_sans_serif_family(*fallback_name),
-                Family::Serif => db.set_serif_family(*fallback_name),
-                Family::Monospace => db.set_monospace_family(*fallback_name),
-                Family::Cursive => db.set_cursive_family(*fallback_name),
-                Family::Fantasy => db.set_fantasy_family(*fallback_name),
-                _ => {}
+        let families_and_fallbacks: &[(Family<'_>, &str)] = &[
+            (Family::SansSerif, "IBM Plex Sans"),
+            // No serif font bundled; use sans-serif as best available fallback.
+            (Family::Serif, "IBM Plex Sans"),
+            (Family::Monospace, "Lilex"),
+            (Family::Cursive, "IBM Plex Sans"),
+            (Family::Fantasy, "IBM Plex Sans"),
+        ];
+
+        for (family, fallback_name) in families_and_fallbacks {
+            let query = Query {
+                families: &[*family],
+                ..Default::default()
+            };
+            if db.query(&query).is_none() {
+                match family {
+                    Family::SansSerif => db.set_sans_serif_family(*fallback_name),
+                    Family::Serif => db.set_serif_family(*fallback_name),
+                    Family::Monospace => db.set_monospace_family(*fallback_name),
+                    Family::Cursive => db.set_cursive_family(*fallback_name),
+                    Family::Fantasy => db.set_fantasy_family(*fallback_name),
+                    _ => {}
+                }
             }
         }
     }
@@ -356,11 +373,6 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use usvg::fontdb::{Database, Family, Query};
-
-    const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     #[test]
     fn renders_parsed_svg_at_requested_size() -> Result<()> {
@@ -389,6 +401,18 @@ mod tests {
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
         Ok(())
     }
+
+}
+
+#[cfg(all(test, feature = "svg-text"))]
+mod text_tests {
+    use super::svg_text::*;
+    use super::*;
+    use usvg::fontdb::{Database, Family, Query};
+
+    const IBM_PLEX_REGULAR: &[u8] =
+        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();

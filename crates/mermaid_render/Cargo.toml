@@ -17,7 +17,8 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
-gpui.workspace = true
+# Diagram labels are SVG `<text>`.
+gpui = { workspace = true, features = ["svg-text"] }
 merman = { workspace = true, features = [
     "layout-cytoscape",
     "svg",
@@ -30,7 +31,7 @@ ztracing.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 mermaid_render = { workspace = true, features = ["test-support"] }
-usvg.workspace = true
+usvg = { workspace = true, features = ["text"] }
 
 [package.metadata.cargo-shear]
 ignored = ["tracing"]

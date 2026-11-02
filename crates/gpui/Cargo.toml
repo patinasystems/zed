@@ -36,6 +36,10 @@ inspector = ["gpui_macros/inspector"]
 # Tracks every entity handle so tests can assert nothing leaked. Also enabled
 # by setting `GPUI_LEAK_DETECTION` when building; see `build.rs`.
 leak-detection = []
+# `<text>` in SVGs (`svg_renderer::svg_text`): resvg's text layout over fontdb, with the
+# system's and the bundled fonts. Without it, rustybuzz and fontdb stay out of the build and
+# text in an SVG draws nothing.
+svg-text = ["resvg/text", "resvg/system-fonts", "resvg/memmap-fonts", "usvg/text"]
 # `Window::render_to_image` outside tests: capture what a window draws (macOS).
 window-capture = []
 font-kit = []
