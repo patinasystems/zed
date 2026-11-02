@@ -77,7 +77,8 @@ float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float
 
 // ---- Instance records (`gpui::InstanceTables`) ----
 // Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
+// distinct content masks (their bounds, then radii and rounded bounds when the index has
+// MASK_ROUNDED set), transformations (2 texels, the identity at texel 0, never read) and
 // each primitive's aux record. `load_*` expand a record into the primitive's full layout.
 
 // A path vertex expanded from its `PathVertexRecord` and its path's record.
@@ -2515,15 +2516,34 @@ Hsla texel_hsla(float4 texel) {
   return color;
 }
 
+// Reads only what the mask has: a fragment that needs no bounds (`content_mask_alpha`) reads
+// nothing for a rectangular clip.
 ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) {
   ContentMask_ScaledPixels mask;
-  mask.bounds = texel_bounds(tables[index]);
-  mask.corner_radii = texel_corners(tables[index + 1]);
-  mask.rounded_bounds = texel_bounds(tables[index + 2]);
+  uint at = index & 0x3fffffffu;
+  mask.bounds = texel_bounds(tables[at]);
+  if ((index & 0x40000000u) != 0) {
+    mask.corner_radii = texel_corners(tables[at + 1]);
+    mask.rounded_bounds = texel_bounds(tables[at + 2]);
+  } else {
+    mask.corner_radii = texel_corners(float4(0.));
+    mask.rounded_bounds = mask.bounds;
+  }
   return mask;
 }
 
 TransformationMatrix load_transformation(constant float4 *tables, uint index) {
+  if (index == 0) {
+    // The identity: no table read.
+    TransformationMatrix identity;
+    identity.rotation_scale[0][0] = 1.;
+    identity.rotation_scale[0][1] = 0.;
+    identity.rotation_scale[1][0] = 0.;
+    identity.rotation_scale[1][1] = 1.;
+    identity.translation[0] = 0.;
+    identity.translation[1] = 0.;
+    return identity;
+  }
   float4 rotation_scale = tables[index];
   float4 translation = tables[index + 1];
   TransformationMatrix transformation;
