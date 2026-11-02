@@ -2868,7 +2868,7 @@ mod content_mask_tests {
     fn elliptical_masks_clip_by_their_ellipse() {
         let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
         // A 100 x 60 card with 20 x 10 px corners.
-        let card = ContentMask::elliptical(rect(0., 0., 100., 60.), Corners::all(px(20.)), Corners::all(px(10.)));
+        let card = ContentMask::<Pixels>::elliptical(rect(0., 0., 100., 60.), Corners::all(px(20.)), Corners::all(px(10.)));
         assert!(card.is_rounded());
         assert_eq!(card.vertical_radii(), Corners::all(px(10.)));
         assert_eq!(card.inscribed_radii(), Corners::all(px(10.)));
@@ -2878,7 +2878,7 @@ mod content_mask_tests {
         assert!(card.contains(&point(px(12.), px(3.))));
         assert!(card.contains(&point(px(50.), px(0.5))), "straight top edge");
         // Equal radii are a circular mask, stored as one.
-        let round = ContentMask::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), Corners::all(px(3.)));
+        let round = ContentMask::<Pixels>::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), Corners::all(px(3.)));
         assert_eq!(round, ContentMask::rounded(rect(0., 0., 10., 10.), Corners::all(px(3.))));
         // A square clip inside keeps the ellipse.
         let tile = ContentMask::from(rect(0., 0., 30., 30.)).intersect(&card);

@@ -819,7 +819,7 @@ impl Style {
                     (Corners::default(), Corners::default())
                 };
 
-                Some(ContentMask::elliptical(bounds, radii_x, radii_y))
+                Some(ContentMask::<Pixels>::elliptical(bounds, radii_x, radii_y))
             }
         }
     }
