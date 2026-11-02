@@ -3429,30 +3429,141 @@ mod tests {
         }
     }
 
-    /// Fill-bound quads stay at their recorded cost on this GPU: each fill's median frame time
-    /// within 8% of `quad_gradient_baseline.tsv` (GPU name, fill, ms). Quads read their whole
+    /// GPU time of a reference fill drawn like `gradient_test_scene::bench`'s quads (200
+    /// overlapping quarter-screen rects at `width` x `height`, blended) with a fragment that only
+    /// returns a color: the cost of the pixels alone at the GPU's current clocks.
+    struct ReferenceFill {
+        queue: metal::CommandQueue,
+        pipeline: metal::RenderPipelineState,
+        target: metal::Texture,
+    }
+
+    impl ReferenceFill {
+        const SHADERS: &str = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 reference_vertex(uint v [[vertex_id]], uint i [[instance_id]]) {
+                float2 corner = float2(float(v == 1 || v == 2 || v == 4), float(v == 2 || v == 4 || v == 5));
+                float2 origin = float2(float(i * 37u % 100u), float(i * 61u % 100u)) / 100.0 * 0.5;
+                float2 at = origin + corner * 0.5;
+                return float4(at.x * 2.0 - 1.0, 1.0 - at.y * 2.0, 0.0, 1.0);
+            }
+            fragment float4 reference_fragment() { return float4(0.31, 0.49, 1.0, 1.0); }
+        "#;
+
+        fn new(width: u64, height: u64) -> Self {
+            let device = metal::Device::system_default().expect("a Metal device");
+            let library = device
+                .new_library_with_source(Self::SHADERS, &metal::CompileOptions::new())
+                .expect("reference shaders");
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_vertex_function(Some(&library.get_function("reference_vertex", None).unwrap()));
+            descriptor.set_fragment_function(Some(&library.get_function("reference_fragment", None).unwrap()));
+            let color = descriptor.color_attachments().object_at(0).unwrap();
+            color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            color.set_blending_enabled(true);
+            color.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+            color.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+            let pipeline = device.new_render_pipeline_state(&descriptor).expect("reference pipeline");
+            let texture = metal::TextureDescriptor::new();
+            texture.set_width(width);
+            texture.set_height(height);
+            texture.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            texture.set_storage_mode(metal::MTLStorageMode::Private);
+            texture.set_usage(metal::MTLTextureUsage::RenderTarget);
+            let target = device.new_texture(&texture);
+            Self { queue: device.new_command_queue(), pipeline, target }
+        }
+
+        fn frame_ms(&self, quads: u64) -> f64 {
+            let pass = metal::RenderPassDescriptor::new();
+            let color = pass.color_attachments().object_at(0).unwrap();
+            color.set_texture(Some(&self.target));
+            color.set_load_action(metal::MTLLoadAction::Clear);
+            color.set_store_action(metal::MTLStoreAction::Store);
+            let cb = self.queue.new_command_buffer();
+            let encoder = cb.new_render_command_encoder(pass);
+            encoder.set_render_pipeline_state(&self.pipeline);
+            encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, quads);
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let (start, end): (f64, f64) = unsafe {
+                let cb = &*(cb.as_ptr() as *const AnyObject);
+                (objc2::msg_send![cb, GPUStartTime], objc2::msg_send![cb, GPUEndTime])
+            };
+            (end - start) * 1e3
+        }
+    }
+
+    /// Fill-bound quads stay at their recorded cost: each fill's frame time as a multiple of a
+    /// reference fill of the same pixels ([`ReferenceFill`], measured interleaved in the same
+    /// process, so GPU clock states cancel), within 10% of the multiple recorded for this GPU in
+    /// `quad_gradient_baseline.tsv` (GPU name, fill, multiple). The least of three passes'
+    /// multiples counts, which drops a pass another process slowed. Quads read their whole
     /// struct per pixel; expanding an instance record per pixel instead cost these frames 12-17%
-    /// on M4 Max (PR 4793), which this catches. A GPU with no baseline prints its times; record
-    /// them with `GPUI_RECORD_QUAD_BASELINE=1`. Run on an idle Mac with
+    /// on M4 Max (PR 4793), which this catches. A GPU with no baseline prints its multiples;
+    /// record them with `GPUI_RECORD_QUAD_BASELINE=1`. Run on an idle Mac with
     /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib quad_gradient_frame_cost_stays_at_baseline -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn quad_gradient_frame_cost_stays_at_baseline() {
-        use gpui::gradient_test_scene::BenchFill;
-        const TOLERANCE: f64 = 1.08;
+        use gpui::gradient_test_scene::{BenchFill, bench};
+        const TOLERANCE: f64 = 1.10;
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/quad_gradient_baseline.tsv");
         let gpu = metal::Device::system_default().expect("a Metal device").name().to_string();
+        let (width, height) = (2880, 1800);
+        let viewport = size(DevicePixels(width), DevicePixels(height));
         let fills = [BenchFill::Solid, BenchFill::TwoStop, BenchFill::Linear(8)];
-        let medians = gradient_frame_medians(&fills, 60);
+        let scenes: Vec<Scene> =
+            fills.iter().map(|fill| bench(200, width as f32, height as f32, *fill)).collect();
+        let mut renderer = MetalHeadlessRenderer::new();
+        let reference = ReferenceFill::new(width as u64, height as u64);
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut multiples = vec![f64::INFINITY; fills.len()];
+        for _ in 0..3 {
+            let mut quad_ms = vec![Vec::new(); fills.len()];
+            let mut reference_ms = vec![Vec::new(); fills.len()];
+            for round in 0..45 {
+                for (k, scene) in scenes.iter().enumerate() {
+                    gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, viewport)
+                        .expect("render");
+                    let mut recorded = retained_stats::take_gpu();
+                    for _ in 0..100 {
+                        if !recorded.is_empty() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        recorded = retained_stats::take_gpu();
+                    }
+                    let fill = reference.frame_ms(200);
+                    if round >= 5 {
+                        quad_ms[k].extend(recorded);
+                        reference_ms[k].push(fill);
+                    }
+                }
+            }
+            for k in 0..fills.len() {
+                let multiple = median(quad_ms[k].clone()) / median(reference_ms[k].clone());
+                multiples[k] = multiples[k].min(multiple);
+            }
+        }
         let measured: Vec<(String, f64)> =
-            fills.iter().map(|fill| format!("{fill:?}")).zip(medians).collect();
+            fills.iter().map(|fill| format!("{fill:?}")).zip(multiples).collect();
         let recorded = std::fs::read_to_string(path).unwrap_or_default();
         let baseline: Vec<(String, f64)> = recorded
             .lines()
             .filter_map(|line| {
                 let mut fields = line.split('\t');
-                let (device, fill, ms) = (fields.next()?, fields.next()?, fields.next()?);
-                (device == gpu).then(|| Some((fill.to_string(), ms.parse().ok()?)))?
+                let (device, fill, multiple) = (fields.next()?, fields.next()?, fields.next()?);
+                (device == gpu).then(|| Some((fill.to_string(), multiple.parse().ok()?)))?
             })
             .collect();
         if std::env::var_os("GPUI_RECORD_QUAD_BASELINE").is_some() {
@@ -3461,7 +3572,7 @@ mod tests {
                 .filter(|line| !line.starts_with(&format!("{gpu}\t")))
                 .map(str::to_string)
                 .collect();
-            lines.extend(measured.iter().map(|(fill, ms)| format!("{gpu}\t{fill}\t{ms:.3}")));
+            lines.extend(measured.iter().map(|(fill, multiple)| format!("{gpu}\t{fill}\t{multiple:.3}")));
             std::fs::write(path, lines.join("\n") + "\n").expect("write the baseline");
             println!("recorded {gpu}: {measured:?}");
             return;
@@ -3470,14 +3581,14 @@ mod tests {
             println!("no baseline for {gpu}: {measured:?} (record with GPUI_RECORD_QUAD_BASELINE=1)");
             return;
         }
-        for (fill, ms) in &measured {
+        for (fill, multiple) in &measured {
             let Some((_, base)) = baseline.iter().find(|(name, _)| name == fill) else {
                 continue;
             };
-            println!("{fill}: GPU {ms:.3} ms per frame, baseline {base:.3} ms");
+            println!("{fill}: {multiple:.3}x the reference fill, baseline {base:.3}x");
             assert!(
-                *ms <= base * TOLERANCE,
-                "{fill} quads cost {ms:.3} ms per frame on {gpu}, over {:.0}% above the {base:.3} ms baseline",
+                *multiple <= base * TOLERANCE,
+                "{fill} quads cost {multiple:.3}x a reference fill on {gpu}, over {:.0}% above the {base:.3}x baseline",
                 (TOLERANCE - 1.) * 100.
             );
         }
