@@ -382,6 +382,21 @@ impl TextSystem {
             .font_id_for_postscript_name(postscript_name)
     }
 
+    /// [`Self::font_id_for_postscript_name`] at the variation coordinates `variations`
+    /// (OpenType axis tag, user value), for text a shaper outside GPUI laid out at a variable
+    /// font's instance between its named ones. Without variations, the face itself.
+    pub fn font_id_for_postscript_name_with_variations(
+        &self,
+        postscript_name: &str,
+        variations: &[(u32, f32)],
+    ) -> Option<FontId> {
+        if variations.is_empty() {
+            return self.font_id_for_postscript_name(postscript_name);
+        }
+        self.platform_text_system
+            .font_id_for_postscript_name_with_variations(postscript_name, variations)
+    }
+
     /// Resolves the specified font, falling back to the default font stack if
     /// the font fails to load.
     ///
