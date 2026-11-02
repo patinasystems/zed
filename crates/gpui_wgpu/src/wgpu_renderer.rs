@@ -6,7 +6,7 @@ use gpui::{
     AtlasTextureId, BackdropFilter, Bounds, DevicePixels, GpuSpecs, InstanceTables, Path,
     PathRecord, PathVertexRecord, PolychromeSpriteRecord, PrimitiveBatch, QuadRecord, RebaseRecord,
     ScaledPixels, Scene, ShadowRecord, Size, SpriteRecord, UnderlineRecord,
-    get_gamma_correction_ratios,
+    get_gamma_correction_ratios, point, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -107,6 +107,267 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    /// Where `bounds` is in the path atlas, from where it is drawn: whole pixels.
+    atlas_offset: [f32; 2],
+}
+
+/// Where a scene's paths rasterize: an atlas the size of their copy regions, not of
+/// the target. Each path batch's regions get a place in a chunk, packed in shelves; a
+/// path draws at its region's place (its record's atlas offset). A chunk is one
+/// rasterization pass (one clear and one resolve, for the area of its places) before
+/// the batches that read it, which then draw in the target's pass. A scene has more
+/// than one chunk only when its regions do not fit in the largest texture.
+#[derive(Default)]
+struct PathAtlasPlan {
+    /// Each chunk's atlas size and the path batches it holds (indices into `batches`).
+    chunks: Vec<(Size<DevicePixels>, Range<usize>)>,
+    /// The scene's path batches, in draw order.
+    batches: Vec<PlannedPathBatch>,
+}
+
+struct PlannedPathBatch {
+    chunk: usize,
+    /// The batch's paths that draw (indices into `Scene::paths`), in order.
+    paths: Vec<usize>,
+    /// The regions to copy from the atlas.
+    sprites: Vec<PathSprite>,
+}
+
+/// A chunk of a scene's path atlas, rasterized: what its batches' sprites read.
+struct PathAtlas {
+    chunk: usize,
+    msaa: Option<Scratch>,
+    resolve: Scratch,
+    bind_group: wgpu::BindGroup,
+}
+
+/// A whole-pixel rectangle: its first pixel and its end, exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PixelRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl PixelRect {
+    /// The pixels a draw of `bounds` touches, within `0..limit`; `None` when none.
+    fn covering(bounds: &Bounds<ScaledPixels>, limit: [i32; 2]) -> Option<Self> {
+        let rect = Self {
+            x0: (bounds.origin.x.0.floor() as i32).max(0),
+            y0: (bounds.origin.y.0.floor() as i32).max(0),
+            x1: ((bounds.origin.x.0 + bounds.size.width.0).ceil() as i32).min(limit[0]),
+            y1: ((bounds.origin.y.0 + bounds.size.height.0).ceil() as i32).min(limit[1]),
+        };
+        (rect.x1 > rect.x0 && rect.y1 > rect.y0).then_some(rect)
+    }
+
+    fn width(&self) -> i32 {
+        self.x1 - self.x0
+    }
+
+    fn height(&self) -> i32 {
+        self.y1 - self.y0
+    }
+
+    /// Whether the two share a pixel.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// A batch's copy regions: the pixels its paths touch, merged where they share a pixel,
+/// so that every pixel is copied once, with everything drawn into it (paths can be
+/// translucent, and paths of one draw order overlap when painted in one
+/// `Window::paint_layer`). More than 256 paths copy their union. Each region lists its
+/// paths in draw order.
+fn path_regions(paths: &[(usize, PixelRect)]) -> Vec<(PixelRect, Vec<usize>)> {
+    if paths.len() > 256 {
+        let union = paths
+            .iter()
+            .map(|(_, rect)| *rect)
+            .reduce(|a, b| a.union(&b))
+            .expect("more than 256 paths");
+        let mut indices: Vec<usize> = paths.iter().map(|(index, _)| *index).collect();
+        indices.sort_unstable();
+        return vec![(union, indices)];
+    }
+    let mut regions: Vec<(PixelRect, Vec<usize>)> = Vec::new();
+    for &(index, rect) in paths {
+        let mut region = (rect, vec![index]);
+        // Merge every region the new one overlaps, again until none overlaps it.
+        while let Some(i) = regions.iter().position(|(r, _)| r.overlaps(&region.0)) {
+            let (r, mut indices) = regions.swap_remove(i);
+            region.0 = region.0.union(&r);
+            indices.append(&mut region.1);
+            region.1 = indices;
+        }
+        regions.push(region);
+    }
+    for (_, indices) in &mut regions {
+        indices.sort_unstable();
+    }
+    regions
+}
+
+/// Next-fit shelf packing into a width, up to a height.
+struct ShelfPacker {
+    width: i32,
+    max_height: i32,
+    x: i32,
+    shelf_y: i32,
+    shelf_height: i32,
+}
+
+impl ShelfPacker {
+    fn new(width: i32, max_height: i32) -> Self {
+        Self {
+            width,
+            max_height,
+            x: 0,
+            shelf_y: 0,
+            shelf_height: 0,
+        }
+    }
+
+    fn height(&self) -> i32 {
+        self.shelf_y + self.shelf_height
+    }
+
+    fn is_empty(&self) -> bool {
+        self.height() == 0
+    }
+
+    /// Places every rectangle, all or none.
+    fn place_all(&mut self, rects: &[PixelRect]) -> Option<Vec<(i32, i32)>> {
+        let saved = (self.x, self.shelf_y, self.shelf_height);
+        let mut places = Vec::with_capacity(rects.len());
+        for rect in rects {
+            let (width, height) = (rect.width(), rect.height());
+            if self.x + width > self.width {
+                self.shelf_y += self.shelf_height;
+                self.x = 0;
+                self.shelf_height = 0;
+            }
+            if width > self.width || self.shelf_y + height > self.max_height {
+                (self.x, self.shelf_y, self.shelf_height) = saved;
+                return None;
+            }
+            places.push((self.x, self.shelf_y));
+            self.x += width;
+            self.shelf_height = self.shelf_height.max(height);
+        }
+        Some(places)
+    }
+}
+
+/// Plans `scene`'s path atlas for a target of `viewport` (see [`PathAtlasPlan`]) and
+/// writes each drawn path's atlas offset into its record.
+fn plan_path_atlas(
+    scene: &Scene,
+    viewport: [i32; 2],
+    max_texture_size: u32,
+    tables: &mut InstanceTables,
+    path_records: &[PathRecord],
+) -> PathAtlasPlan {
+    let mut plan = PathAtlasPlan::default();
+    if scene.paths.is_empty() {
+        return plan;
+    }
+    let mut batches: Vec<Vec<(PixelRect, Vec<usize>)>> = Vec::new();
+    let mut touched = Vec::new();
+    for batch in scene.batches() {
+        if let PrimitiveBatch::Paths(range) = batch {
+            touched.clear();
+            touched.extend(range.filter_map(|index| {
+                Some((
+                    index,
+                    PixelRect::covering(&scene.paths[index].clipped_bounds(), viewport)?,
+                ))
+            }));
+            batches.push(path_regions(&touched));
+        }
+    }
+    let max = max_texture_size.min(i32::MAX as u32) as i32;
+    let rects = || batches.iter().flatten().map(|(rect, _)| rect);
+    let area: f64 = rects()
+        .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
+        .sum();
+    let widest = rects().map(PixelRect::width).max().unwrap_or(1);
+    // About square (shelves leave some height unused), never narrower than a region.
+    let width = (((area.sqrt() * 1.25) as u32)
+        .max(widest as u32)
+        .max(1)
+        .next_multiple_of(GROUP_IMAGE_STEP) as i32)
+        .min(max);
+    let finish_chunk = |plan: &mut PathAtlasPlan, packer: &ShelfPacker, start: usize| {
+        let height =
+            ((packer.height().max(1) as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
+        let size = size(DevicePixels(width), DevicePixels(height));
+        plan.chunks.push((size, start..plan.batches.len()));
+    };
+    let mut packer = ShelfPacker::new(width, max);
+    let mut chunk_start = 0;
+    for mut regions in batches {
+        let mut rects: Vec<PixelRect> = regions.iter().map(|(rect, _)| *rect).collect();
+        let mut places = packer.place_all(&rects);
+        if places.is_none() && !packer.is_empty() {
+            finish_chunk(&mut plan, &packer, chunk_start);
+            chunk_start = plan.batches.len();
+            packer = ShelfPacker::new(width, max);
+            places = packer.place_all(&rects);
+        }
+        if places.is_none() {
+            // Regions that together do not fit an empty atlas copy their union, which
+            // is within the target, so it fits.
+            let union = rects.iter().copied().reduce(|a, b| a.union(&b));
+            let mut indices: Vec<usize> = regions.drain(..).flat_map(|(_, i)| i).collect();
+            indices.sort_unstable();
+            regions.extend(union.map(|union| (union, indices)));
+            rects = regions.iter().map(|(rect, _)| *rect).collect();
+            places = packer.place_all(&rects);
+        }
+        let places = places.unwrap_or_default();
+        let mut paths = Vec::new();
+        let mut sprites = Vec::with_capacity(regions.len());
+        for ((rect, indices), (x, y)) in regions.iter().zip(places) {
+            let offset = [(x - rect.x0) as f32, (y - rect.y0) as f32];
+            for &index in indices {
+                tables.set_path_atlas_offset(path_records[index], offset);
+            }
+            paths.extend_from_slice(indices);
+            sprites.push(PathSprite {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(rect.x0 as f32), ScaledPixels(rect.y0 as f32)),
+                    size: size(
+                        ScaledPixels(rect.width() as f32),
+                        ScaledPixels(rect.height() as f32),
+                    ),
+                },
+                atlas_offset: offset,
+            });
+        }
+        // Rasterized in draw order, so overlapping paths blend as painted.
+        paths.sort_unstable();
+        plan.batches.push(PlannedPathBatch {
+            chunk: plan.chunks.len(),
+            paths,
+            sprites,
+        });
+    }
+    if plan.batches.len() > chunk_start {
+        finish_chunk(&mut plan, &packer, chunk_start);
+    }
+    plan
 }
 
 /// Encoded records waiting for their scene's table to be written (whose first texel WebGL
@@ -436,7 +697,8 @@ fn bucket(size: u32) -> u32 {
     size.max(1).next_multiple_of(GROUP_IMAGE_STEP)
 }
 
-/// Offscreen textures (group images, blur and backdrop copies) by size, reused
+/// Offscreen textures (group images, blur and backdrop copies, path atlases) by size and
+/// sample count, reused
 /// within and across frames. A texture released during a frame is reused later in
 /// it: wgpu orders the later pass after the earlier ones. Textures a frame did not
 /// use are freed at its end.
@@ -452,12 +714,15 @@ struct PooledTexture {
 }
 
 impl TexturePool {
+    /// A texture of `width` × `height`; a multisampled one (`sample_count` > 1) is only
+    /// a render attachment, to resolve from.
     fn acquire(
         &self,
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        sample_count: u32,
     ) -> Scratch {
         let (width, height) = (width.max(1), height.max(1));
         let mut entries = self.entries.borrow_mut();
@@ -465,6 +730,7 @@ impl TexturePool {
             !entry.in_use
                 && entry.scratch.texture.width() == width
                 && entry.scratch.texture.height() == height
+                && entry.scratch.texture.sample_count() == sample_count
         }) {
             entry.in_use = true;
             entry.used = true;
@@ -478,13 +744,17 @@ impl TexturePool {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+            usage: if sample_count > 1 {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+            },
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -508,6 +778,12 @@ impl TexturePool {
         }
     }
 
+    fn clear(&self) {
+        for entry in self.entries.borrow_mut().drain(..) {
+            entry.scratch.texture.destroy();
+        }
+    }
+
     fn end_frame(&self) {
         let mut entries = self.entries.borrow_mut();
         entries.retain(|entry| entry.used);
@@ -523,7 +799,10 @@ impl TexturePool {
             .iter()
             .map(|entry| {
                 let texture = &entry.scratch.texture;
-                u64::from(texture.width()) * u64::from(texture.height()) * 4
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * 4
+                    * u64::from(texture.sample_count())
             })
             .sum()
     }
@@ -561,6 +840,8 @@ struct InstanceBindings {
     /// Each path's record in the table (offset like the other records' indices), which its
     /// vertices share.
     path_records: Vec<PathRecord>,
+    /// Where the scene's paths rasterize.
+    path_atlas: PathAtlasPlan,
     /// Whether any primitive has an elliptical content mask: the scene draws with the
     /// elliptical variants of [`MaskPipelines`].
     elliptical_masks: bool,
@@ -604,10 +885,6 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
     retained: retained_shapes::RetainedState,
     marks: marks::MarksState,
     /// Group images and their blur and backdrop copies, reused across frames and
@@ -626,11 +903,10 @@ struct CachedTextureBindGroup {
 }
 
 impl WgpuResources {
+    /// Frees the offscreen textures (path atlases, group images and copies); frames
+    /// make them again as they need them.
     fn invalidate_intermediate_textures(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
+        self.texture_pool.clear();
     }
 }
 
@@ -1611,58 +1887,6 @@ impl WgpuRendererCore {
             uniform_layout,
         }
     }
-
-    fn create_path_intermediate(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_intermediate"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    fn create_msaa_if_needed(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        sample_count: u32,
-    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
-        if sample_count <= 1 {
-            return None;
-        }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_msaa"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Some((texture, view))
-    }
 }
 
 impl WgpuRenderer {
@@ -1701,17 +1925,8 @@ impl WgpuRenderer {
             warn!("Failed to poll device during resize: {e:?}");
         }
 
-        // Destroy old textures before allocating new ones to avoid GPU memory spikes
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
-        }
-
-        // Invalidate intermediate textures - they will be lazily recreated
-        // in draw() after we confirm the surface is healthy. This avoids
-        // panics when the device/surface is in an invalid state during resize.
+        // Free offscreen textures before the surface reallocates, to avoid GPU memory
+        // spikes; frames make them again as they need them.
         resources.invalidate_intermediate_textures();
 
         if let RendererState::Ready { surface, core } = &self.state {
@@ -2032,10 +2247,6 @@ impl WgpuRendererCore {
                 globals_bind_group,
                 path_globals_bind_group,
                 instance_data,
-                path_intermediate_texture: None,
-                path_intermediate_view: None,
-                path_msaa_texture: None,
-                path_msaa_view: None,
                 retained: Default::default(),
                 marks: Default::default(),
                 texture_pool: TexturePool::default(),
@@ -2069,41 +2280,6 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        if self
-            .resources
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
-        {
-            return;
-        }
-
-        let format = self.target_format;
-        let path_sample_count = self.rendering_params.path_sample_count;
-        let resources = &mut self.resources;
-
-        let (texture, view) =
-            Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(texture);
-        resources.path_intermediate_view = Some(view);
-
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            width,
-            height,
-            path_sample_count,
-        )
-        .map(|(texture, view)| (Some(texture), Some(view)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
-    }
 
     fn render_frame(
         &mut self,
@@ -2125,7 +2301,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -2250,9 +2425,9 @@ impl WgpuRendererCore {
         };
         let mut retained_base = 0;
         let mut marks_base = 0;
-        for drawn in &scenes {
+        for &(drawn, viewport) in &viewports {
             let instance_bindings = self
-                .write_instances(drawn, &mut instance_offset)
+                .write_instances(drawn, viewport, &mut instance_offset)
                 .with_context(|| {
                     format!(
                         "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -2367,6 +2542,20 @@ impl WgpuRendererCore {
             .context("scene not prepared for the frame")?;
         let instance_bindings = &drawn.instance_bindings;
         let target_view = target.view;
+        // The first chunk of paths rasterizes before the target's pass opens, so the
+        // batches that read it draw in that pass.
+        let mut path_atlas = if instance_bindings.path_atlas.chunks.is_empty() {
+            None
+        } else {
+            Some(self.rasterize_path_chunk(
+                encoder,
+                scene,
+                instance_bindings,
+                0,
+                instance_offset,
+            )?)
+        };
+        let mut path_batches = instance_bindings.path_atlas.batches.iter();
         let mut pass = clear.map(|color| target_pass(encoder, target, Some(color), "main_pass"));
 
         for batch in scene.batches() {
@@ -2390,29 +2579,37 @@ impl WgpuRendererCore {
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range.clone()];
-                    if paths.is_empty() {
+                PrimitiveBatch::Paths(_) => {
+                    let batch = path_batches
+                        .next()
+                        .context("path batch not in the scene's path atlas plan")?;
+                    if batch.sprites.is_empty() {
                         continue;
                     }
-
-                    pass = None;
-                    let rasterized = self.draw_paths_to_intermediate(
-                        encoder,
-                        paths,
-                        &instance_bindings.path_records[range],
-                        &instance_bindings.tables,
-                        instance_bindings.elliptical_masks,
-                        instance_offset,
-                        size,
-                    )?;
-                    if rasterized {
-                        self.draw_paths_from_intermediate(
-                            paths,
+                    if path_atlas
+                        .as_ref()
+                        .is_none_or(|atlas| atlas.chunk != batch.chunk)
+                    {
+                        // The next chunk replaces the last, whose batches have drawn.
+                        pass = None;
+                        if let Some(atlas) = path_atlas.take() {
+                            self.release_path_atlas(atlas);
+                        }
+                        path_atlas = Some(self.rasterize_path_chunk(
+                            encoder,
+                            scene,
+                            instance_bindings,
+                            batch.chunk,
                             instance_offset,
-                            open_pass(&mut pass, encoder, target),
-                        )?;
+                        )?);
                     }
+                    let atlas = path_atlas.as_ref().expect("rasterized above");
+                    self.draw_path_sprites(
+                        &batch.sprites,
+                        atlas,
+                        instance_offset,
+                        open_pass(&mut pass, encoder, target),
+                    )?;
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_instances(
                     &instance_bindings.underlines,
@@ -2524,6 +2721,10 @@ impl WgpuRendererCore {
                 }
             }
         }
+        drop(pass);
+        if let Some(atlas) = path_atlas {
+            self.release_path_atlas(atlas);
+        }
         Ok(())
     }
 
@@ -2611,6 +2812,7 @@ impl WgpuRendererCore {
             self.target_format,
             bucket(size.width.0 as u32),
             bucket(size.height.0 as u32),
+            1,
         );
         let image_target = DrawTarget {
             view: &image.view,
@@ -2720,6 +2922,7 @@ impl WgpuRendererCore {
                     self.target_format,
                     bucket(image_size.width.0 as u32),
                     bucket(image_size.height.0 as u32),
+                    1,
                 );
                 let mask_target = DrawTarget {
                     view: &texture.view,
@@ -2941,7 +3144,7 @@ impl WgpuRendererCore {
         let (width, height) = (width as u32, height as u32);
         let pool = &self.resources().texture_pool;
         let device = &self.resources().device;
-        let copy = pool.acquire(device, self.target_format, width, height);
+        let copy = pool.acquire(device, self.target_format, width, height, 1);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: frame_texture,
@@ -2974,8 +3177,8 @@ impl WgpuRendererCore {
         let scale = (sigma / 8.).ceil().max(1.);
         let small_width = ((width as f32) / scale).ceil().max(1.) as u32;
         let small_height = ((height as f32) / scale).ceil().max(1.) as u32;
-        let a = pool.acquire(device, self.target_format, small_width, small_height);
-        let b = pool.acquire(device, self.target_format, small_width, small_height);
+        let a = pool.acquire(device, self.target_format, small_width, small_height, 1);
+        let b = pool.acquire(device, self.target_format, small_width, small_height, 1);
         let (copy_view, a_view, b_view) = (&copy.view, &a.view, &b.view);
         let sigma = sigma / scale;
         let radius = (sigma * 3.).ceil() as i32;
@@ -3123,10 +3326,11 @@ impl WgpuRendererCore {
     fn write_instances(
         &mut self,
         scene: &Scene,
+        viewport: [f32; 2],
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
         let mut records = std::mem::take(&mut self.records);
-        let result = self.write_scene_records(scene, instance_offset, &mut records);
+        let result = self.write_scene_records(scene, viewport, instance_offset, &mut records);
         self.records = records;
         result
     }
@@ -3134,6 +3338,7 @@ impl WgpuRendererCore {
     fn write_scene_records(
         &mut self,
         scene: &Scene,
+        viewport: [f32; 2],
         instance_offset: &mut u64,
         records: &mut RecordScratch,
     ) -> Result<InstanceBindings> {
@@ -3178,6 +3383,13 @@ impl WgpuRendererCore {
         });
         let mut path_records: Vec<PathRecord> =
             scene.paths.iter().map(|path| tables.path(path)).collect();
+        let path_atlas = plan_path_atlas(
+            scene,
+            [viewport[0] as i32, viewport[1] as i32],
+            self.max_texture_size,
+            tables,
+            &path_records,
+        );
 
         let table_binding =
             self.write_instance_binding("tables_bind_group", instance_offset, tables.texels())?;
@@ -3220,6 +3432,7 @@ impl WgpuRendererCore {
             )?,
             tables: table_binding,
             path_records,
+            path_atlas,
             // Quads uploaded whole carry their masks outside the table.
             elliptical_masks: tables.has_elliptical_masks()
                 || (!webgl
@@ -3377,33 +3590,21 @@ impl WgpuRendererCore {
         }
     }
 
-    fn draw_paths_from_intermediate(
+    /// Draws a batch's regions from the path atlas into the pass.
+    fn draw_path_sprites(
         &mut self,
-        paths: &[Path<ScaledPixels>],
+        sprites: &[PathSprite],
+        atlas: &PathAtlas,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
-        // Each pixel is copied at most once (paths can be translucent): overlapping paths'
-        // bounds are copied as one region.
-        let sprites: Vec<PathSprite> = gpui::path_copy_bounds(paths)
-            .into_iter()
-            .map(|bounds| PathSprite { bounds })
-            .collect();
-
-        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
-            return Ok(());
-        };
         let instances =
-            self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
-        let texture = self.create_texture_bind_group(
-            "path_intermediate_texture_bind_group",
-            &path_intermediate_view,
-        );
+            self.write_instance_binding("path_sprites_bind_group", instance_offset, sprites)?;
         let resources = self.resources();
         pass.set_pipeline(&resources.pipelines.paths);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(2, &atlas.bind_group, &[]);
         pass.draw(
             0..4,
             instances.first_instance..instances.first_instance + sprites.len() as u32,
@@ -3411,49 +3612,67 @@ impl WgpuRendererCore {
         Ok(())
     }
 
-    fn draw_paths_to_intermediate(
+    /// Rasterizes the paths of `chunk` of the scene's path atlas plan into a pooled
+    /// atlas (multisampled, then resolved), each at its place, in one pass.
+    fn rasterize_path_chunk(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        paths: &[Path<ScaledPixels>],
-        path_records: &[PathRecord],
-        tables: &InstanceBinding,
-        elliptical_masks: bool,
+        scene: &Scene,
+        bindings: &InstanceBindings,
+        chunk: usize,
         instance_offset: &mut u64,
-        size: Size<DevicePixels>,
-    ) -> Result<bool> {
+    ) -> Result<PathAtlas> {
+        let (size, ref batches) = bindings.path_atlas.chunks[chunk];
         let mut vertices = std::mem::take(&mut self.records.path_vertices);
         vertices.clear();
-        for (path, &record) in paths.iter().zip(path_records) {
-            vertices.extend(InstanceTables::path_vertices(path, record));
+        for batch in &bindings.path_atlas.batches[batches.clone()] {
+            for &index in &batch.paths {
+                vertices.extend(InstanceTables::path_vertices(
+                    &scene.paths[index],
+                    bindings.path_records[index],
+                ));
+            }
         }
         let vertex_count = vertices.len() as u32;
-        let vertex_binding = if vertices.is_empty() {
-            Ok(None)
-        } else {
-            self.write_instance_binding("path_rasterization_bind_group", instance_offset, &vertices)
-                .map(Some)
-        };
+        let vertex_binding = (!vertices.is_empty())
+            .then(|| {
+                self.write_instance_binding(
+                    "path_rasterization_bind_group",
+                    instance_offset,
+                    &vertices,
+                )
+            })
+            .transpose();
         self.records.path_vertices = vertices;
-        let Some(vertex_binding) = vertex_binding? else {
-            return Ok(false);
-        };
+        let vertex_binding = vertex_binding?;
 
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let sample_count = self.rendering_params.path_sample_count;
+        let resources = &self.resources;
+        let resolve =
+            resources
+                .texture_pool
+                .acquire(&resources.device, self.target_format, width, height, 1);
+        let msaa = (sample_count > 1).then(|| {
+            resources.texture_pool.acquire(
+                &resources.device,
+                self.target_format,
+                width,
+                height,
+                sample_count,
+            )
+        });
+        let path_globals = self.group_globals(size).1;
         let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return Ok(false);
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
-            (msaa_view, Some(path_intermediate_view))
-        } else {
-            (path_intermediate_view, None)
-        };
-
         {
+            let (view, resolve_target) = match &msaa {
+                Some(msaa) => (&msaa.view, Some(&resolve.view)),
+                None => (&resolve.view, None),
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("path_rasterization_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
+                    view,
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3464,23 +3683,41 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
-
-            // The target may be smaller than the intermediate texture (a group's image).
-            pass.set_viewport(0., 0., size.width.0 as f32, size.height.0 as f32, 0., 1.);
-            pass.set_pipeline(resources.pipelines.path_rasterization.get(elliptical_masks));
-            pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
-            pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
-            pass.set_bind_group(3, &tables.bind_group, &[]);
-            // The path rasterization shader loads records by vertex index
-            // rather than instance index, so the allocation's base shifts the
-            // vertex range here.
-            pass.draw(
-                vertex_binding.first_instance..vertex_binding.first_instance + vertex_count,
-                0..1,
-            );
+            if let Some(vertex_binding) = &vertex_binding {
+                pass.set_pipeline(
+                    resources
+                        .pipelines
+                        .path_rasterization
+                        .get(bindings.elliptical_masks),
+                );
+                pass.set_bind_group(0, &path_globals, &[]);
+                pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
+                pass.set_bind_group(3, &bindings.tables.bind_group, &[]);
+                // The path rasterization shader loads records by vertex index
+                // rather than instance index, so the allocation's base shifts the
+                // vertex range here.
+                pass.draw(
+                    vertex_binding.first_instance..vertex_binding.first_instance + vertex_count,
+                    0..1,
+                );
+            }
         }
+        let bind_group = self.create_texture_bind_group("path_atlas_bind_group", &resolve.view);
+        Ok(PathAtlas {
+            chunk,
+            msaa,
+            resolve,
+            bind_group,
+        })
+    }
 
-        Ok(true)
+    /// Returns a path atlas's textures to the pool: later passes may reuse them.
+    fn release_path_atlas(&self, atlas: PathAtlas) {
+        let pool = &self.resources.texture_pool;
+        pool.release(&atlas.resolve.texture);
+        if let Some(msaa) = &atlas.msaa {
+            pool.release(&msaa.texture);
+        }
     }
 
     fn write_instance_binding<T>(
@@ -4309,6 +4546,210 @@ mod tests {
             "{:?}",
             batches.iter().map(|b| b.label()).collect::<Vec<_>>()
         );
+    }
+
+    fn rect_path(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        color: Hsla,
+        mask: Bounds<ScaledPixels>,
+    ) -> Path<ScaledPixels> {
+        let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+        let mut path = Path::new(at(x0, y0));
+        path.line_to(at(x1, y0));
+        path.line_to(at(x1, y1));
+        path.line_to(at(x0, y1));
+        path.line_to(at(x0, y0));
+        let mut path = path.scale(1.);
+        path.color = color.into();
+        path.content_mask = ContentMask::from(mask);
+        path
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    /// Copy regions merge paths that share a pixel, not only those whose bounds overlap:
+    /// two paths meeting at x = 10.5 both draw into pixel 10, which is copied once.
+    #[test]
+    fn path_regions_merge_paths_that_share_a_pixel() {
+        let rect = |x0, y0, x1, y1| PixelRect { x0, y0, x1, y1 };
+        let regions = path_regions(&[
+            (0, rect(0, 0, 11, 4)),
+            (1, rect(10, 0, 20, 4)),
+            (2, rect(20, 0, 24, 4)),
+            (3, rect(40, 0, 44, 4)),
+        ]);
+        let mut regions: Vec<_> = regions.into_iter().map(|(r, i)| (r.x0, r.x1, i)).collect();
+        regions.sort();
+        // 2 touches 1's edge (pixel 19 against 20) without sharing a pixel.
+        assert_eq!(
+            regions,
+            [(0, 20, vec![0, 1]), (20, 24, vec![2]), (40, 44, vec![3])]
+        );
+        let covering = PixelRect::covering(&scaled_bounds(-3.5, 2.25, 14., 1.), [8, 8]);
+        assert_eq!(covering, Some(rect(0, 2, 8, 4)));
+        assert_eq!(
+            PixelRect::covering(&scaled_bounds(9., 0., 2., 2.), [8, 8]),
+            None
+        );
+    }
+
+    /// A scene whose path regions outgrow the largest texture rasterizes in chunks, each
+    /// region placed once, within its chunk.
+    #[test]
+    fn path_atlas_plan_packs_regions_into_chunks() {
+        let full = scaled_bounds(0., 0., 400., 400.);
+        let mut scene = Scene::default();
+        for i in 0..6 {
+            // A quad over everything between each path splits the paths into six batches.
+            scene.insert_primitive(Quad {
+                bounds: full,
+                content_mask: ContentMask::from(full),
+                ..Default::default()
+            });
+            let x = 10. + 60. * i as f32;
+            scene.insert_primitive(rect_path(x, 10., x + 50., 110., gpui::red(), full));
+        }
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        // Room for two 50 × 100 regions per 128 × 128 atlas... at most.
+        let plan = plan_path_atlas(&scene, [400, 400], 128, &mut tables, &records);
+        assert_eq!(plan.batches.len(), 6);
+        assert!(plan.chunks.len() >= 3, "{} chunks", plan.chunks.len());
+        for (chunk, (size, batches)) in plan.chunks.iter().enumerate() {
+            assert!(size.width.0 <= 128 && size.height.0 <= 128, "{size:?}");
+            let mut placed = Vec::new();
+            for batch in &plan.batches[batches.clone()] {
+                assert_eq!(batch.chunk, chunk);
+                for sprite in &batch.sprites {
+                    let x = sprite.bounds.origin.x.0 + sprite.atlas_offset[0];
+                    let y = sprite.bounds.origin.y.0 + sprite.atlas_offset[1];
+                    let (w, h) = (sprite.bounds.size.width.0, sprite.bounds.size.height.0);
+                    assert!(x >= 0. && y >= 0., "{x}, {y}");
+                    assert!(x + w <= size.width.0 as f32 && y + h <= size.height.0 as f32);
+                    for &(px, py, pw, ph) in &placed {
+                        let apart: bool =
+                            x >= px + pw || px >= x + w || y >= py + ph || py >= y + h;
+                        assert!(apart, "places overlap");
+                    }
+                    placed.push((x, y, w, h));
+                }
+            }
+        }
+    }
+
+    /// Paths rasterize in the atlas and draw back where they belong: translucent paths of
+    /// one layer overlap once, paths meeting at a half pixel fill it as one coverage, a
+    /// path partly off the target draws its visible part, a masked path draws only
+    /// inside its mask, and batches between quads each read their own places.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn paths_draw_from_the_atlas_where_they_belong() -> anyhow::Result<()> {
+        use gpui::PlatformHeadlessRenderer;
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let full = scaled_bounds(0., 0., 64., 48.);
+        let white = gpui::white();
+        let translucent = |color: Hsla| Hsla { a: 0.5, ..color };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full,
+            content_mask: ContentMask::from(full),
+            background: white.into(),
+            ..Default::default()
+        });
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(4., 4., 20., 20., translucent(gpui::red()), full));
+        scene.insert_primitive(rect_path(
+            12.,
+            4.,
+            28.,
+            20.,
+            translucent(gpui::blue()),
+            full,
+        ));
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(30., 4., 4., 4.),
+            content_mask: ContentMask::from(full),
+            background: gpui::green().into(),
+            ..Default::default()
+        });
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(36., 4., 44.5, 12., gpui::black(), full));
+        scene.insert_primitive(rect_path(44.5, 4., 52., 12., gpui::black(), full));
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(30., 24., 4., 4.),
+            content_mask: ContentMask::from(full),
+            background: gpui::green().into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(rect_path(-6., 30., 6., 40., gpui::red(), full));
+        scene.insert_primitive(rect_path(
+            20.,
+            30.,
+            60.,
+            44.,
+            gpui::blue(),
+            scaled_bounds(40., 30., 10., 14.),
+        ));
+        scene.finish();
+        let batches = scene
+            .batches()
+            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(_)))
+            .count();
+        assert!(batches >= 3, "{batches} path batches");
+
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(64),
+                height: DevicePixels(48),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("path_atlas_wgpu.png"))?;
+        }
+        let check = |x: u32, y: u32, expected: [u8; 4]| {
+            let actual = image.get_pixel(x, y).0;
+            assert!(
+                actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 3),
+                "pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+            );
+        };
+        // Red at 50% over white; blue at 50% over that; blue alone.
+        check(8, 10, [255, 128, 128, 255]);
+        check(16, 10, [128, 64, 191, 255]);
+        check(24, 10, [128, 128, 255, 255]);
+        // Pixel 44: half of each black path. Their samples resolve together, so it is
+        // black (copied from separate places it would be 75% black, a seam).
+        check(40, 8, [0, 0, 0, 255]);
+        check(44, 8, [0, 0, 0, 255]);
+        check(48, 8, [0, 0, 0, 255]);
+        // Off the target's left edge, its visible part.
+        check(0, 35, [255, 0, 0, 255]);
+        check(5, 35, [255, 0, 0, 255]);
+        check(8, 35, [255, 255, 255, 255]);
+        // Masked to x 40..50.
+        check(25, 35, [255, 255, 255, 255]);
+        check(45, 35, [0, 0, 255, 255]);
+        check(55, 35, [255, 255, 255, 255]);
+        check(31, 5, [0, 128, 0, 255]);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -5375,7 +5816,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<QuadRecord>(), 16 * 4);
         assert_eq!(std::mem::size_of::<ShadowRecord>(), 24 * 4);
         assert_eq!(std::mem::size_of::<PathVertexRecord>(), 6 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);
         assert_eq!(std::mem::size_of::<UnderlineRecord>(), 12 * 4);
         assert_eq!(std::mem::size_of::<SpriteRecord>(), 16 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSpriteRecord>(), 16 * 4);

@@ -1493,6 +1493,8 @@ struct PathRasterizationVertex {
     color: Background,
     bounds: Bounds,
     content_mask: ContentMask,
+    // Where the path is drawn in the path atlas, from where it is drawn in the target.
+    atlas_offset: vec2<f32>,
 }
 
 
@@ -1510,7 +1512,8 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     let v = load_path_vertex(vertex_id);
 
     var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
+    // Drawn into its place in the path atlas (whose size is the viewport here).
+    out.position = to_device_position_impl(v.xy_position + v.atlas_offset);
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
@@ -1526,7 +1529,9 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     }
 
     let v = load_path_vertex(input.vertex_id);
-    let clip_alpha = content_mask_alpha(input.position.xy, v.content_mask);
+    // The pixel's position in the target, which the mask and the gradient are in.
+    let position = input.position.xy - v.atlas_offset;
+    let clip_alpha = content_mask_alpha(position, v.content_mask);
     let background = v.color;
     let bounds = v.bounds;
 
@@ -1546,7 +1551,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, position, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return (vec4<f32>(color.rgb * color.a * alpha, color.a * alpha)) * clip_alpha;
 }
@@ -1555,11 +1560,14 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    // Where the region is in the path atlas, from where it is drawn.
+    atlas_offset: vec2<f32>,
 }
 
 
 struct PathVarying {
     @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) atlas_offset: vec2<f32>,
 }
 
 @vertex
@@ -1569,14 +1577,14 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     // Don't apply content mask because it was already accounted for when rasterizing the path.
     var out = PathVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.atlas_offset = sprite.atlas_offset;
     return out;
 }
 
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
-    // The intermediate texture holds the paths at the target's pixels (it may be larger
-    // than the target, a group's image).
-    return textureLoad(t_sprite, vec2<i32>(input.position.xy), 0);
+    // The path atlas holds the region's pixels at a whole-pixel offset.
+    return textureLoad(t_sprite, vec2<i32>(input.position.xy + input.atlas_offset), 0);
 }
 
 // --- underlines --- //
@@ -2438,5 +2446,6 @@ fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
         load_background(bitcast<u32>(info.x), record.path + 3u, texel_hsla(load_table_texel(record.path + 1u))),
         texel_bounds(load_table_texel(record.path)),
         load_content_mask(record.content_mask),
+        info.yz,
     );
 }

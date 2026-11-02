@@ -134,8 +134,8 @@ fn load_path_vertex_record(vertex_id: u32) -> PathVertexRecord {
 }
 
 fn load_path_sprite(instance_id: u32) -> PathSprite {
-    var cursor = instance_cursor(instance_id * 4u);
-    return PathSprite(read_bounds(&cursor));
+    var cursor = instance_cursor(instance_id * 6u);
+    return PathSprite(read_bounds(&cursor), read_vec2_f32(&cursor));
 }
 
 fn load_underline_record(instance_id: u32) -> UnderlineRecord {

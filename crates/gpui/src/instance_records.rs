@@ -546,6 +546,15 @@ impl InstanceTables {
         }
     }
 
+    /// Places `record`'s path at `offset` device pixels from where it is drawn, in a renderer
+    /// that rasterizes paths into an atlas: texel 2 of the record holds it after the background
+    /// flags (0 unless set). Renderers that rasterize at the target's pixels ignore it.
+    pub fn set_path_atlas_offset(&mut self, record: PathRecord, offset: [f32; 2]) {
+        let texel = &mut self.texels[record.texel as usize + 2];
+        texel[1] = offset[0];
+        texel[2] = offset[1];
+    }
+
     /// `path`'s vertices, each pointing at `record` ([`InstanceTables::path`]).
     pub fn path_vertices<'a>(
         path: &'a Path<ScaledPixels>,
