@@ -47,7 +47,12 @@ mod apple_build {
             "AtlasTile".into(),
             "PathRasterizationInputIndex".into(),
             "PathVertex_ScaledPixels".into(),
-            "PathRasterizationVertex".into(),
+            "PathVertexRecord".into(),
+            "QuadRecord".into(),
+            "ShadowRecord".into(),
+            "UnderlineRecord".into(),
+            "SpriteRecord".into(),
+            "PolychromeSpriteRecord".into(),
             "ShadowInputIndex".into(),
             "Shadow".into(),
             "QuadInputIndex".into(),
@@ -78,6 +83,7 @@ mod apple_build {
             gpui_dir.join("src/color.rs"),
             gpui_dir.join("src/window.rs"),
             gpui_dir.join("src/platform.rs"),
+            gpui_dir.join("src/instance_records.rs"),
         ];
 
         // Source files from this crate
