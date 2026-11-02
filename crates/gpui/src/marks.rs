@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn uniforms_layout_matches_the_prelude() {
-        assert_eq!(std::mem::size_of::<MarksUniforms>(), 272);
+        assert_eq!(std::mem::size_of::<MarksUniforms>(), 336);
         assert_eq!(std::mem::offset_of!(MarksUniforms, content_mask), 64);
         assert_eq!(std::mem::offset_of!(MarksUniforms, clips), 80);
     }

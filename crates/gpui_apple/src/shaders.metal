@@ -1844,6 +1844,7 @@ struct RetainedClip {
   float2 t;
   float2 half_size;
   float4 radii; // top-left, top-right, bottom-right, bottom-left
+  float4 radii_y; // vertical radii, the same order; zero is circular
 };
 
 struct RetainedShapesUniforms {
@@ -2057,13 +2058,20 @@ float retained_clip_coverage(float2 pos, constant RetainedShapesUniforms *u) {
       return 0.0;
     }
     float2 p = float2(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
-    float d = retained_rect_sdf(p, c.half_size, c.radii);
-    // The distance's gradient in clip space, then in device pixels.
     float2 side = p.x >= 0.0 ? c.radii.yz : c.radii.xw;
     float radius = p.y >= 0.0 ? side.y : side.x;
-    float2 q = abs(p) - c.half_size + radius;
+    // An elliptical corner (a vertical radius; zero is circular) is its circle in a space whose
+    // y is scaled by rx / ry: a quadrant's distance depends on its own corner only.
+    float2 side_y = p.x >= 0.0 ? c.radii_y.yz : c.radii_y.xw;
+    float radius_y = p.y >= 0.0 ? side_y.y : side_y.x;
+    float k = (radius > 0.0 && radius_y > 0.0) ? radius / radius_y : 1.0;
+    p.y *= k;
+    float2 half_size = float2(c.half_size.x, c.half_size.y * k);
+    float d = retained_rect_sdf(p, half_size, float4(radius));
+    // The distance's gradient in clip space (through the y scale), then in device pixels.
+    float2 q = abs(p) - half_size + radius;
     float2 g = (q.x > 0.0 && q.y > 0.0) ? normalize(q) : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
-    g *= float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    g *= float2(p.x < 0.0 ? -1.0 : 1.0, (p.y < 0.0 ? -1.0 : 1.0) * k);
     float per_px = length(float2(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
     // The intersection: the least covered clip (a product would darken shared edges).
     coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));

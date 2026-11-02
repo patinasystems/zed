@@ -1873,6 +1873,7 @@ struct RetainedClip {
     t: vec2<f32>,
     half_size: vec2<f32>,
     radii: vec4<f32>, // top-left, top-right, bottom-right, bottom-left
+    radii_y: vec4<f32>, // vertical radii, the same order; zero is circular
 }
 
 struct RetainedShapesUniforms {
@@ -2089,14 +2090,21 @@ fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
         if c.half_size.x < 0.0 {
             return 0.0;
         }
-        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
-        let d = retained_rect_sdf(p, c.half_size, c.radii);
-        // The distance's gradient in clip space, then in device pixels.
+        var p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
         let side = select(c.radii.xw, c.radii.yz, p.x >= 0.0);
         let radius = select(side.x, side.y, p.y >= 0.0);
-        let q = abs(p) - c.half_size + radius;
+        // An elliptical corner (a vertical radius; zero is circular) is its circle in a space
+        // whose y is scaled by rx / ry: a quadrant's distance depends on its own corner only.
+        let side_y = select(c.radii_y.xw, c.radii_y.yz, p.x >= 0.0);
+        let radius_y = select(side_y.x, side_y.y, p.y >= 0.0);
+        let k = select(1.0, radius / radius_y, radius > 0.0 && radius_y > 0.0);
+        p.y *= k;
+        let half_size = vec2<f32>(c.half_size.x, c.half_size.y * k);
+        let d = retained_rect_sdf(p, half_size, vec4<f32>(radius));
+        // The distance's gradient in clip space (through the y scale), then in device pixels.
+        let q = abs(p) - half_size + radius;
         var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
-        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
+        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0) * k);
         let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
         // The intersection: the least covered clip (a product would darken shared edges).
         coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
