@@ -12,7 +12,7 @@
 //! to rounded rectangles in the buffer's space, rotated or not (a canvas
 //! frame that clips its content); unclipped draws pay one uniform check.
 
-use crate::{Bounds, ContentMask, DrawOrder, ScaledPixels, TransformationMatrix};
+use crate::{Bounds, ContentMask, Corners, DrawOrder, ScaledPixels, TransformationMatrix};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::{
@@ -401,6 +401,7 @@ pub(crate) fn clip_uniform(
         translation: [0.0; 2],
         half_size: [-1.0, -1.0],
         corner_radii: [0.0; 4],
+        corner_radii_y: [0.0; 4],
     };
     let (w, h) = (clip.width, clip.height);
     if !(w > 0.0 && h > 0.0) {
@@ -419,6 +420,7 @@ pub(crate) fn clip_uniform(
         translation: [tx as f32, ty as f32],
         half_size: [0.5 * w, 0.5 * h],
         corner_radii: clip.corner_radii.map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+        corner_radii_y: [0.0; 4],
     };
     let finite = uniform
         .matrix
@@ -438,19 +440,22 @@ pub(crate) fn rounded_mask_clip(mask: &ContentMask<ScaledPixels>) -> Option<Reta
     mask.is_rounded().then(|| {
         let b = mask.rounded_bounds;
         let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
-        // One radius per corner here: an elliptical corner clips by the circle inside it.
-        let r = mask.inscribed_radii();
+        let corners = |r: &Corners<ScaledPixels>| {
+            [r.top_left.0, r.top_right.0, r.bottom_right.0, r.bottom_left.0]
+        };
+        // Elliptical corners carry their vertical radii (zero where a corner is circular).
+        let (x, y) = (corners(&mask.corner_radii), corners(&mask.corner_radii_y));
+        let elliptical = y.iter().any(|r| *r > 0.0);
         RetainedClipUniform {
             matrix: [1.0, 0.0, 0.0, 1.0],
             translation: [-b.origin.x.0, -b.origin.y.0],
             half_size: [0.5 * w, 0.5 * h],
-            corner_radii: [
-                r.top_left.0,
-                r.top_right.0,
-                r.bottom_right.0,
-                r.bottom_left.0,
-            ]
-            .map(|r| r.clamp(0.0, 0.5 * w.min(h))),
+            corner_radii: if elliptical {
+                x.map(|r| r.clamp(0.0, 0.5 * w))
+            } else {
+                x.map(|r| r.clamp(0.0, 0.5 * w.min(h)))
+            },
+            corner_radii_y: y.map(|r| r.clamp(0.0, 0.5 * h)),
         }
     })
 }
@@ -554,7 +559,7 @@ pub struct RetainedShapesUniforms {
     pub clips: [RetainedClipUniform; MAX_RETAINED_CLIPS],
 }
 
-/// One clip in [`RetainedShapesUniforms`] (48 bytes): device pixels map to
+/// One clip in [`RetainedShapesUniforms`] (64 bytes): device pixels map to
 /// its space by `matrix` (`[a, b, c, d]`, x' = a·x + c·y + tx) and
 /// `translation`, where it is a rounded rectangle centered on `half_size`.
 /// A negative `half_size` is an empty clip.
@@ -567,8 +572,10 @@ pub struct RetainedClipUniform {
     pub translation: [f32; 2],
     /// Half the clip's size.
     pub half_size: [f32; 2],
-    /// Corner radii, clamped.
+    /// Corner radii, clamped (horizontal ones where a corner is elliptical).
     pub corner_radii: [f32; 4],
+    /// Vertical corner radii, clamped; zero where a corner is circular.
+    pub corner_radii_y: [f32; 4],
 }
 
 /// A small scene that exercises retained shapes, for renderer tests: every
@@ -1057,8 +1064,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<ShapeInstance>(), 16 * 4);
         // Six floats, float2, float4 (16-aligned at 32), two floats, float2,
         // six floats, uint, float, then four 48-byte clips at 96.
-        assert_eq!(std::mem::size_of::<RetainedClipUniform>(), 48);
-        assert_eq!(std::mem::size_of::<RetainedShapesUniforms>(), 96 + 4 * 48);
+        assert_eq!(std::mem::size_of::<RetainedClipUniform>(), 64);
+        assert_eq!(std::mem::size_of::<RetainedShapesUniforms>(), 96 + 4 * 64);
         assert_eq!(std::mem::offset_of!(RetainedShapesUniforms, clips), 96);
     }
 
@@ -1196,7 +1203,7 @@ mod tests {
 
     #[test]
     fn a_rounded_content_mask_is_one_more_clip_in_device_pixels() {
-        use crate::{Corners, point, size};
+        use crate::{point, size};
         let mask = ContentMask::rounded(
             Bounds::new(
                 point(ScaledPixels(10.0), ScaledPixels(20.0)),
@@ -1231,6 +1238,20 @@ mod tests {
             [8.0, 0.0, 15.0, 2.0],
             "clamped to half the shorter side"
         );
+        assert_eq!(c.corner_radii_y, [0.0; 4], "circular");
+        // An elliptical mask carries its vertical radii, each axis clamped to half its side.
+        let oval = ContentMask::<ScaledPixels>::elliptical(
+            mask.bounds,
+            Corners::all(ScaledPixels(30.0)),
+            Corners::all(ScaledPixels(6.0)),
+        );
+        let e = RetainedShapesDraw {
+            content_mask: oval,
+            ..draw.clone()
+        }
+        .uniforms([100.0, 100.0])
+        .clips[0];
+        assert_eq!((e.corner_radii, e.corner_radii_y), ([20.0; 4], [6.0; 4]));
         // A square mask adds no clip; past the clip limit a rounded one clips square.
         let square = RetainedShapesDraw {
             content_mask: ContentMask::from(mask.bounds),

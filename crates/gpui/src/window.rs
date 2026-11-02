@@ -2706,19 +2706,6 @@ macro_rules! content_mask_intersect {
                 }
             }
 
-            /// Each corner's smaller radius: the circle inside an elliptical corner, for clips
-            /// that take one radius per corner.
-            pub fn inscribed_radii(&self) -> Corners<$unit> {
-                let y = self.vertical_radii();
-                let x = &self.corner_radii;
-                let min = |a: $unit, b: $unit| if b.0 < a.0 { b } else { a };
-                Corners {
-                    top_left: min(x.top_left, y.top_left),
-                    top_right: min(x.top_right, y.top_right),
-                    bottom_right: min(x.bottom_right, y.bottom_right),
-                    bottom_left: min(x.bottom_left, y.bottom_left),
-                }
-            }
 
             /// The mask with `corner_radii_y` zero where a corner is circular, so equal masks
             /// compare (and share a table entry) equal.
@@ -2881,7 +2868,6 @@ mod content_mask_tests {
         let card = ContentMask::<Pixels>::elliptical(rect(0., 0., 100., 60.), Corners::all(px(20.)), Corners::all(px(10.)));
         assert!(card.is_rounded());
         assert_eq!(card.vertical_radii(), Corners::all(px(10.)));
-        assert_eq!(card.inscribed_radii(), Corners::all(px(10.)));
         // (6, 2) is inside a 10 px circle's corner box but outside the 20 x 10 ellipse; (12, 3)
         // is inside it.
         assert!(!card.contains(&point(px(6.), px(2.))));
