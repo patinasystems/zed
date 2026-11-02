@@ -15,7 +15,10 @@ doctest = false
 [features]
 default = []
 bench-support = ["gpui/bench-support", "dep:image"]
-font-kit = ["dep:font-kit"]
+# `CosmicTextSystem`: GPUI's text system on Linux, and the web's unless the application
+# gives `gpui_web` its own (`WebPlatformOptions::text_system`).
+cosmic = ["dep:cosmic-text", "dep:swash", "dep:unicode-bidi"]
+font-kit = ["cosmic", "dep:font-kit"]
 test-support = ["gpui/test-support", "dep:image"]
 
 [dependencies]
@@ -23,7 +26,7 @@ gpui.workspace = true
 anyhow.workspace = true
 bytemuck.workspace = true
 collections.workspace = true
-cosmic-text = "0.19.0"
+cosmic-text = { version = "0.19.0", optional = true }
 etagere.workspace = true
 itertools.workspace = true
 image = { workspace = true, optional = true }
@@ -35,8 +38,8 @@ parking_lot.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
-swash.workspace = true
-unicode-bidi.workspace = true
+swash = { workspace = true, optional = true }
+unicode-bidi = { workspace = true, optional = true }
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
 
@@ -62,3 +65,4 @@ image.workspace = true
 [[bench]]
 name = "layout_line"
 harness = false
+required-features = ["cosmic"]
