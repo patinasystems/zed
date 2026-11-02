@@ -305,15 +305,20 @@ fn plan_path_atlas(
         .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
         .sum();
     let widest = rects().map(PixelRect::width).max().unwrap_or(1);
+    // Atlas sides step up in pool-sized steps, but no further than the target's side
+    // when the need fits in it (a small target keeps a small atlas).
+    let side = |need: i32, target: i32| {
+        let stepped = ((need.max(1) as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
+        if need <= target {
+            stepped.min(target)
+        } else {
+            stepped
+        }
+    };
     // About square (shelves leave some height unused), never narrower than a region.
-    let width = (((area.sqrt() * 1.25) as u32)
-        .max(widest as u32)
-        .max(1)
-        .next_multiple_of(GROUP_IMAGE_STEP) as i32)
-        .min(max);
+    let width = side(((area.sqrt() * 1.25) as i32).max(widest), viewport[0]);
     let finish_chunk = |plan: &mut PathAtlasPlan, packer: &ShelfPacker, start: usize| {
-        let height =
-            ((packer.height().max(1) as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
+        let height = side(packer.height(), viewport[1]);
         let size = size(DevicePixels(packer.width), DevicePixels(height));
         plan.chunks.push((size, start..plan.batches.len()));
     };
@@ -342,9 +347,7 @@ fn plan_path_atlas(
                     finish_chunk(&mut plan, &packer, chunk_start);
                     chunk_start = plan.batches.len();
                 }
-                let chunk_width =
-                    ((wide as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
-                packer = ShelfPacker::new(chunk_width, max);
+                packer = ShelfPacker::new(side(wide, viewport[0]), max);
             }
             places = packer.place_all(&rects);
         }
@@ -4689,6 +4692,20 @@ mod tests {
         assert_eq!(batch.sprites[0].bounds.size.width.0, 252.);
         let (size, _) = plan.chunks[batch.chunk];
         assert!(size.width.0 >= 252 && size.width.0 <= 256, "{size:?}");
+    }
+
+    /// A small target's atlas is no larger than the target.
+    #[test]
+    fn path_atlas_of_a_small_target_is_within_it() {
+        let full = scaled_bounds(0., 0., 40., 30.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(rect_path(2., 2., 30., 20., gpui::red(), full));
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        let plan = plan_path_atlas(&scene, [40, 30], 8192, &mut tables, &records);
+        let (size, _) = plan.chunks[0];
+        assert!(size.width.0 <= 40 && size.height.0 <= 30, "{size:?}");
     }
 
     /// Paths rasterize in the atlas and draw back where they belong: translucent paths of
