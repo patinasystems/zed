@@ -80,9 +80,9 @@ float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float
                      float4 header, float4 first, float4 last, float opacity);
 
 // ---- Instance records (`gpui::InstanceTables`) ----
-// Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (their bounds, then radii and rounded bounds when the index has
-// MASK_ROUNDED set), transformations (2 texels, the identity at texel 0, never read) and
+// Renderers upload a compact record per small primitive (quads, which are fill-heavy, upload
+// whole: see `write_instances`) and one table of texels per scene: its
+// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
 // each primitive's aux record. `load_*` expand a record into the primitive's full layout.
 
 // A path vertex expanded from its `PathVertexRecord` and its path's record.
@@ -96,7 +96,6 @@ struct PathRasterizationVertex {
 
 ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index);
 TransformationMatrix load_transformation(constant float4 *tables, uint index);
-Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id);
 Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id);
 Underline load_underline(constant UnderlineRecord *underlines, constant float4 *tables, uint id);
 MonochromeSprite load_monochrome_sprite(constant SpriteRecord *sprites, constant float4 *tables,
@@ -138,16 +137,14 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     uint quad_id [[instance_id]],
                                     constant float2 *unit_vertices
                                     [[buffer(QuadInputIndex_Vertices)]],
-                                    constant QuadRecord *quads
+                                    constant Quad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
                                     constant Size_DevicePixels *viewport_size
                                     [[buffer(QuadInputIndex_ViewportSize)]],
                                     constant float4 *gradients
-                                    [[buffer(QuadInputIndex_Gradients)]],
-                                    constant float4 *tables
-                                    [[buffer(QuadInputIndex_Tables)]]) {
+                                    [[buffer(QuadInputIndex_Gradients)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Quad quad = load_quad(quads, tables, quad_id);
+  Quad quad = quads[quad_id];
   Bounds_ScaledPixels geometry = quad.bounds;
   float4 device_position;
   float4 clip_distance;
@@ -197,14 +194,13 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Quads read their full per-primitive struct, not an instance record (see `write_instances`).
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant QuadRecord *quads
+                              constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]],
                               constant float4 *gradients
-                              [[buffer(QuadInputIndex_Gradients)]],
-                              constant float4 *tables
-                              [[buffer(QuadInputIndex_Tables)]]) {
-  Quad quad = load_quad(quads, tables, input.quad_id);
+                              [[buffer(QuadInputIndex_Gradients)]]) {
+  Quad quad = quads[input.quad_id];
   float clip_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
   float2 position = input.position.xy;
   bool transformed = is_transformed(quad.transformation);
@@ -2506,34 +2502,15 @@ Hsla texel_hsla(float4 texel) {
   return color;
 }
 
-// Reads only what the mask has: a fragment that needs no bounds (`content_mask_alpha`) reads
-// nothing for a rectangular clip.
 ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) {
   ContentMask_ScaledPixels mask;
-  uint at = index & 0x3fffffffu;
-  mask.bounds = texel_bounds(tables[at]);
-  if ((index & 0x40000000u) != 0) {
-    mask.corner_radii = texel_corners(tables[at + 1]);
-    mask.rounded_bounds = texel_bounds(tables[at + 2]);
-  } else {
-    mask.corner_radii = texel_corners(float4(0.));
-    mask.rounded_bounds = mask.bounds;
-  }
+  mask.bounds = texel_bounds(tables[index]);
+  mask.corner_radii = texel_corners(tables[index + 1]);
+  mask.rounded_bounds = texel_bounds(tables[index + 2]);
   return mask;
 }
 
 TransformationMatrix load_transformation(constant float4 *tables, uint index) {
-  if (index == 0) {
-    // The identity: no table read.
-    TransformationMatrix identity;
-    identity.rotation_scale[0][0] = 1.;
-    identity.rotation_scale[0][1] = 0.;
-    identity.rotation_scale[1][0] = 0.;
-    identity.rotation_scale[1][1] = 1.;
-    identity.translation[0] = 0.;
-    identity.translation[1] = 0.;
-    return identity;
-  }
   float4 rotation_scale = tables[index];
   float4 translation = tables[index + 1];
   TransformationMatrix transformation;
@@ -2567,41 +2544,6 @@ Background load_background(constant float4 *tables, uint flags, uint block, Hsla
     }
   }
   return background;
-}
-
-// `QuadRecord::flags` bits (`QUAD_*`) come from the generated scene header.
-
-Quad load_quad(constant QuadRecord *quads, constant float4 *tables, uint id) {
-  QuadRecord record = quads[id];
-  Quad quad = {};
-  quad.border_style = (BorderStyle)(record.flags & QUAD_DASHED);
-  quad.bounds = record.bounds;
-  quad.content_mask = load_content_mask(tables, record.content_mask);
-  quad.corner_radii = record.corner_radii;
-  quad.corner_radii_y = record.corner_radii;
-  quad.transformation = load_transformation(tables, record.transformation);
-  uint aux = record.aux;
-  if ((record.flags & QUAD_BORDER) != 0) {
-    float4 widths = tables[aux];
-    quad.border_widths.top = widths.x;
-    quad.border_widths.right = widths.y;
-    quad.border_widths.bottom = widths.z;
-    quad.border_widths.left = widths.w;
-    quad.border_color = texel_hsla(tables[aux + 1]);
-    aux += 2;
-  }
-  if ((record.flags & QUAD_ELLIPTICAL) != 0) {
-    quad.corner_radii_y = texel_corners(tables[aux]);
-    aux += 1;
-  }
-  if ((record.flags & QUAD_SHAPED) != 0) {
-    float4 shapes = tables[aux];
-    quad.corner_shapes[0] = as_type<uint>(shapes.x);
-    quad.corner_shapes[1] = as_type<uint>(shapes.y);
-    aux += 1;
-  }
-  quad.background = load_background(tables, record.flags, aux, record.background);
-  return quad;
 }
 
 Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id) {

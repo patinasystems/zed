@@ -6,9 +6,7 @@
 //! circular, solid and unbordered. So renderers upload a compact record per primitive and one
 //! table of 16-byte texels per scene ([`InstanceTables`]) that the records index:
 //!
-//! - each distinct content mask once: its bounds, then, when a corner is rounded, its corner
-//!   radii and rounded bounds, the index a record holds then having [`MASK_ROUNDED`] set. A
-//!   shader reads no more than a mask has, so a rectangular clip costs a pixel no table read;
+//! - each distinct content mask once, as three texels (bounds, corner radii, rounded bounds);
 //! - each distinct transformation once, as two texels, the identity at texel 0;
 //! - per primitive, only what it uses beyond the common case (its "aux" record): a border, the
 //!   vertical radii of elliptical corners, superellipse corner shapes, a background other than a
@@ -159,15 +157,10 @@ pub trait RebaseRecord {
     fn rebase(&mut self, base: u32);
 }
 
-/// The identity stays 0: shaders read no texel for it.
-fn rebase_transformation(index: u32, base: u32) -> u32 {
-    if index == 0 { 0 } else { index + base }
-}
-
 impl RebaseRecord for QuadRecord {
     fn rebase(&mut self, base: u32) {
         self.content_mask += base;
-        self.transformation = rebase_transformation(self.transformation, base);
+        self.transformation += base;
         self.aux += base;
     }
 }
@@ -175,7 +168,7 @@ impl RebaseRecord for QuadRecord {
 impl RebaseRecord for ShadowRecord {
     fn rebase(&mut self, base: u32) {
         self.content_mask += base;
-        self.transformation = rebase_transformation(self.transformation, base);
+        self.transformation += base;
         if self.info >> 1 != 0 {
             self.info += base << 1;
         }
@@ -185,21 +178,21 @@ impl RebaseRecord for ShadowRecord {
 impl RebaseRecord for UnderlineRecord {
     fn rebase(&mut self, base: u32) {
         self.content_mask += base;
-        self.transformation = rebase_transformation(self.transformation, base);
+        self.transformation += base;
     }
 }
 
 impl RebaseRecord for SpriteRecord {
     fn rebase(&mut self, base: u32) {
         self.content_mask += base;
-        self.transformation = rebase_transformation(self.transformation, base);
+        self.transformation += base;
     }
 }
 
 impl RebaseRecord for PolychromeSpriteRecord {
     fn rebase(&mut self, base: u32) {
         self.content_mask += base;
-        self.transformation = rebase_transformation(self.transformation, base);
+        self.transformation += base;
         if self.info >> 2 != 0 {
             self.info += base << 2;
         }
@@ -273,13 +266,6 @@ fn hsla_texel(color: &Hsla) -> Texel {
     [color.h, color.s, color.l, color.a]
 }
 
-/// Set in a record's content mask index when the mask has rounded corners: two more texels,
-/// its corner radii and rounded bounds, follow its bounds.
-pub const MASK_ROUNDED: u32 = 1 << 30;
-
-/// The texel index in a record's content mask index, without its flags.
-pub const MASK_INDEX: u32 = MASK_ROUNDED - 1;
-
 fn mask_key(mask: &ContentMask<ScaledPixels>) -> [u32; 12] {
     let [a, b, c, d] = bounds_texel(&mask.bounds);
     let [e, f, g, h] = corners_texel(&mask.corner_radii);
@@ -322,8 +308,7 @@ impl InstanceTables {
         self.texels.len() as u32
     }
 
-    /// The first texel of `mask`, added when the scene has not used it yet, with [`MASK_ROUNDED`]
-    /// set when it has rounded corners.
+    /// The first texel of `mask`, added when the scene has not used it yet.
     pub fn content_mask(&mut self, mask: &ContentMask<ScaledPixels>) -> u32 {
         let key = mask_key(mask);
         if let Some((last, index)) = self.last_mask
@@ -331,17 +316,14 @@ impl InstanceTables {
         {
             return index;
         }
-        let rounded = mask.corner_radii != Corners::default();
-        let next = self.next() | if rounded { MASK_ROUNDED } else { 0 };
+        let next = self.next();
         let index = *self.masks.entry(key).or_insert(next);
         if index == next {
-            self.texels.push(bounds_texel(&mask.bounds));
-            if rounded {
-                self.texels.extend_from_slice(&[
-                    corners_texel(&mask.corner_radii),
-                    bounds_texel(&mask.rounded_bounds),
-                ]);
-            }
+            self.texels.extend_from_slice(&[
+                bounds_texel(&mask.bounds),
+                corners_texel(&mask.corner_radii),
+                bounds_texel(&mask.rounded_bounds),
+            ]);
         }
         self.last_mask = Some((key, index));
         index
@@ -618,14 +600,13 @@ mod tests {
             bounds: rect(10., 10., 5., 5.),
             ..quad()
         });
-        // A rectangular mask: its bounds alone.
         assert_eq!(first.content_mask, 2);
         assert_eq!(second.content_mask, 2);
         assert_eq!(first.transformation, 0);
         assert_eq!(first.aux, 0);
         assert_eq!(first.flags, 0);
         // The identity, then one mask.
-        assert_eq!(tables.texels().len(), 3);
+        assert_eq!(tables.texels().len(), 5);
         assert_eq!(tables.texels()[0], [1., 0., 0., 1.]);
         assert_eq!(tables.texels()[2], [0., 0., 100., 100.]);
     }
@@ -653,7 +634,7 @@ mod tests {
         });
         assert_eq!(a, c.content_mask);
         assert_ne!(a, b);
-        assert_eq!(c.transformation, 2 + 1 + 1);
+        assert_eq!(c.transformation, 2 + 3 + 3);
         assert_eq!(tables.texels()[c.transformation as usize + 1], [3., 4., 0., 0.]);
         let again = tables.transformation(&TransformationMatrix::unit().translate(point(sp(3.), sp(4.))));
         assert_eq!(again, c.transformation);
@@ -704,19 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn rounded_masks_carry_their_radii_and_flag() {
-        let mut tables = InstanceTables::default();
-        let rounded = ContentMask::rounded(rect(0., 0., 100., 100.), Corners::all(sp(8.)));
-        let index = tables.content_mask(&rounded);
-        assert_eq!(index, 2 | MASK_ROUNDED);
-        assert_eq!(index & MASK_INDEX, 2);
-        assert_eq!(tables.texels().len(), 5);
-        assert_eq!(tables.texels()[3], [8.; 4]);
-        assert_eq!(tables.content_mask(&mask(0.)), 5);
-        assert_eq!(tables.texels().len(), 6);
-    }
-
-    #[test]
     fn rebase_offsets_every_index_and_keeps_absent_aux_absent() {
         let mut tables = InstanceTables::default();
         let mut shadow = tables.shadow(&Shadow {
@@ -738,8 +706,7 @@ mod tests {
         shadow.rebase(100);
         assert_eq!(shadow.info, 1);
         assert_eq!(shadow.content_mask, 102);
-        // The identity stays 0.
-        assert_eq!(shadow.transformation, 0);
+        assert_eq!(shadow.transformation, 100);
 
         let mut sprite = tables.polychrome_sprite(&PolychromeSprite {
             order: 0,
