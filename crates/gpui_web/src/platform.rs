@@ -57,7 +57,7 @@ pub struct WebPlatform {
 }
 
 /// How a [`WebPlatform`] starts and where its window lives in the page.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct WebPlatformOptions {
     /// Run background work on web workers (needs the `multithreaded` feature and a
     /// cross-origin isolated page).
@@ -69,8 +69,26 @@ pub struct WebPlatformOptions {
     /// pixel ratio. `None` appends the canvas to the document body.
     pub container: Option<web_sys::Element>,
     /// The family `.SystemUIFont` (GPUI's default text family) resolves to, for
-    /// example a UI font the application loads. `None`: IBM Plex Sans.
+    /// example a UI font the application loads. `None`: IBM Plex Sans. Read by the
+    /// default text system only.
     pub system_font_family: Option<String>,
+    /// The text system that shapes and rasterizes the application's fonts. The
+    /// platform adds the browser's Canvas text for what they lack. `None`: Cosmic
+    /// Text with no system fonts (the `cosmic` feature).
+    pub text_system: Option<Arc<dyn PlatformTextSystem>>,
+}
+
+impl std::fmt::Debug for WebPlatformOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebPlatformOptions")
+            .field("allow_multi_threading", &self.allow_multi_threading)
+            .field("backend_preference", &self.backend_preference)
+            .field("canvas_font_fallback", &self.canvas_font_fallback)
+            .field("container", &self.container)
+            .field("system_font_family", &self.system_font_family)
+            .field("text_system", &self.text_system.as_ref().map(|_| "custom"))
+            .finish()
+    }
 }
 
 /// Gesture feel for the browser, chosen so touch scrolling matches the host
@@ -209,6 +227,7 @@ impl WebPlatform {
             canvas_font_fallback,
             container,
             system_font_family,
+            text_system,
         } = options;
         let browser_window =
             web_sys::window().expect("must be running in a browser window context");
@@ -219,10 +238,8 @@ impl WebPlatform {
         ));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
-        let text_system = Arc::new(WebTextSystem::new(
-            system_font_family.as_deref().unwrap_or("IBM Plex Sans"),
-            canvas_font_fallback,
-        ));
+        let native = text_system.unwrap_or_else(|| default_text_system(system_font_family.as_deref()));
+        let text_system = Arc::new(WebTextSystem::new(native, canvas_font_fallback));
         let text_system: Arc<dyn PlatformTextSystem> = text_system;
         let active_display: Rc<dyn PlatformDisplay> =
             Rc::new(WebDisplay::new(browser_window.clone()));
@@ -1030,4 +1047,18 @@ fn copy_through_event(browser_window: &web_sys::Window, text: &str) -> bool {
         .remove_event_listener_with_callback_and_bool("copy", listener.as_ref().unchecked_ref(), true)
         .ok();
     ran && wrote.get()
+}
+
+/// The native text system when the application gives none: Cosmic Text with no system
+/// fonts, `.SystemUIFont` resolving to `family` (IBM Plex Sans when `None`).
+#[cfg(feature = "cosmic")]
+fn default_text_system(family: Option<&str>) -> Arc<dyn PlatformTextSystem> {
+    Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+        family.unwrap_or("IBM Plex Sans"),
+    ))
+}
+
+#[cfg(not(feature = "cosmic"))]
+fn default_text_system(_family: Option<&str>) -> Arc<dyn PlatformTextSystem> {
+    panic!("gpui_web without the `cosmic` feature needs `WebPlatformOptions::text_system`")
 }
