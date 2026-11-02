@@ -1,6 +1,6 @@
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, px,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
     TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
@@ -36,6 +36,7 @@ pub(crate) struct TestWindowState {
     visibility: WindowVisibility,
     visibility_callback: Option<Box<dyn FnMut(WindowVisibility)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
+    hovered: bool,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     visual_viewport: Option<Bounds<Pixels>>,
     visual_viewport_callback: Option<Box<dyn FnMut()>>,
@@ -110,6 +111,7 @@ impl TestWindow {
             visibility: WindowVisibility::Visible,
             visibility_callback: None,
             hover_status_change_callback: None,
+            hovered: false,
             resize_callback: None,
             visual_viewport: None,
             visual_viewport_callback: None,
@@ -286,6 +288,21 @@ impl TestWindow {
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        // The pointer hovers the window while it is over it, as the platforms report on enter
+        // and leave: Linux, FreeBSD and Windows show a window's cursor only while it is hovered
+        // (`Window::is_window_hovered`).
+        match &event {
+            PlatformInput::MouseMove(e) => {
+                let size = self.0.lock().bounds.size;
+                let inside = e.position.x >= px(0.)
+                    && e.position.y >= px(0.)
+                    && e.position.x < size.width
+                    && e.position.y < size.height;
+                self.simulate_hover(inside);
+            }
+            PlatformInput::MouseExited(_) => self.simulate_hover(false),
+            _ => {}
+        }
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
@@ -294,6 +311,21 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    /// Reports the pointer entering (`true`) or leaving the window, when that changes.
+    pub fn simulate_hover(&self, hovered: bool) {
+        let mut lock = self.0.lock();
+        if lock.hovered == hovered {
+            return;
+        }
+        lock.hovered = hovered;
+        let Some(mut callback) = lock.hover_status_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(hovered);
+        self.0.lock().hover_status_change_callback = Some(callback);
     }
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
@@ -429,7 +461,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_hovered(&self) -> bool {
-        false
+        self.0.lock().hovered
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
