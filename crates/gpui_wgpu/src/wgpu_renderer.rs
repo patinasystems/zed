@@ -4769,19 +4769,21 @@ mod tests {
             scene
         };
         let size = Size { width: DevicePixels(100), height: DevicePixels(100) };
-        let alpha_at = |renderer: &mut WgpuHeadlessRenderer, mask| -> anyhow::Result<u8> {
+        // Alpha at (1, 1), outside both corners, and (2, 8), inside a 10 px circular corner but
+        // outside a 10 x 40 px elliptical one.
+        let alpha_at = |renderer: &mut WgpuHeadlessRenderer, mask| -> anyhow::Result<(u8, u8)> {
             let image = renderer.render_scene_to_image(&scene(mask), size)?;
             assert_eq!(image.get_pixel(50, 50).0[3], 255, "the quad's middle is drawn");
-            // Inside a 10 px circular corner, outside a 10 x 40 px elliptical one.
-            Ok(image.get_pixel(2, 8).0[3])
+            Ok((image.get_pixel(1, 1).0[3], image.get_pixel(2, 8).0[3]))
         };
         let circular = alpha_at(&mut renderer, ContentMask::rounded(bounds, Corners::all(ScaledPixels(10.))))?;
         let elliptical = alpha_at(
             &mut renderer,
             ContentMask::<ScaledPixels>::elliptical(bounds, Corners::all(ScaledPixels(10.)), Corners::all(ScaledPixels(40.))),
         )?;
-        assert!(circular > 192, "circular corner covers (2, 8): {circular}");
-        assert!(elliptical < 64, "elliptical corner leaves (2, 8) out: {elliptical}");
+        println!("circular {circular:?}, elliptical {elliptical:?}");
+        assert!(circular.0 < 64 && circular.1 > 192, "circular corner: {circular:?}");
+        assert!(elliptical.0 < 64 && elliptical.1 < 64, "elliptical corner: {elliptical:?}");
         Ok(())
     }
 
