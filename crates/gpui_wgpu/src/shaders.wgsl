@@ -2309,8 +2309,9 @@ fn load_background(flags: u32, block: u32, solid: Hsla) -> Background {
     return background;
 }
 
-fn load_quad(instance_id: u32) -> Quad {
-    let record = load_quad_record(instance_id);
+// A quad from its record (WebGL's transport; storage backends read whole quads, see
+// `shaders_storage.wgsl`).
+fn expand_quad_record(record: QuadRecord) -> Quad {
     var quad: Quad;
     quad.border_style = record.flags & QUAD_DASHED;
     quad.bounds = record.bounds;

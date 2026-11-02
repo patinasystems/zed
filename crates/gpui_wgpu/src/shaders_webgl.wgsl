@@ -81,6 +81,10 @@ fn instance_texel(texel_index: u32) -> vec4<u32> {
 
 // Records of whole texels, decoded at fixed positions: some WebGL shader compilers fail to
 // optimize the cursor's branches and dynamic vector indexing.
+fn load_quad(instance_id: u32) -> Quad {
+    return expand_quad_record(load_quad_record(instance_id));
+}
+
 fn load_quad_record(instance_id: u32) -> QuadRecord {
     let first = instance_id * 4u;
     let t0 = bitcast<vec4<f32>>(instance_texel(first));

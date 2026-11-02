@@ -5,7 +5,7 @@
 // All buffers share `@group(1) @binding(0)` because each pipeline binds only the
 // buffer its own entry points read.
 
-@group(1) @binding(0) var<storage, read> b_quads: array<QuadRecord>;
+@group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
 @group(1) @binding(0) var<storage, read> b_shadows: array<ShadowRecord>;
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathVertexRecord>;
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
@@ -13,7 +13,9 @@
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<SpriteRecord>;
 @group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSpriteRecord>;
 
-fn load_quad_record(instance_id: u32) -> QuadRecord {
+// Quads are fill-heavy: shaders read the whole quad in place, never expanding a record per
+// pixel (`WgpuRenderer::write_scene_records`).
+fn load_quad(instance_id: u32) -> Quad {
     return b_quads[instance_id];
 }
 

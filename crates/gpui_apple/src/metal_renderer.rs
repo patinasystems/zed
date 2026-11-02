@@ -1671,11 +1671,6 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
-        set_tables(
-            command_encoder,
-            QuadInputIndex::Tables as u64,
-            &instance_bindings.tables,
-        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2716,7 +2711,13 @@ fn write_instances(
     let result: Result<InstanceBindings> = (|| {
         Ok(InstanceBindings {
             gradients: gradients.clone(),
-            quads: writer.write_iter(scene.quads.iter().map(|quad| tables.quad(quad)))?,
+            // Quads are fill-heavy (a few large primitives cover most pixels): their shaders read
+            // the whole per-primitive struct in place, so a fragment does no table walk. The
+            // many small primitives (glyphs, underlines, shadows, paths) use compact records
+            // indexing the scene's table, which cut upload bytes. Expanding a record per pixel
+            // cost fill-bound quad scenes 12-17% GPU time on M4 Max (PR 4793), and the
+            // `quad_gradient_frame_cost_stays_at_baseline` bench guards it.
+            quads: writer.write(&scene.quads)?,
             shadows: writer.write_iter(scene.shadows.iter().map(|shadow| tables.shadow(shadow)))?,
             underlines: writer.write_iter(
                 scene
@@ -2921,7 +2922,6 @@ enum QuadInputIndex {
     Quads = 1,
     ViewportSize = 2,
     Gradients = 3,
-    Tables = 4,
 }
 
 #[repr(C)]
@@ -3368,14 +3368,11 @@ mod tests {
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 2);
     }
 
-    /// Gradients against solid fills: 200 overlapping quarter-screen quads with rounded
-    /// corners at 2880x1800 (about 260 million shaded pixels). Fills alternate each
-    /// round; each line is the median GPU time of a frame. Run with
-    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib gradient_frame_cost -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn gradient_frame_cost() {
-        use gpui::gradient_test_scene::{BenchFill, bench};
+    /// Each fill's median GPU time per frame of `gradient_test_scene::bench` (200 overlapping
+    /// quarter-screen quads with rounded corners at 2880x1800, about 260 million shaded pixels),
+    /// over `rounds` frames each, fills alternating.
+    fn gradient_frame_medians(fills: &[gpui::gradient_test_scene::BenchFill], rounds: usize) -> Vec<f64> {
+        use gpui::gradient_test_scene::bench;
         assert!(
             retained_stats::enabled(),
             "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
@@ -3383,20 +3380,12 @@ mod tests {
         let (width, height) = (2880, 1800);
         let size = size(DevicePixels(width), DevicePixels(height));
         let mut renderer = MetalHeadlessRenderer::new();
-        let fills = [
-            BenchFill::Solid,
-            BenchFill::TwoStop,
-            BenchFill::Linear(2),
-            BenchFill::Linear(8),
-            BenchFill::Radial(4),
-            BenchFill::Radial(16),
-        ];
         let scenes: Vec<Scene> = fills
             .iter()
             .map(|fill| bench(200, width as f32, height as f32, *fill))
             .collect();
         let mut gpu = vec![Vec::new(); scenes.len()];
-        for _ in 0..60 {
+        for _ in 0..rounds {
             for (scene, times) in scenes.iter().zip(&mut gpu) {
                 gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, size)
                     .expect("render");
@@ -3412,12 +3401,84 @@ mod tests {
                 times.extend(recorded);
             }
         }
-        for (fill, times) in fills.iter().zip(&mut gpu) {
-            times.sort_by(f64::total_cmp);
-            println!(
-                "{fill:?}: GPU {:.3} ms per frame (median of {})",
-                times[times.len() / 2],
-                times.len()
+        gpu.into_iter()
+            .map(|mut times| {
+                times.sort_by(f64::total_cmp);
+                times[times.len() / 2]
+            })
+            .collect()
+    }
+
+    /// Gradients against solid fills ([`gradient_frame_medians`]); each line is the median GPU
+    /// time of a frame. Run with
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib gradient_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gradient_frame_cost() {
+        use gpui::gradient_test_scene::BenchFill;
+        let fills = [
+            BenchFill::Solid,
+            BenchFill::TwoStop,
+            BenchFill::Linear(2),
+            BenchFill::Linear(8),
+            BenchFill::Radial(4),
+            BenchFill::Radial(16),
+        ];
+        for (fill, median) in fills.iter().zip(gradient_frame_medians(&fills, 60)) {
+            println!("{fill:?}: GPU {median:.3} ms per frame (median of 60)");
+        }
+    }
+
+    /// Fill-bound quads stay at their recorded cost on this GPU: each fill's median frame time
+    /// within 8% of `quad_gradient_baseline.tsv` (GPU name, fill, ms). Quads read their whole
+    /// struct per pixel; expanding an instance record per pixel instead cost these frames 12-17%
+    /// on M4 Max (PR 4793), which this catches. A GPU with no baseline prints its times; record
+    /// them with `GPUI_RECORD_QUAD_BASELINE=1`. Run on an idle Mac with
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib quad_gradient_frame_cost_stays_at_baseline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn quad_gradient_frame_cost_stays_at_baseline() {
+        use gpui::gradient_test_scene::BenchFill;
+        const TOLERANCE: f64 = 1.08;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/quad_gradient_baseline.tsv");
+        let gpu = metal::Device::system_default().expect("a Metal device").name().to_string();
+        let fills = [BenchFill::Solid, BenchFill::TwoStop, BenchFill::Linear(8)];
+        let medians = gradient_frame_medians(&fills, 60);
+        let measured: Vec<(String, f64)> =
+            fills.iter().map(|fill| format!("{fill:?}")).zip(medians).collect();
+        let recorded = std::fs::read_to_string(path).unwrap_or_default();
+        let baseline: Vec<(String, f64)> = recorded
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let (device, fill, ms) = (fields.next()?, fields.next()?, fields.next()?);
+                (device == gpu).then(|| Some((fill.to_string(), ms.parse().ok()?)))?
+            })
+            .collect();
+        if std::env::var_os("GPUI_RECORD_QUAD_BASELINE").is_some() {
+            let mut lines: Vec<String> = recorded
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{gpu}\t")))
+                .map(str::to_string)
+                .collect();
+            lines.extend(measured.iter().map(|(fill, ms)| format!("{gpu}\t{fill}\t{ms:.3}")));
+            std::fs::write(path, lines.join("\n") + "\n").expect("write the baseline");
+            println!("recorded {gpu}: {measured:?}");
+            return;
+        }
+        if baseline.is_empty() {
+            println!("no baseline for {gpu}: {measured:?} (record with GPUI_RECORD_QUAD_BASELINE=1)");
+            return;
+        }
+        for (fill, ms) in &measured {
+            let Some((_, base)) = baseline.iter().find(|(name, _)| name == fill) else {
+                continue;
+            };
+            println!("{fill}: GPU {ms:.3} ms per frame, baseline {base:.3} ms");
+            assert!(
+                *ms <= base * TOLERANCE,
+                "{fill} quads cost {ms:.3} ms per frame on {gpu}, over {:.0}% above the {base:.3} ms baseline",
+                (TOLERANCE - 1.) * 100.
             );
         }
     }
