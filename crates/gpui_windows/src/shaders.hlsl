@@ -556,6 +556,8 @@ struct Quad {
     Corners content_mask_radii;
     // `ContentMask::rounded_bounds`, the rectangle those radii round.
     Bounds content_mask_rounded_bounds;
+    // `ContentMask::corner_radii_y` (Direct3D clips square).
+    Corners content_mask_radii_y;
     Background background;
     Hsla border_color;
     Corners corner_radii;
@@ -952,6 +954,8 @@ struct Shadow {
     Corners content_mask_radii;
     // `ContentMask::rounded_bounds`, the rectangle those radii round.
     Bounds content_mask_rounded_bounds;
+    // `ContentMask::corner_radii_y` (Direct3D clips square).
+    Corners content_mask_radii_y;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
@@ -1195,6 +1199,8 @@ struct Underline {
     Corners content_mask_radii;
     // `ContentMask::rounded_bounds`, the rectangle those radii round.
     Bounds content_mask_rounded_bounds;
+    // `ContentMask::corner_radii_y` (Direct3D clips square).
+    Corners content_mask_radii_y;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1300,6 +1306,8 @@ struct MonochromeSprite {
     Corners content_mask_radii;
     // `ContentMask::rounded_bounds`, the rectangle those radii round.
     Bounds content_mask_rounded_bounds;
+    // `ContentMask::corner_radii_y` (Direct3D clips square).
+    Corners content_mask_radii_y;
     Hsla color;
     TransformationMatrix transformation;
 };
@@ -1379,6 +1387,8 @@ struct PolychromeSprite {
     Corners content_mask_radii;
     // `ContentMask::rounded_bounds`, the rectangle those radii round.
     Bounds content_mask_rounded_bounds;
+    // `ContentMask::corner_radii_y` (Direct3D clips square).
+    Corners content_mask_radii_y;
     Corners corner_radii;
     // Each corner's vertical radius (`PolychromeSprite::corner_radii_y`): Direct3D draws circular corners.
     Corners corner_radii_y;

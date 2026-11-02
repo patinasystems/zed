@@ -6,7 +6,8 @@
 //! circular, solid and unbordered. So renderers upload a compact record per primitive and one
 //! table of 16-byte texels per scene ([`InstanceTables`]) that the records index:
 //!
-//! - each distinct content mask once, as three texels (bounds, corner radii, rounded bounds);
+//! - each distinct content mask once, as four texels (bounds, corner radii, rounded bounds, and
+//!   vertical corner radii, zero where a corner is circular);
 //! - each distinct transformation once, as two texels, the identity at texel 0;
 //! - per primitive, only what it uses beyond the common case (its "aux" record): a border, the
 //!   vertical radii of elliptical corners, superellipse corner shapes, a background other than a
@@ -218,8 +219,8 @@ impl RebaseRecord for PathRecord {
 /// [`InstanceTables::texels`] beside the records and [`clear`](Self::clear) it for the next scene.
 pub struct InstanceTables {
     texels: Vec<Texel>,
-    masks: FxHashMap<[u32; 12], u32>,
-    last_mask: Option<([u32; 12], u32)>,
+    masks: FxHashMap<[u32; 16], u32>,
+    last_mask: Option<([u32; 16], u32)>,
     transforms: FxHashMap<[u32; 6], u32>,
 }
 
@@ -266,11 +267,12 @@ fn hsla_texel(color: &Hsla) -> Texel {
     [color.h, color.s, color.l, color.a]
 }
 
-fn mask_key(mask: &ContentMask<ScaledPixels>) -> [u32; 12] {
+fn mask_key(mask: &ContentMask<ScaledPixels>) -> [u32; 16] {
     let [a, b, c, d] = bounds_texel(&mask.bounds);
     let [e, f, g, h] = corners_texel(&mask.corner_radii);
     let [i, j, k, l] = bounds_texel(&mask.rounded_bounds);
-    [a, b, c, d, e, f, g, h, i, j, k, l].map(f32::to_bits)
+    let [m, n, o, p] = corners_texel(&mask.corner_radii_y);
+    [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p].map(f32::to_bits)
 }
 
 fn is_identity(transformation: &TransformationMatrix) -> bool {
@@ -323,6 +325,7 @@ impl InstanceTables {
                 bounds_texel(&mask.bounds),
                 corners_texel(&mask.corner_radii),
                 bounds_texel(&mask.rounded_bounds),
+                corners_texel(&mask.corner_radii_y),
             ]);
         }
         self.last_mask = Some((key, index));
@@ -606,7 +609,7 @@ mod tests {
         assert_eq!(first.aux, 0);
         assert_eq!(first.flags, 0);
         // The identity, then one mask.
-        assert_eq!(tables.texels().len(), 5);
+        assert_eq!(tables.texels().len(), 6);
         assert_eq!(tables.texels()[0], [1., 0., 0., 1.]);
         assert_eq!(tables.texels()[2], [0., 0., 100., 100.]);
     }
@@ -634,7 +637,7 @@ mod tests {
         });
         assert_eq!(a, c.content_mask);
         assert_ne!(a, b);
-        assert_eq!(c.transformation, 2 + 3 + 3);
+        assert_eq!(c.transformation, 2 + 4 + 4);
         assert_eq!(tables.texels()[c.transformation as usize + 1], [3., 4., 0., 0.]);
         let again = tables.transformation(&TransformationMatrix::unit().translate(point(sp(3.), sp(4.))));
         assert_eq!(again, c.transformation);

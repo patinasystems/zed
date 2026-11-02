@@ -115,6 +115,8 @@ struct ContentMask {
     bounds: Bounds,
     corner_radii: Corners,
     rounded_bounds: Bounds,
+    // Each corner's vertical radius; zero where the corner is circular.
+    corner_radii_y: Corners,
 }
 
 struct Edges {
@@ -1698,6 +1700,7 @@ struct MonoSpriteVarying {
     // radii; the square clip is `clip_distances`.
     @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(4) @interpolate(flat) mask_radii: vec4<f32>,
+    @location(5) @interpolate(flat) mask_radii_y: vec4<f32>,
 }
 
 @vertex
@@ -1714,6 +1717,8 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.mask_bounds = vec4<f32>(sprite.content_mask.rounded_bounds.origin, sprite.content_mask.rounded_bounds.size);
     let r = sprite.content_mask.corner_radii;
     out.mask_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
+    let ry = sprite.content_mask.corner_radii_y;
+    out.mask_radii_y = vec4<f32>(ry.top_left, ry.top_right, ry.bottom_right, ry.bottom_left);
     return out;
 }
 
@@ -1731,6 +1736,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_radii.x, input.mask_radii.y, input.mask_radii.z, input.mask_radii.w),
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
+        Corners(input.mask_radii_y.x, input.mask_radii_y.y, input.mask_radii_y.z, input.mask_radii_y.w),
     );
     let clip_alpha = content_mask_alpha(input.position.xy, mask);
     return clip_output(blend_color(input.color, alpha_corrected), clip_alpha);
@@ -2172,7 +2178,18 @@ fn content_mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     if (r.top_left <= 0.0 && r.top_right <= 0.0 && r.bottom_right <= 0.0 && r.bottom_left <= 0.0) {
         return 1.0;
     }
-    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+    let y = mask.corner_radii_y;
+    if (y.top_left <= 0.0 && y.top_right <= 0.0 && y.bottom_right <= 0.0 && y.bottom_left <= 0.0) {
+        return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+    }
+    // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
+    let ry = Corners(
+        select(r.top_left, y.top_left, y.top_left > 0.0),
+        select(r.top_right, y.top_right, y.top_right > 0.0),
+        select(r.bottom_right, y.bottom_right, y.bottom_right > 0.0),
+        select(r.bottom_left, y.bottom_left, y.bottom_left > 0.0),
+    );
+    return saturate(0.5 - quad_sdf_xy(position, mask.rounded_bounds, r, ry));
 }
 
 // A fragment's color with its content mask coverage applied, in the target's alpha
@@ -2273,6 +2290,7 @@ fn load_content_mask(index: u32) -> ContentMask {
         texel_bounds(load_table_texel(index)),
         texel_corners(load_table_texel(index + 1u)),
         texel_bounds(load_table_texel(index + 2u)),
+        texel_corners(load_table_texel(index + 3u)),
     );
 }
 

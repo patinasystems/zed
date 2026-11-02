@@ -77,7 +77,7 @@ float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float
 
 // ---- Instance records (`gpui::InstanceTables`) ----
 // Renderers upload a compact record per primitive and one table of texels per scene: its
-// distinct content masks (3 texels), transformations (2 texels, the identity at texel 0) and
+// distinct content masks (4 texels), transformations (2 texels, the identity at texel 0) and
 // each primitive's aux record. `load_*` expand a record into the primitive's full layout.
 
 // A path vertex expanded from its `PathVertexRecord` and its path's record.
@@ -2479,7 +2479,16 @@ float content_mask_alpha(float2 position, ContentMask_ScaledPixels mask) {
   if (r.top_left <= 0. && r.top_right <= 0. && r.bottom_right <= 0. && r.bottom_left <= 0.) {
     return 1.;
   }
-  return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+  Corners_ScaledPixels y = mask.corner_radii_y;
+  if (y.top_left <= 0. && y.top_right <= 0. && y.bottom_right <= 0. && y.bottom_left <= 0.) {
+    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+  }
+  // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
+  y.top_left = y.top_left > 0. ? y.top_left : r.top_left;
+  y.top_right = y.top_right > 0. ? y.top_right : r.top_right;
+  y.bottom_right = y.bottom_right > 0. ? y.bottom_right : r.bottom_right;
+  y.bottom_left = y.bottom_left > 0. ? y.bottom_left : r.bottom_left;
+  return saturate(0.5 - quad_sdf_xy(position, mask.rounded_bounds, r, y));
 }
 
 float4 clip_alpha_straight(float4 color, float alpha) {
@@ -2520,6 +2529,7 @@ ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) 
   mask.bounds = texel_bounds(tables[index]);
   mask.corner_radii = texel_corners(tables[index + 1]);
   mask.rounded_bounds = texel_bounds(tables[index + 2]);
+  mask.corner_radii_y = texel_corners(tables[index + 3]);
   return mask;
 }
 

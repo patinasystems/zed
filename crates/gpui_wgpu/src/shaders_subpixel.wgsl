@@ -11,6 +11,7 @@ struct SubpixelSpriteOutput {
     // radii; the square clip is `clip_distances`.
     @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(4) @interpolate(flat) mask_radii: vec4<f32>,
+    @location(5) @interpolate(flat) mask_radii_y: vec4<f32>,
 }
 
 struct SubpixelSpriteFragmentOutput {
@@ -31,6 +32,8 @@ fn vs_subpixel_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     out.mask_bounds = vec4<f32>(sprite.content_mask.rounded_bounds.origin, sprite.content_mask.rounded_bounds.size);
     let r = sprite.content_mask.corner_radii;
     out.mask_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
+    let ry = sprite.content_mask.corner_radii_y;
+    out.mask_radii_y = vec4<f32>(ry.top_left, ry.top_right, ry.bottom_right, ry.bottom_left);
     return out;
 }
 
@@ -53,6 +56,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_radii.x, input.mask_radii.y, input.mask_radii.z, input.mask_radii.w),
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
+        Corners(input.mask_radii_y.x, input.mask_radii_y.y, input.mask_radii_y.z, input.mask_radii_y.w),
     );
     out.alpha = vec4<f32>(input.color.a * alpha_corrected * content_mask_alpha(input.position.xy, mask), 1.0);
     return out;

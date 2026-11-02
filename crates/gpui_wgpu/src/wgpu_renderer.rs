@@ -5062,6 +5062,12 @@ mod tests {
                         height: 97.0.into(),
                     },
                 },
+                corner_radii_y: Corners {
+                    top_left: 98.0.into(),
+                    top_right: 99.0.into(),
+                    bottom_right: 100.0.into(),
+                    bottom_left: 101.0.into(),
+                },
             },
             background: linear_gradient(
                 11.0,
@@ -5140,8 +5146,8 @@ mod tests {
                 0,
                 flags,
                 2,
-                5,
-                7,
+                6,
+                8,
             ]
         );
         let texels: Vec<[u32; 4]> = tables
@@ -5157,6 +5163,7 @@ mod tests {
                 [f(5.0), f(6.0), f(7.0), f(8.0)],
                 [f(90.0), f(91.0), f(92.0), f(93.0)],
                 [f(94.0), f(95.0), f(96.0), f(97.0)],
+                [f(98.0), f(99.0), f(100.0), f(101.0)],
                 [f(34.0), f(35.0), f(36.0), f(37.0)],
                 [f(38.0), f(39.0), 0, 0],
                 [f(30.0), f(31.0), f(32.0), f(33.0)],

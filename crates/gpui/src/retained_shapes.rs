@@ -438,7 +438,8 @@ pub(crate) fn rounded_mask_clip(mask: &ContentMask<ScaledPixels>) -> Option<Reta
     mask.is_rounded().then(|| {
         let b = mask.rounded_bounds;
         let (w, h) = (b.size.width.0.max(0.0), b.size.height.0.max(0.0));
-        let r = mask.corner_radii;
+        // One radius per corner here: an elliptical corner clips by the circle inside it.
+        let r = mask.inscribed_radii();
         RetainedClipUniform {
             matrix: [1.0, 0.0, 0.0, 1.0],
             translation: [-b.origin.x.0, -b.origin.y.0],
