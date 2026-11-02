@@ -5163,7 +5163,7 @@ mod tests {
                 0,
                 0,
                 flags,
-                2 | gpui::MASK_ELLIPTICAL,
+                2 | gpui::MASK_ROUNDED | gpui::MASK_ELLIPTICAL,
                 6,
                 8,
             ]
