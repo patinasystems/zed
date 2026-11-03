@@ -2483,57 +2483,173 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered: a rectangle, with rounded corners where `corner_radii` are positive (an element's
-/// `overflow` clip follows its rounded border, as CSS clips to the padding box's curve).
+/// rendered: the square `bounds`, inside a rectangle `rounded_bounds` whose corners are rounded where
+/// `corner_radii` are positive (an element's `overflow` clip follows its rounded border, as CSS clips
+/// to the padding box's curve).
+///
+/// The rounded rectangle is kept apart from the square clip so that a square clip inside a rounded
+/// one (a scroller's or an image's own bounds under a rounded card) is exact: the curve stays where
+/// the card has it, and the square clip only trims. Shaders clip to `bounds` and take coverage from
+/// the rounded rectangle.
+///
+/// A corner may be elliptical (CSS `border-radius: 20px / 10px`, or a circular radius inset by
+/// unequal border or padding widths): `corner_radii` holds each corner's horizontal radius and
+/// `corner_radii_y` its vertical one, zero where the corner is circular, so circular masks
+/// (every mask before) keep their default and their table texel.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
-    /// The bounds
+    /// The square clip.
     pub bounds: Bounds<P>,
-    /// The radii of the bounds' corners; zero (the default) is square.
+    /// The radii of `rounded_bounds`' corners; zero (the default) is square.
     pub corner_radii: Corners<P>,
+    /// The rectangle `corner_radii` round. It contains `bounds` where `bounds` matters; a square
+    /// mask's is its `bounds`.
+    pub rounded_bounds: Bounds<P>,
+    /// Each corner's vertical radius where it differs from `corner_radii` (an elliptical
+    /// corner); zero for a circular corner. A square corner is a zero `corner_radii` entry.
+    pub corner_radii_y: Corners<P>,
 }
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// A mask that rounds its own bounds' corners.
+    pub fn rounded(bounds: Bounds<P>, corner_radii: Corners<P>) -> Self {
+        ContentMask {
+            rounded_bounds: bounds.clone(),
+            bounds,
+            corner_radii,
+            corner_radii_y: Corners::default(),
+        }
+    }
+}
+
+macro_rules! content_mask_elliptical {
+    ($unit:ty) => {
+        impl ContentMask<$unit> {
+            /// A mask that rounds its own bounds' corners by `radii_x` horizontally and `radii_y`
+            /// vertically (CSS `border-radius: x / y`); equal radii make a circular corner, and a
+            /// zero radius on either axis a square one.
+            pub fn elliptical(
+                bounds: Bounds<$unit>,
+                mut radii_x: Corners<$unit>,
+                radii_y: Corners<$unit>,
+            ) -> Self {
+                let square = |x: &mut $unit, y: $unit| {
+                    if y.0 <= 0. {
+                        *x = <$unit>::from(0.);
+                    }
+                };
+                square(&mut radii_x.top_left, radii_y.top_left);
+                square(&mut radii_x.top_right, radii_y.top_right);
+                square(&mut radii_x.bottom_right, radii_y.bottom_right);
+                square(&mut radii_x.bottom_left, radii_y.bottom_left);
+                ContentMask {
+                    corner_radii_y: radii_y,
+                    ..ContentMask::rounded(bounds, radii_x)
+                }
+                .canonical()
+            }
+        }
+    };
+}
+
+content_mask_elliptical!(Pixels);
+content_mask_elliptical!(ScaledPixels);
+
 
 macro_rules! content_mask_intersect {
     ($unit:ty) => {
         impl ContentMask<$unit> {
             /// Intersect the content mask with the given content mask.
             ///
-            /// The result is one rounded rectangle. Each of its corners takes the largest
-            /// radius a mask's rounded corner gives it: a mask's own corner keeps its
-            /// radius; a corner inset by `dx`, `dy` inside a mask's rounded corner takes
-            /// `radius - max(dx, dy)`, as CSS derives an inner curve from an outer one
-            /// (the padding box's curve from the border box's).
+            /// The square clips intersect exactly. When one mask is rounded, the result keeps
+            /// its rounded rectangle, so a square clip inside a rounded one is exact. When both
+            /// are rounded, the result is one rounded rectangle inside both: their rectangles'
+            /// intersection, each corner rounded by the smallest circle that keeps it inside
+            /// every mask whose curve reaches it ([`contained_corner_radius`]). One rounded
+            /// rectangle inside the other comes out exactly as the inner one; two that cross
+            /// lose slightly more corner than a browser would. Where those circles do not fit
+            /// the intersection (a strip narrower than the corner it sits in), the result keeps
+            /// the mask with the larger corner exactly and the other's rectangle as its square
+            /// clip, so only the smaller corners can show past their curve.
             pub fn intersect(&self, other: &Self) -> Self {
                 let bounds = self.bounds.intersect(&other.bounds);
-                if self.corner_radii == Corners::default()
-                    && other.corner_radii == Corners::default()
-                {
-                    return ContentMask::from(bounds);
+                match (self.is_rounded(), other.is_rounded()) {
+                    (false, false) => return ContentMask::from(bounds),
+                    (true, false) => return ContentMask { bounds, ..*self },
+                    (false, true) => return ContentMask { bounds, ..*other },
+                    (true, true) => {}
                 }
+                let rounded = self.rounded_bounds.intersect(&other.rounded_bounds);
+                // Each corner's (horizontal, vertical) radii: per mask, the smallest corner of
+                // its aspect inside its curve, found where its ellipse is a circle (the vertical
+                // axis scaled by rx / ry); then the larger on each axis, which cuts away at least
+                // what either does.
                 let corner = |at: fn(&Bounds<$unit>) -> Point<$unit>,
                               radius: fn(&Corners<$unit>) -> $unit| {
-                    let here = at(&bounds);
-                    let mut r = 0f32;
+                    let here = at(&rounded);
+                    let (mut out_x, mut out_y) = (0f32, 0f32);
                     for mask in [self, other] {
-                        let there = at(&mask.bounds);
-                        let inset = (here.x.0 - there.x.0)
-                            .abs()
-                            .max((here.y.0 - there.y.0).abs());
-                        r = r.max(radius(&mask.corner_radii).0 - inset);
+                        let there = at(&mask.rounded_bounds);
+                        let rx = radius(&mask.corner_radii).0;
+                        let ry = match radius(&mask.corner_radii_y).0 {
+                            ry if ry > 0. => ry,
+                            _ => rx,
+                        };
+                        if rx <= 0. || ry <= 0. {
+                            continue;
+                        }
+                        let k = rx / ry;
+                        let rho = contained_corner_radius(
+                            rx,
+                            (here.x.0 - there.x.0).abs(),
+                            (here.y.0 - there.y.0).abs() * k,
+                        );
+                        out_x = out_x.max(rho);
+                        out_y = out_y.max(rho / k);
                     }
-                    <$unit>::from(r.max(0.))
+                    (<$unit>::from(out_x), <$unit>::from(out_y))
                 };
+                let corners = [
+                    corner(|b| b.origin, |c| c.top_left),
+                    corner(|b| b.top_right(), |c| c.top_right),
+                    corner(|b| b.bottom_right(), |c| c.bottom_right),
+                    corner(|b| b.bottom_left(), |c| c.bottom_left),
+                ];
                 let corner_radii = Corners {
-                    top_left: corner(|b| b.origin, |c| c.top_left),
-                    top_right: corner(|b| b.top_right(), |c| c.top_right),
-                    bottom_right: corner(|b| b.bottom_right(), |c| c.bottom_right),
-                    bottom_left: corner(|b| b.bottom_left(), |c| c.bottom_left),
+                    top_left: corners[0].0,
+                    top_right: corners[1].0,
+                    bottom_right: corners[2].0,
+                    bottom_left: corners[3].0,
                 };
-                ContentMask {
-                    bounds,
-                    corner_radii,
+                let corner_radii_y = Corners {
+                    top_left: corners[0].1,
+                    top_right: corners[1].1,
+                    bottom_right: corners[2].1,
+                    bottom_left: corners[3].1,
+                };
+                // Coverage picks each corner's radii by quadrant: a horizontal radius fits in
+                // half the width, a vertical one in half the height.
+                let fits = corners.iter().all(|(x, y)| {
+                    x.0 <= rounded.size.width.0 / 2. && y.0 <= rounded.size.height.0 / 2.
+                });
+                if fits {
+                    return ContentMask {
+                        bounds,
+                        corner_radii,
+                        rounded_bounds: rounded,
+                        corner_radii_y,
+                    }
+                    .canonical();
                 }
+                let largest = |m: &Self| {
+                    let [x, y] = [&m.corner_radii, &m.corner_radii_y].map(|r| {
+                        r.top_left.0.max(r.top_right.0).max(r.bottom_right.0).max(r.bottom_left.0)
+                    });
+                    x.max(y)
+                };
+                let kept = if largest(self) >= largest(other) { self } else { other };
+                ContentMask { bounds, ..*kept }
             }
 
             /// Whether `point` is inside the mask, rounded corners included.
@@ -2541,7 +2657,7 @@ macro_rules! content_mask_intersect {
                 if !self.bounds.contains(point) {
                     return false;
                 }
-                let b = &self.bounds;
+                let b = &self.rounded_bounds;
                 let (x, y) = (point.x.0, point.y.0);
                 let (left, top) = (b.origin.x.0, b.origin.y.0);
                 let (right, bottom) = (left + b.size.width.0, top + b.size.height.0);
@@ -2557,16 +2673,54 @@ macro_rules! content_mask_intersect {
                 } else {
                     (bottom, -1.)
                 };
-                let radius = match (rx > 0., ry > 0.) {
+                let pick = |r: &Corners<$unit>| match (rx > 0., ry > 0.) {
                     (true, true) => r.top_left.0,
                     (false, true) => r.top_right.0,
                     (false, false) => r.bottom_right.0,
                     (true, false) => r.bottom_left.0,
                 };
-                // The corner's circle center; outside its box the straight edges hold.
-                let (ox, oy) = (cx + rx * radius, cy + ry * radius);
+                let radius_x = pick(r);
+                if radius_x <= 0. {
+                    return true;
+                }
+                let radius_y = match pick(&self.corner_radii_y) {
+                    v if v > 0. => v,
+                    _ => radius_x,
+                };
+                // The corner's ellipse center; outside its box the straight edges hold.
+                let (ox, oy) = (cx + rx * radius_x, cy + ry * radius_y);
                 let (dx, dy) = ((x - ox) * rx, (y - oy) * ry);
-                !(dx < 0. && dy < 0. && dx * dx + dy * dy > radius * radius)
+                let (u, v) = (dx / radius_x, dy / radius_y);
+                !(dx < 0. && dy < 0. && u * u + v * v > 1.)
+            }
+
+            /// Each corner's vertical radius: `corner_radii_y` where set, else the horizontal.
+            pub fn vertical_radii(&self) -> Corners<$unit> {
+                let pick = |x: $unit, y: $unit| if y.0 > 0. { y } else { x };
+                let (x, y) = (&self.corner_radii, &self.corner_radii_y);
+                Corners {
+                    top_left: pick(x.top_left, y.top_left),
+                    top_right: pick(x.top_right, y.top_right),
+                    bottom_right: pick(x.bottom_right, y.bottom_right),
+                    bottom_left: pick(x.bottom_left, y.bottom_left),
+                }
+            }
+
+
+            /// The mask with `corner_radii_y` zero where a corner is circular, so equal masks
+            /// compare (and share a table entry) equal.
+            pub fn canonical(mut self) -> Self {
+                let fix = |x: $unit, y: &mut $unit| {
+                    if y.0 == x.0 || x.0 <= 0. {
+                        *y = <$unit>::from(0.);
+                    }
+                };
+                let x = self.corner_radii;
+                fix(x.top_left, &mut self.corner_radii_y.top_left);
+                fix(x.top_right, &mut self.corner_radii_y.top_right);
+                fix(x.bottom_right, &mut self.corner_radii_y.bottom_right);
+                fix(x.bottom_left, &mut self.corner_radii_y.bottom_left);
+                self
             }
 
             /// Whether any corner is rounded.
@@ -2576,17 +2730,40 @@ macro_rules! content_mask_intersect {
                     || self.corner_radii.bottom_right.0 > 0.
                     || self.corner_radii.bottom_left.0 > 0.
             }
+
+            /// The mask moved by `offset`.
+            pub fn translate(&self, offset: Point<$unit>) -> Self {
+                ContentMask {
+                    bounds: Bounds::new(self.bounds.origin + offset, self.bounds.size),
+                    corner_radii: self.corner_radii,
+                    rounded_bounds: Bounds::new(
+                        self.rounded_bounds.origin + offset,
+                        self.rounded_bounds.size,
+                    ),
+                    corner_radii_y: self.corner_radii_y,
+                }
+            }
         }
     };
+}
+
+/// The smallest radius that keeps a rectangle's corner inside a rounded corner of radius `r`
+/// whose rectangle's corner is `dx`, `dy` outward from it (both inside the same quarter). The
+/// corner's circle, of radius `ρ`, centred `ρ` in from the corner, lies inside the mask's when
+/// `|centre - mask centre| + ρ <= r`, which first holds at `ρ = r - dx - dy - sqrt(2 dx dy)`:
+/// `r` for a shared corner, `r - dy` for a corner on the mask's edge, and zero once the corner
+/// is inside the arc.
+fn contained_corner_radius(r: f32, dx: f32, dy: f32) -> f32 {
+    if r <= 0. || dx >= r || dy >= r {
+        return 0.;
+    }
+    (r - dx - dy - (2. * dx * dy).sqrt()).max(0.)
 }
 
 impl<P: Clone + Debug + Default + PartialEq> From<Bounds<P>> for ContentMask<P> {
     /// A square mask.
     fn from(bounds: Bounds<P>) -> Self {
-        ContentMask {
-            bounds,
-            corner_radii: Corners::default(),
-        }
+        ContentMask::rounded(bounds, Corners::default())
     }
 }
 
@@ -2599,59 +2776,74 @@ mod content_mask_tests {
     use crate::{px, size};
 
     fn mask(x: f32, y: f32, w: f32, h: f32, r: f32) -> ContentMask<Pixels> {
-        ContentMask {
-            bounds: Bounds::new(point(px(x), px(y)), size(px(w), px(h))),
-            corner_radii: Corners::all(px(r)),
-        }
+        ContentMask::rounded(
+            Bounds::new(point(px(x), px(y)), size(px(w), px(h))),
+            Corners::all(px(r)),
+        )
     }
 
     #[test]
-    fn intersect_keeps_the_radii_of_shared_corners() {
+    fn a_square_clip_keeps_the_rounded_rectangle() {
         let card = mask(0., 0., 100., 100., 12.);
-        // A child filling the card: every corner is the card's, so it stays rounded,
-        // and where both round a corner, the larger radius wins.
-        assert_eq!(
-            mask(0., 0., 100., 100., 4.).intersect(&card).corner_radii,
-            Corners::all(px(12.))
-        );
-        // A square window over the card's lower half: its bottom corners are the card's.
-        let lower = mask(-10., 50., 200., 100., 0.).intersect(&card);
-        assert_eq!(
-            lower.bounds,
-            Bounds::new(point(px(0.), px(50.)), size(px(100.), px(50.)))
-        );
-        assert_eq!(
-            lower.corner_radii,
-            Corners {
-                top_left: px(0.),
-                top_right: px(0.),
-                bottom_right: px(12.),
-                bottom_left: px(12.)
-            }
-        );
-        // A child inset by 4 px takes the card's inner curve (12 - 4); one inset past the
-        // radius clips square; inset unevenly, the larger inset wins (12 - max(2, 6)).
-        assert_eq!(
-            mask(4., 4., 92., 92., 0.).intersect(&card).corner_radii,
-            Corners::all(px(8.))
-        );
-        assert_eq!(
-            mask(20., 20., 60., 60., 0.).intersect(&card).corner_radii,
-            Corners::default()
-        );
-        assert_eq!(
-            mask(2., 6., 50., 50., 0.)
-                .intersect(&card)
-                .corner_radii
-                .top_left,
-            px(6.)
-        );
+        // A tile flush with the card's left edge, ending 4 px above its bottom: the result
+        // clips to the tile and rounds by the card's own corner, so the card's curve stays
+        // where it is (a single circle on the tile would need 8 px to stay inside it).
+        let tile = mask(0., 40., 50., 56., 0.).intersect(&card);
+        assert_eq!(tile.bounds, Bounds::new(point(px(0.), px(40.)), size(px(50.), px(56.))));
+        assert_eq!(tile.rounded_bounds, card.rounded_bounds);
+        assert_eq!(tile.corner_radii, card.corner_radii);
+        assert!(!tile.contains(&point(px(0.5), px(95.5))), "the card's cutout");
+        assert!(!tile.contains(&point(px(0.2), px(99.))), "below the tile");
+        assert!(tile.contains(&point(px(3.), px(95.))));
+        // The same from the other side, and nested square clips keep it.
+        assert_eq!(card.intersect(&mask(0., 40., 50., 56., 0.)), tile);
+        let nested = tile.intersect(&mask(-5., 50., 20., 100., 0.));
+        assert_eq!(nested.rounded_bounds, card.rounded_bounds);
+        assert_eq!(nested.bounds, Bounds::new(point(px(0.), px(50.)), size(px(15.), px(46.))));
         // Square masks stay square.
         assert!(
             !mask(0., 0., 10., 10., 0.)
                 .intersect(&mask(5., 5., 10., 10., 0.))
                 .is_rounded()
         );
+    }
+
+    #[test]
+    fn rounded_masks_intersect_inside_both() {
+        let card = mask(0., 0., 100., 100., 12.);
+        // A child filling the card: every corner is the card's, so where both round a
+        // corner, the larger radius wins.
+        assert_eq!(
+            mask(0., 0., 100., 100., 4.).intersect(&card).corner_radii,
+            Corners::all(px(12.))
+        );
+        // A rounded child well inside the card is exactly itself.
+        let inner = mask(20., 20., 60., 60., 6.);
+        assert_eq!(inner.intersect(&card), inner);
+        // A padding-box child inset 4 px with its own inner curve (12 - 4) is itself.
+        let padding = mask(4., 4., 92., 92., 8.);
+        assert_eq!(padding.intersect(&card), padding);
+        // A rounded child flush with the card's left edge, ending 4 px above its bottom:
+        // its bottom left corner takes 12 - 4, the smallest circle inside the card's arc.
+        let tile = mask(0., 40., 50., 56., 2.).intersect(&card);
+        assert_eq!(tile.corner_radii.bottom_left, px(8.));
+        assert_eq!(tile.corner_radii.top_left, px(2.));
+        for (x, y) in [(0.3, 95.7), (1., 90.), (8., 95.9)] {
+            let p = point(px(x), px(y));
+            assert!(!tile.contains(&p) || card.contains(&p), "({x}, {y}) leaks");
+        }
+        // A strip narrower than the card's corner, in that corner: no circle on the strip
+        // fits inside the card's arc, so the card's rectangle and curve stay as they are and
+        // the strip clips square.
+        let strip = mask(0., 0., 10., 100., 1.).intersect(&card);
+        assert_eq!(strip.rounded_bounds, card.rounded_bounds);
+        assert_eq!(strip.corner_radii, card.corner_radii);
+        assert_eq!(strip.bounds, Bounds::new(point(px(0.), px(0.)), size(px(10.), px(100.))));
+        assert!(!strip.contains(&point(px(0.5), px(5.))), "outside the card's arc");
+        // A corner inside the arc stays as the child has it.
+        assert_eq!(contained_corner_radius(12., 4., 4.), 0.);
+        assert_eq!(contained_corner_radius(12., 0., 0.), 12.);
+        assert_eq!(contained_corner_radius(12., 20., 0.), 0.);
     }
 
     #[test]
@@ -2670,6 +2862,58 @@ mod content_mask_tests {
     }
 
     #[test]
+    fn elliptical_masks_clip_by_their_ellipse() {
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        // A 100 x 60 card with 20 x 10 px corners.
+        let card = ContentMask::<Pixels>::elliptical(rect(0., 0., 100., 60.), Corners::all(px(20.)), Corners::all(px(10.)));
+        assert!(card.is_rounded());
+        assert_eq!(card.vertical_radii(), Corners::all(px(10.)));
+        // (6, 2) is inside a 10 px circle's corner box but outside the 20 x 10 ellipse; (12, 3)
+        // is inside it.
+        assert!(!card.contains(&point(px(6.), px(2.))));
+        assert!(card.contains(&point(px(12.), px(3.))));
+        assert!(card.contains(&point(px(50.), px(0.5))), "straight top edge");
+        // Equal radii are a circular mask, stored as one.
+        let round = ContentMask::<Pixels>::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), Corners::all(px(3.)));
+        assert_eq!(round, ContentMask::rounded(rect(0., 0., 10., 10.), Corners::all(px(3.))));
+        // A corner flat on either axis is square (CSS Backgrounds 3 5.1).
+        let flat = Corners { top_left: px(0.), ..Corners::all(px(3.)) };
+        let half = ContentMask::<Pixels>::elliptical(rect(0., 0., 10., 10.), Corners::all(px(3.)), flat);
+        assert_eq!(half.corner_radii.top_left, px(0.));
+        assert!(half.contains(&point(px(0.2), px(0.2))));
+        assert_eq!(half.corner_radii.top_right, px(3.));
+        // A square clip inside keeps the ellipse.
+        let tile = ContentMask::from(rect(0., 0., 30., 30.)).intersect(&card);
+        assert_eq!(tile.corner_radii_y, card.corner_radii_y);
+        assert!(!tile.contains(&point(px(6.), px(2.))));
+        // A rounded child sharing the card's corner takes the card's ellipse there, and its
+        // own circle where the card does not reach.
+        let child = ContentMask::rounded(rect(0., 0., 50., 30.), Corners::all(px(4.))).intersect(&card);
+        assert_eq!(child.corner_radii.top_left, px(20.));
+        assert_eq!(child.vertical_radii().top_left, px(10.));
+        assert_eq!(child.corner_radii.bottom_right, px(4.));
+        assert_eq!(child.vertical_radii().bottom_right, px(4.));
+        for (x, y) in [(1., 1.), (6., 2.), (2., 6.), (0.5, 9.)] {
+            let p = point(px(x), px(y));
+            assert!(!child.contains(&p) || card.contains(&p), "({x}, {y}) leaks");
+        }
+        // A rounded child inset into the card's corner: the smallest corner of the card's
+        // aspect inside its ellipse, never past it.
+        let inset = ContentMask::rounded(rect(2., 1., 40., 30.), Corners::all(px(1.))).intersect(&card);
+        let (rx, ry) = (inset.corner_radii.top_left.0, inset.vertical_radii().top_left.0);
+        assert!(rx > 0. && (rx / ry - 2.).abs() < 1e-4, "{rx} x {ry}");
+        for i in 0..=40 {
+            for j in 0..=20 {
+                let p = point(px(2. + i as f32 * 0.5), px(1. + j as f32 * 0.5));
+                assert!(!inset.contains(&p) || card.contains(&p), "{p:?} leaks");
+            }
+        }
+        // Scaling scales both axes.
+        let scaled = card.scale(2.);
+        assert_eq!(scaled.corner_radii_y, Corners::all(ScaledPixels(20.)));
+    }
+
+    #[test]
     fn scale_scales_the_radii() {
         let scaled = mask(1., 2., 3., 4., 5.).scale(2.);
         assert_eq!(scaled.corner_radii, Corners::all(ScaledPixels(10.)));
@@ -2683,6 +2927,8 @@ impl ContentMask<Pixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
             corner_radii: self.corner_radii.scale(factor),
+            rounded_bounds: self.rounded_bounds.scale(factor),
+            corner_radii_y: self.corner_radii_y.scale(factor),
         }
     }
 }
@@ -3814,6 +4060,8 @@ impl Window {
         ContentMask {
             bounds: self.cover_bounds(mask.bounds),
             corner_radii: mask.corner_radii.scale(self.scale_factor()),
+            rounded_bounds: self.cover_bounds(mask.rounded_bounds),
+            corner_radii_y: mask.corner_radii_y.scale(self.scale_factor()),
         }
     }
 
@@ -4994,16 +5242,20 @@ impl Window {
             // its transformed bounds (exact for translation and scale).
             if let Some(transformation) = self.element_transformation_stack.last() {
                 mask.bounds = transform_pixel_bounds(transformation, mask.bounds);
-                // Rounded corners scale with an axis-aligned transformation (by the smaller
-                // scale, so they stay circular); under rotation, skew or a flip the mask is
-                // the transformed bounding box and clips square.
+                mask.rounded_bounds = transform_pixel_bounds(transformation, mask.rounded_bounds);
+                // Rounded corners scale with an axis-aligned transformation, each axis by its
+                // own scale (a circle under unequal scales becomes an ellipse); under rotation,
+                // skew or a flip the mask is the transformed bounding box and clips square.
                 let [[a, b], [c, d]] = transformation.rotation_scale;
-                mask.corner_radii = if b == 0. && c == 0. && a > 0. && d > 0. {
-                    let scale = a.min(d);
-                    mask.corner_radii.map(|r| *r * scale)
+                if b == 0. && c == 0. && a > 0. && d > 0. {
+                    let vertical = mask.vertical_radii();
+                    mask.corner_radii = mask.corner_radii.map(|r| *r * a);
+                    mask.corner_radii_y = vertical.map(|r| *r * d);
+                    mask = mask.canonical();
                 } else {
-                    Corners::default()
-                };
+                    mask.corner_radii = Corners::default();
+                    mask.corner_radii_y = Corners::default();
+                }
             }
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
@@ -10572,6 +10824,55 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
             cursor_at(cx, point(px(10.), px(5.))),
             Some(crate::CursorStyle::PointingHand)
         );
+    }
+
+    /// A 50 px box with the pointing-hand cursor at the window's corner.
+    struct PointerBox;
+
+    impl Render for PointerBox {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().id("box").w(px(50.)).h(px(50.)).cursor_pointer())
+        }
+    }
+
+    /// The test platform shows the cursor as the platforms do on every OS: the pointer moving
+    /// over the window hovers it (Linux and Windows show only a hovered window's cursor), and
+    /// leaving it unhovers it.
+    #[gpui::test]
+    fn test_the_platform_shows_the_hovered_windows_cursor(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| PointerBox);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let cursor_at = |cx: &mut crate::VisualTestContext, at: Point<Pixels>| {
+            cx.simulate_mouse_move(at, None, crate::Modifiers::default());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.cx.active_cursor()
+        };
+        assert_eq!(
+            cursor_at(cx, point(px(10.), px(10.))),
+            crate::CursorStyle::PointingHand
+        );
+        assert_eq!(
+            cursor_at(cx, point(px(100.), px(100.))),
+            crate::CursorStyle::Arrow
+        );
+        assert_eq!(
+            cursor_at(cx, point(px(20.), px(20.))),
+            crate::CursorStyle::PointingHand
+        );
+        assert!(cx.update(|window, _| window.is_window_hovered()) || cfg!(target_os = "macos"));
+        cx.simulate_event(crate::MouseExitEvent {
+            position: point(px(-1.), px(20.)),
+            pressed_button: None,
+            modifiers: crate::Modifiers::default(),
+        });
+        cx.run_until_parked();
+        if cfg!(not(target_os = "macos")) {
+            assert!(!cx.update(|window, _| window.is_window_hovered()));
+        }
     }
 
     #[gpui::test]

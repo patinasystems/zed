@@ -10,6 +10,8 @@ struct GpuiMarksClip {
     t: vec2<f32>,
     half_size: vec2<f32>,
     radii: vec4<f32>,
+    // Vertical radii; zero is circular.
+    radii_y: vec4<f32>,
 }
 
 struct GpuiMarks {
@@ -116,13 +118,19 @@ fn gpui_marks_clip_coverage(pos: vec2<f32>) -> f32 {
         if c.half_size.x < 0.0 {
             return 0.0;
         }
-        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
-        let d = gpui_marks_rect_sdf(p, c.half_size, c.radii);
+        var p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
         let side = select(c.radii.xw, c.radii.yz, p.x >= 0.0);
         let radius = select(side.x, side.y, p.y >= 0.0);
-        let q = abs(p) - c.half_size + radius;
+        // An elliptical corner is its circle with y scaled by rx / ry (as retained shapes' clips).
+        let side_y = select(c.radii_y.xw, c.radii_y.yz, p.x >= 0.0);
+        let radius_y = select(side_y.x, side_y.y, p.y >= 0.0);
+        let k = select(1.0, radius / radius_y, radius > 0.0 && radius_y > 0.0);
+        p.y *= k;
+        let half_size = vec2<f32>(c.half_size.x, c.half_size.y * k);
+        let d = gpui_marks_rect_sdf(p, half_size, vec4<f32>(radius));
+        let q = abs(p) - half_size + radius;
         var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
-        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
+        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0) * k);
         let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
         coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
     }

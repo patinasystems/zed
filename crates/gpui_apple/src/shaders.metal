@@ -3,6 +3,13 @@
 
 using namespace metal;
 
+// Whether the scene has elliptical content masks (`InstanceTables::has_elliptical_masks`): the
+// renderer specializes the pipelines that read masks both ways, so a scene of circular and
+// rectangular clips runs code with no elliptical path.
+constant bool elliptical_masks_constant [[function_constant(0)]];
+constant bool ELLIPTICAL_MASKS =
+    is_function_constant_defined(elliptical_masks_constant) && elliptical_masks_constant;
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -27,7 +34,12 @@ Bounds_ScaledPixels dilate_bounds(Bounds_ScaledPixels bounds, float2 amount);
 Bounds_ScaledPixels scale_bounds(Bounds_ScaledPixels bounds, float2 scale);
 Corners_ScaledPixels scale_corners(Corners_ScaledPixels corners, float scale);
 float2 bounds_position(float2 unit_vertex, Bounds_ScaledPixels bounds);
-float corner_dash_velocity(float dv1, float dv2);
+float rounded_dash_alpha(Quad quad, float2 point, float2 size, float2 center_to_point,
+                         float2 corner_to_point, float2 corner_center_to_point,
+                         bool is_near_rounded_corner, float2 corner_radii_xy,
+                         float antialias_threshold);
+float ellipse_arc_length(float2 r, float t);
+float ellipse_nearest_angle(float2 p, float2 r);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
@@ -37,7 +49,6 @@ Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y)
 bool corners_equal(Corners_ScaledPixels a, Corners_ScaledPixels b);
 float quad_sdf_impl_xy(float2 corner_center_to_point, float2 radii);
 float2 corner_pair(float x, float y);
-float quarter_arc_length(float2 r);
 float ellipse_sdf(float2 p, float2 r);
 float pick_corner_shape(float2 center_to_point, uint2 shapes);
 float shaped_corner_sdf(float2 p, float2 radii, float k);
@@ -74,6 +85,33 @@ GradientVertex gradient_vertex(constant float4 *gradients, uint start, float2 po
                                Bounds_ScaledPixels bounds);
 float4 gradient_fill(constant float4 *gradients, uint start, float2 point, float4 stops,
                      float4 header, float4 first, float4 last, float opacity);
+
+// ---- Instance records (`gpui::InstanceTables`) ----
+// Renderers upload a compact record per small primitive (quads, which are fill-heavy, upload
+// whole: see `write_instances`) and one table of texels per scene: its
+// distinct content masks (3 texels, and a 4th, the vertical radii, when the index has
+// MASK_ELLIPTICAL set), transformations (2 texels, the identity at texel 0) and
+// each primitive's aux record. `load_*` expand a record into the primitive's full layout.
+
+// A path vertex expanded from its `PathVertexRecord` and its path's record.
+struct PathRasterizationVertex {
+  Point_ScaledPixels xy_position;
+  Point_f32 st_position;
+  Background color;
+  Bounds_ScaledPixels bounds;
+  ContentMask_ScaledPixels content_mask;
+};
+
+ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index);
+TransformationMatrix load_transformation(constant float4 *tables, uint index);
+Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id);
+Underline load_underline(constant UnderlineRecord *underlines, constant float4 *tables, uint id);
+MonochromeSprite load_monochrome_sprite(constant SpriteRecord *sprites, constant float4 *tables,
+                                        uint id);
+PolychromeSprite load_polychrome_sprite(constant PolychromeSpriteRecord *sprites,
+                                        constant float4 *tables, uint id);
+PathRasterizationVertex load_path_vertex(constant PathVertexRecord *vertices,
+                                         constant float4 *tables, uint id);
 
 struct QuadVertexOutput {
   uint quad_id [[flat]];
@@ -164,11 +202,14 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Quads read their full per-primitive struct, not an instance record (see `write_instances`).
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]],
                               constant float4 *gradients
                               [[buffer(QuadInputIndex_Gradients)]]) {
+  // The clip reads the mask in place before the quad is copied out: computing it from the
+  // copy cost 40k-quad instance frames 3% GPU time on M4 Max (PR 4793's follow-up).
   float clip_alpha = content_mask_alpha(input.position.xy, quads[input.quad_id].content_mask);
   Quad quad = quads[input.quad_id];
   float2 position = input.position.xy;
@@ -390,135 +431,34 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
         t *= dash_velocity;
         max_t = is_horizontal ? size.x : size.y;
         max_t *= dash_velocity;
-      } else {
-        // When corners are rounded, the dashes are laid out clockwise
-        // around the whole perimeter.
 
-        // Each corner's (rx, ry): an elliptical corner's dashes follow its arc.
-        float2 r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
-        float2 r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
-        float2 r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
-        float2 r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+        float dash_length = dash_length_per_width / dash_period_per_width;
+        float desired_dash_gap = dash_gap_per_width / dash_period_per_width;
 
-        float w_t = quad.border_widths.top;
-        float w_r = quad.border_widths.right;
-        float w_b = quad.border_widths.bottom;
-        float w_l = quad.border_widths.left;
-
-        // Straight side dash velocities
-        float dv_t = w_t <= 0.0 ? 0.0 : dv_numerator / w_t;
-        float dv_r = w_r <= 0.0 ? 0.0 : dv_numerator / w_r;
-        float dv_b = w_b <= 0.0 ? 0.0 : dv_numerator / w_b;
-        float dv_l = w_l <= 0.0 ? 0.0 : dv_numerator / w_l;
-
-        // Straight side lengths in dash space
-        float s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
-        float s_r = (size.y - r_tr.y - r_br.y) * dv_r;
-        float s_b = (size.x - r_br.x - r_bl.x) * dv_b;
-        float s_l = (size.y - r_bl.y - r_tl.y) * dv_l;
-
-        float corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
-        float corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
-        float corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
-        float corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
-
-        // Corner lengths in dash space
-        float c_tr = quarter_arc_length(r_tr) * corner_dash_velocity_tr;
-        float c_br = quarter_arc_length(r_br) * corner_dash_velocity_br;
-        float c_bl = quarter_arc_length(r_bl) * corner_dash_velocity_bl;
-        float c_tl = quarter_arc_length(r_tl) * corner_dash_velocity_tl;
-
-        // Cumulative dash space upto each segment
-        float upto_tr = s_t;
-        float upto_r = upto_tr + c_tr;
-        float upto_br = upto_r + s_r;
-        float upto_b = upto_br + c_br;
-        float upto_bl = upto_b + s_b;
-        float upto_l = upto_bl + c_bl;
-        float upto_tl = upto_l + s_l;
-        max_t = upto_tl + c_tl;
-
-        if (is_near_rounded_corner) {
-          // The angle in the corner's unit circle (an ellipse's parameter), spread over its arc.
-          float radians = atan2(corner_center_to_point.y / max(corner_radii_xy.y, 1e-4),
-                                corner_center_to_point.x / max(corner_radii_xy.x, 1e-4));
-          float corner_t = corner_radii_xy.x == corner_radii_xy.y
-            ? radians * corner_radius
-            : radians * quarter_arc_length(corner_radii_xy) / (M_PI_F / 2.0);
-
-          if (center_to_point.x >= 0.0) {
-            if (center_to_point.y < 0.0) {
-              dash_velocity = corner_dash_velocity_tr;
-              // Subtracted because radians is pi/2 to 0 when
-              // going clockwise around the top right corner,
-              // since the y axis has been flipped
-              t = upto_r - corner_t * dash_velocity;
-            } else {
-              dash_velocity = corner_dash_velocity_br;
-              // Added because radians is 0 to pi/2 when going
-              // clockwise around the bottom-right corner
-              t = upto_br + corner_t * dash_velocity;
-            }
-          } else {
-            if (center_to_point.y >= 0.0) {
-              dash_velocity = corner_dash_velocity_bl;
-              // Subtracted because radians is pi/1 to 0 when
-              // going clockwise around the bottom-left corner,
-              // since the x axis has been flipped
-              t = upto_l - corner_t * dash_velocity;
-            } else {
-              dash_velocity = corner_dash_velocity_tl;
-              // Added because radians is 0 to pi/2 when going
-              // clockwise around the top-left corner, since both
-              // axis were flipped
-              t = upto_tl + corner_t * dash_velocity;
-            }
-          }
-        } else {
-          // Straight borders
-          bool is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
-          if (is_horizontal) {
-            if (center_to_point.y < 0.0) {
-              dash_velocity = dv_t;
-              t = (point.x - r_tl.x) * dash_velocity;
-            } else {
-              dash_velocity = dv_b;
-              t = upto_bl - (point.x - r_bl.x) * dash_velocity;
-            }
-          } else {
-            if (center_to_point.x < 0.0) {
-              dash_velocity = dv_l;
-              t = upto_tl - (point.y - r_tl.y) * dash_velocity;
-            } else {
-              dash_velocity = dv_r;
-              t = upto_r + (point.y - r_tr.y) * dash_velocity;
-            }
-          }
-        }
-      }
-
-      float dash_length = dash_length_per_width / dash_period_per_width;
-      float desired_dash_gap = dash_gap_per_width / dash_period_per_width;
-
-      // Straight borders should start and end with a dash, so max_t is
-      // reduced to cause this.
-      max_t -= unrounded ? dash_length : 0.0;
-      if (max_t >= 1.0) {
-        // Adjust dash gap to evenly divide max_t
-        float dash_count = floor(max_t);
-        float dash_period = max_t / dash_count;
-        border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
-                                     antialias_threshold);
-      } else if (unrounded) {
-        // When there isn't enough space for the full gap between the
-        // two start / end dashes of a straight border, reduce gap to
-        // make them fit.
-        float dash_gap = max_t - dash_length;
-        if (dash_gap > 0.0) {
-          float dash_period = dash_length + dash_gap;
+        // Straight borders should start and end with a dash, so max_t is
+        // reduced to cause this.
+        max_t -= dash_length;
+        if (max_t >= 1.0) {
+          // Adjust dash gap to evenly divide max_t
+          float dash_count = floor(max_t);
+          float dash_period = max_t / dash_count;
           border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
                                        antialias_threshold);
+        } else {
+          // When there isn't enough space for the full gap between the
+          // two start / end dashes of a straight border, reduce gap to
+          // make them fit.
+          float dash_gap = max_t - dash_length;
+          if (dash_gap > 0.0) {
+            float dash_period = dash_length + dash_gap;
+            border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
+                                         antialias_threshold);
+          }
         }
+      } else {
+        border_color.a *= rounded_dash_alpha(quad, point, size, center_to_point, corner_to_point,
+                                             corner_center_to_point, is_near_rounded_corner,
+                                             corner_radii_xy, antialias_threshold);
       }
     }
 
@@ -532,22 +472,114 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return clip_alpha_straight(color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf)), clip_alpha);
 }
 
-// Returns the dash velocity of a corner given the dash velocity of the two
-// sides, by returning the slower velocity (larger dashes).
-//
-// Since 0 is used for dash velocity when the border width is 0 (instead of
-// +inf), this returns the other dash velocity in that case.
-//
-// An alternative to this might be to appropriately interpolate the dash
-// velocity around the corner, but that seems overcomplicated.
-float corner_dash_velocity(float dv1, float dv2) {
-  if (dv1 == 0.0) {
-    return dv2;
-  } else if (dv2 == 0.0) {
-    return dv1;
+// The alpha of a rounded dashed border at `point` (from the quad's origin), as WebKit draws it
+// (`BorderPainter::drawBoxSideFromPath`). Each side strokes the outer edge's path, which starts
+// halfway down the straight part of the right edge and runs clockwise (down the right edge
+// first), with dashes three times the side's width and gaps as long. When the count of dashes
+// along the whole path is odd and not whole, each gap grows by a dash over half that count. The
+// pattern starts with a gap (a dash offset of one dash), and under four dashes the side is solid.
+// A pixel takes the position of the point of the outer edge nearest to it, and the pattern of the
+// side whose part of the border holds it: each corner splits along the line from the box's outer
+// corner to the border's inner corner.
+float rounded_dash_alpha(Quad quad, float2 point, float2 size, float2 center_to_point,
+                         float2 corner_to_point, float2 corner_center_to_point,
+                         bool is_near_rounded_corner, float2 corner_radii_xy,
+                         float antialias_threshold) {
+  float2 r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
+  float2 r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
+  float2 r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
+  float2 r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+  float q_tr = ellipse_arc_length(r_tr, M_PI_F / 2.0);
+  float q_br = ellipse_arc_length(r_br, M_PI_F / 2.0);
+  float q_bl = ellipse_arc_length(r_bl, M_PI_F / 2.0);
+  float q_tl = ellipse_arc_length(r_tl, M_PI_F / 2.0);
+
+  // Where each piece of the path starts, along it.
+  float start_y = (r_tr.y + size.y - r_br.y) / 2.0;
+  float at_br = size.y - r_br.y - start_y;
+  float at_b = at_br + q_br;
+  float at_bl = at_b + (size.x - r_br.x - r_bl.x);
+  float at_l = at_bl + q_bl;
+  float at_tl = at_l + (size.y - r_bl.y - r_tl.y);
+  float at_t = at_tl + q_tl;
+  float at_tr = at_t + (size.x - r_tl.x - r_tr.x);
+  float at_r = at_tr + q_tr;
+  float total = at_r + (start_y - r_tr.y);
+
+  bool right = center_to_point.x >= 0.0;
+  bool bottom = center_to_point.y >= 0.0;
+  float s;
+  if (is_near_rounded_corner) {
+    float arc = ellipse_arc_length(corner_radii_xy,
+                                   ellipse_nearest_angle(corner_center_to_point, corner_radii_xy));
+    if (right) {
+      s = bottom ? at_br + arc : at_tr + q_tr - arc;
+    } else {
+      s = bottom ? at_bl + q_bl - arc : at_tl + arc;
+    }
+  } else if (corner_to_point.y > corner_to_point.x) {
+    // Nearest a horizontal edge.
+    s = bottom ? at_b + (size.x - r_br.x - point.x) : at_t + (point.x - r_tl.x);
+  } else if (right) {
+    s = point.y >= start_y ? point.y - start_y : at_r + (point.y - r_tr.y);
   } else {
-    return min(dv1, dv2);
+    s = at_l + (size.y - r_bl.y - point.y);
   }
+
+  float2 from_corner = -corner_to_point;
+  float horizontal_width = bottom ? quad.border_widths.bottom : quad.border_widths.top;
+  float vertical_width = right ? quad.border_widths.right : quad.border_widths.left;
+  float width = from_corner.y * vertical_width < from_corner.x * horizontal_width
+    ? horizontal_width
+    : vertical_width;
+  float dash = 3.0 * width;
+  if (dash <= 0.0) {
+    return 1.0;
+  }
+  float count = total / dash;
+  if (count < 4.0) {
+    return 1.0;
+  }
+  float gap = dash;
+  if ((int(count) & 1) == 1 && fract(count) > 0.0) {
+    gap += dash / (count / 2.0);
+  }
+  return dash_alpha(s + dash, dash + gap, dash, 1.0, antialias_threshold);
+}
+
+// The arc length of an ellipse of radii `r` from parametric angle 0 (the end of its horizontal
+// radius) to `t`: Simpson's rule over eight steps, exact for a circle.
+float ellipse_arc_length(float2 r, float t) {
+  if (r.x == r.y) {
+    return r.x * t;
+  }
+  float h = t / 8.0;
+  float sum = 0.0;
+  for (int i = 0; i <= 8; i++) {
+    float a = h * float(i);
+    float weight = (i == 0 || i == 8) ? 1.0 : ((i & 1) == 1 ? 4.0 : 2.0);
+    sum += weight * length(float2(r.x * sin(a), r.y * cos(a)));
+  }
+  return sum * h / 3.0;
+}
+
+// The parametric angle of the point of an ellipse of radii `r` (centered at the origin) nearest
+// to `p`, both components of `p` at least 0: where the ellipse's normal through `p` meets it. Three
+// iterations of the evolute method; exact for a circle.
+float ellipse_nearest_angle(float2 p, float2 r) {
+  if (r.x == r.y) {
+    return atan2(p.y, p.x);
+  }
+  float2 t = float2(0.70710678);
+  for (int i = 0; i < 3; i++) {
+    float2 e = float2((r.x * r.x - r.y * r.y) * t.x * t.x * t.x / r.x,
+                      (r.y * r.y - r.x * r.x) * t.y * t.y * t.y / r.y);
+    float2 q = p - e;
+    float scale = length(r * t - e) / max(length(q), 1e-4);
+    t = clamp((q * scale + e) / r, 0.0, 1.0);
+    t /= max(length(t), 1e-4);
+  }
+  return atan2(t.y, t.x);
 }
 
 // Returns alpha used to render antialiased dashes.
@@ -600,11 +632,12 @@ struct ShadowFragmentInput {
 vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
-    constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
+    constant ShadowRecord *shadows [[buffer(ShadowInputIndex_Shadows)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant float4 *tables [[buffer(ShadowInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Shadow shadow = shadows[shadow_id];
+  Shadow shadow = load_shadow(shadows, tables, shadow_id);
 
   Bounds_ScaledPixels bounds;
   if (shadow.inset != 0u) {
@@ -644,10 +677,12 @@ vertex ShadowVertexOutput shadow_vertex(
 }
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
-                                constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, shadows[input.shadow_id].content_mask);
-  Shadow shadow = shadows[input.shadow_id];
+                                constant ShadowRecord *shadows
+                                [[buffer(ShadowInputIndex_Shadows)]],
+                                constant float4 *tables
+                                [[buffer(ShadowInputIndex_Tables)]]) {
+  Shadow shadow = load_shadow(shadows, tables, input.shadow_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, shadow.content_mask);
   float2 position = input.position.xy;
   if (is_transformed(shadow.transformation)) {
     // Shade in the shadow's own frame, scaled to device pixels.
@@ -739,11 +774,12 @@ struct UnderlineFragmentInput {
 vertex UnderlineVertexOutput underline_vertex(
     uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
-    constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
+    constant UnderlineRecord *underlines [[buffer(UnderlineInputIndex_Underlines)]],
     constant Size_DevicePixels *viewport_size
-    [[buffer(ShadowInputIndex_ViewportSize)]]) {
+    [[buffer(UnderlineInputIndex_ViewportSize)]],
+    constant float4 *tables [[buffer(UnderlineInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Underline underline = underlines[underline_id];
+  Underline underline = load_underline(underlines, tables, underline_id);
   Bounds_ScaledPixels geometry = underline.bounds;
   float4 device_position;
   float4 clip_distance;
@@ -769,13 +805,15 @@ vertex UnderlineVertexOutput underline_vertex(
 }
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
-                                   constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, underlines[input.underline_id].content_mask);
+                                   constant UnderlineRecord *underlines
+                                   [[buffer(UnderlineInputIndex_Underlines)]],
+                                   constant float4 *tables
+                                   [[buffer(UnderlineInputIndex_Tables)]]) {
+  Underline underline = load_underline(underlines, tables, input.underline_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
-  Underline underline = underlines[input.underline_id];
   float2 position = input.position.xy;
   bool transformed = is_transformed(underline.transformation);
   if (transformed) {
@@ -833,13 +871,14 @@ struct MonochromeSpriteFragmentInput {
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant SpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
-    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  MonochromeSprite sprite = sprites[sprite_id];
+  MonochromeSprite sprite = load_monochrome_sprite(sprites, tables, sprite_id);
   float4 device_position =
       to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
@@ -856,9 +895,11 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, sprites[input.sprite_id].content_mask);
+    constant SpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
+  float clip_alpha = content_mask_alpha(
+      input.position.xy, load_content_mask(tables, sprites[input.sprite_id].content_mask));
   if (any(input.clip_distance < float4(0.0))) {
     return clip_alpha_straight(float4(0.0), clip_alpha);
   }
@@ -891,14 +932,15 @@ struct PolychromeSpriteFragmentInput {
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant PolychromeSpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
-    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  PolychromeSprite sprite = sprites[sprite_id];
+  PolychromeSprite sprite = load_polychrome_sprite(sprites, tables, sprite_id);
   float4 device_position = to_device_position_transformed(
       unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(
@@ -917,12 +959,13 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant PolychromeSpriteRecord *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
     // Linear, or nearest for an external texture that asks for it.
-    sampler atlas_texture_sampler [[sampler(0)]]) {
-  float clip_alpha = content_mask_alpha(input.position.xy, sprites[input.sprite_id].content_mask);
-  PolychromeSprite sprite = sprites[input.sprite_id];
+    sampler atlas_texture_sampler [[sampler(0)]],
+    constant float4 *tables [[buffer(SpriteInputIndex_Tables)]]) {
+  PolychromeSprite sprite = load_polychrome_sprite(sprites, tables, input.sprite_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
   // Sample inside the tile: a filtered read at the tile's edge texels would blend in its
   // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
   float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
@@ -961,10 +1004,11 @@ struct PathRasterizationFragmentInput {
 
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant PathVertexRecord *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]],
+  constant float4 *tables [[buffer(PathRasterizationInputIndex_Tables)]]
 ) {
-  PathRasterizationVertex v = vertices[vertex_id];
+  PathRasterizationVertex v = load_path_vertex(vertices, tables, vertex_id);
   float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
   float4 position = float4(
     vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
@@ -986,13 +1030,14 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+  constant PathVertexRecord *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant float4 *tables [[buffer(PathRasterizationInputIndex_Tables)]]
 ) {
-  float clip_alpha = content_mask_alpha(input.position.xy, vertices[input.vertex_id].content_mask);
+  PathRasterizationVertex v = load_path_vertex(vertices, tables, input.vertex_id);
+  float clip_alpha = content_mask_alpha(input.position.xy, v.content_mask);
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
-  PathRasterizationVertex v = vertices[input.vertex_id];
   Background background = v.color;
   Bounds_ScaledPixels path_bounds = v.bounds;
   float alpha;
@@ -1343,11 +1388,6 @@ float2 pick_corner_radii_xy(float2 center_to_point, Corners_ScaledPixels x, Corn
 
 float2 corner_pair(float x, float y) {
   return (x <= 0.0 || y <= 0.0) ? float2(0.0) : float2(x, y);
-}
-
-// The length of a quarter ellipse of radii `r` (Ramanujan's approximation; exact for a circle).
-float quarter_arc_length(float2 r) {
-  return (M_PI_F / 4.0) * (3.0 * (r.x + r.y) - sqrt((3.0 * r.x + r.y) * (r.x + 3.0 * r.y)));
 }
 
 Corners_ScaledPixels min_corners(Corners_ScaledPixels x, Corners_ScaledPixels y) {
@@ -1810,6 +1850,7 @@ struct RetainedClip {
   float2 t;
   float2 half_size;
   float4 radii; // top-left, top-right, bottom-right, bottom-left
+  float4 radii_y; // vertical radii, the same order; zero is circular
 };
 
 struct RetainedShapesUniforms {
@@ -2023,13 +2064,20 @@ float retained_clip_coverage(float2 pos, constant RetainedShapesUniforms *u) {
       return 0.0;
     }
     float2 p = float2(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
-    float d = retained_rect_sdf(p, c.half_size, c.radii);
-    // The distance's gradient in clip space, then in device pixels.
     float2 side = p.x >= 0.0 ? c.radii.yz : c.radii.xw;
     float radius = p.y >= 0.0 ? side.y : side.x;
-    float2 q = abs(p) - c.half_size + radius;
+    // An elliptical corner (a vertical radius; zero is circular) is its circle in a space whose
+    // y is scaled by rx / ry: a quadrant's distance depends on its own corner only.
+    float2 side_y = p.x >= 0.0 ? c.radii_y.yz : c.radii_y.xw;
+    float radius_y = p.y >= 0.0 ? side_y.y : side_y.x;
+    float k = (radius > 0.0 && radius_y > 0.0) ? radius / radius_y : 1.0;
+    p.y *= k;
+    float2 half_size = float2(c.half_size.x, c.half_size.y * k);
+    float d = retained_rect_sdf(p, half_size, float4(radius));
+    // The distance's gradient in clip space (through the y scale), then in device pixels.
+    float2 q = abs(p) - half_size + radius;
     float2 g = (q.x > 0.0 && q.y > 0.0) ? normalize(q) : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
-    g *= float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    g *= float2(p.x < 0.0 ? -1.0 : 1.0, (p.y < 0.0 ? -1.0 : 1.0) * k);
     float per_px = length(float2(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
     // The intersection: the least covered clip (a product would darken shared edges).
     coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
@@ -2462,17 +2510,186 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the vertex stage's clip distances; a square
-// mask costs this one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the vertex stage's
+// clip distances; a square mask costs this one test.
 float content_mask_alpha(float2 position, ContentMask_ScaledPixels mask) {
   Corners_ScaledPixels r = mask.corner_radii;
   if (r.top_left <= 0. && r.top_right <= 0. && r.bottom_right <= 0. && r.bottom_left <= 0.) {
     return 1.;
   }
-  return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+  Corners_ScaledPixels y = mask.corner_radii_y;
+  if (!ELLIPTICAL_MASKS ||
+      (y.top_left <= 0. && y.top_right <= 0. && y.bottom_right <= 0. && y.bottom_left <= 0.)) {
+    return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+  }
+  // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
+  y.top_left = y.top_left > 0. ? y.top_left : r.top_left;
+  y.top_right = y.top_right > 0. ? y.top_right : r.top_right;
+  y.bottom_right = y.bottom_right > 0. ? y.bottom_right : r.bottom_right;
+  y.bottom_left = y.bottom_left > 0. ? y.bottom_left : r.bottom_left;
+  return saturate(0.5 - quad_sdf_xy(position, mask.rounded_bounds, r, y));
 }
 
 float4 clip_alpha_straight(float4 color, float alpha) {
   return float4(color.rgb, color.a * alpha);
+}
+
+// ---- Instance records (`gpui::InstanceTables`) ----
+
+Bounds_ScaledPixels texel_bounds(float4 texel) {
+  Bounds_ScaledPixels bounds;
+  bounds.origin.x = texel.x;
+  bounds.origin.y = texel.y;
+  bounds.size.width = texel.z;
+  bounds.size.height = texel.w;
+  return bounds;
+}
+
+Corners_ScaledPixels texel_corners(float4 texel) {
+  Corners_ScaledPixels corners;
+  corners.top_left = texel.x;
+  corners.top_right = texel.y;
+  corners.bottom_right = texel.z;
+  corners.bottom_left = texel.w;
+  return corners;
+}
+
+Hsla texel_hsla(float4 texel) {
+  Hsla color;
+  color.h = texel.x;
+  color.s = texel.y;
+  color.l = texel.z;
+  color.a = texel.w;
+  return color;
+}
+
+ContentMask_ScaledPixels load_content_mask(constant float4 *tables, uint index) {
+  ContentMask_ScaledPixels mask;
+  uint at = index & 0x7fffffffu;
+  mask.bounds = texel_bounds(tables[at]);
+  mask.corner_radii = texel_corners(tables[at + 1]);
+  mask.rounded_bounds = texel_bounds(tables[at + 2]);
+  // A circular mask has no fourth texel (`MASK_ELLIPTICAL`); circular scenes compile it out.
+  mask.corner_radii_y = ELLIPTICAL_MASKS && (index & 0x80000000u) != 0
+                            ? texel_corners(tables[at + 3])
+                            : texel_corners(float4(0.));
+  return mask;
+}
+
+TransformationMatrix load_transformation(constant float4 *tables, uint index) {
+  float4 rotation_scale = tables[index];
+  float4 translation = tables[index + 1];
+  TransformationMatrix transformation;
+  transformation.rotation_scale[0][0] = rotation_scale.x;
+  transformation.rotation_scale[0][1] = rotation_scale.y;
+  transformation.rotation_scale[1][0] = rotation_scale.z;
+  transformation.rotation_scale[1][1] = rotation_scale.w;
+  transformation.translation[0] = translation.x;
+  transformation.translation[1] = translation.y;
+  return transformation;
+}
+
+// A background from its tag and color space (`flags`, bits 1-3 and 4), its solid color and,
+// unless solid, its block at `block`: the angle or pattern height, the gradient record and the
+// gradient's opacity, then a linear gradient's two stops.
+Background load_background(constant float4 *tables, uint flags, uint block, Hsla solid) {
+  Background background = {};
+  background.tag = (BackgroundTag)((flags >> BACKGROUND_TAG_SHIFT) & 7u);
+  background.color_space = (ColorSpace)((flags & BACKGROUND_OKLAB) != 0 ? 1u : 0u);
+  background.solid = solid;
+  if (background.tag != 0) {
+    float4 head = tables[block];
+    background.gradient_angle_or_pattern_height = head.x;
+    background.gradient = as_type<uint>(head.y);
+    background.colors[0].color.a = head.z;
+    if (background.tag == 1) {
+      background.colors[0].color = texel_hsla(tables[block + 1]);
+      background.colors[1].color = texel_hsla(tables[block + 2]);
+      background.colors[0].percentage = tables[block + 3].x;
+      background.colors[1].percentage = tables[block + 3].y;
+    }
+  }
+  return background;
+}
+
+Shadow load_shadow(constant ShadowRecord *shadows, constant float4 *tables, uint id) {
+  ShadowRecord record = shadows[id];
+  Shadow shadow = {};
+  shadow.blur_radius = record.blur_radius;
+  shadow.bounds = record.bounds;
+  shadow.corner_radii = record.corner_radii;
+  shadow.corner_radii_y = record.corner_radii;
+  shadow.content_mask = load_content_mask(tables, record.content_mask);
+  shadow.color = record.color;
+  shadow.element_bounds = record.element_bounds;
+  shadow.element_corner_radii = record.element_corner_radii;
+  shadow.element_corner_radii_y = record.element_corner_radii;
+  shadow.inset = record.info & 1u;
+  uint aux = record.info >> 1;
+  if (aux != 0) {
+    shadow.corner_radii_y = texel_corners(tables[aux]);
+    shadow.element_corner_radii_y = texel_corners(tables[aux + 1]);
+  }
+  shadow.transformation = load_transformation(tables, record.transformation);
+  return shadow;
+}
+
+Underline load_underline(constant UnderlineRecord *underlines, constant float4 *tables, uint id) {
+  UnderlineRecord record = underlines[id];
+  Underline underline = {};
+  underline.bounds = record.bounds;
+  underline.content_mask = load_content_mask(tables, record.content_mask);
+  underline.color = record.color;
+  underline.thickness = record.thickness;
+  underline.wavy = record.wavy;
+  underline.transformation = load_transformation(tables, record.transformation);
+  return underline;
+}
+
+MonochromeSprite load_monochrome_sprite(constant SpriteRecord *sprites, constant float4 *tables,
+                                        uint id) {
+  SpriteRecord record = sprites[id];
+  MonochromeSprite sprite = {};
+  sprite.tile.bounds = record.tile_bounds;
+  sprite.bounds = record.bounds;
+  sprite.content_mask = load_content_mask(tables, record.content_mask);
+  sprite.color = record.color;
+  sprite.transformation = load_transformation(tables, record.transformation);
+  return sprite;
+}
+
+PolychromeSprite load_polychrome_sprite(constant PolychromeSpriteRecord *sprites,
+                                        constant float4 *tables, uint id) {
+  PolychromeSpriteRecord record = sprites[id];
+  PolychromeSprite sprite = {};
+  sprite.exact_scale = record.info & 1u;
+  sprite.tile.bounds = record.tile_bounds;
+  sprite.grayscale = (record.info >> 1) & 1u;
+  sprite.opacity = record.opacity;
+  sprite.bounds = record.bounds;
+  sprite.content_mask = load_content_mask(tables, record.content_mask);
+  sprite.corner_radii = record.corner_radii;
+  sprite.corner_radii_y = record.corner_radii;
+  uint aux = record.info >> 2;
+  if (aux != 0) {
+    sprite.corner_radii_y = texel_corners(tables[aux]);
+  }
+  sprite.transformation = load_transformation(tables, record.transformation);
+  return sprite;
+}
+
+PathRasterizationVertex load_path_vertex(constant PathVertexRecord *vertices,
+                                         constant float4 *tables, uint id) {
+  PathVertexRecord record = vertices[id];
+  uint path = record.path;
+  float4 info = tables[path + 2];
+  uint flags = as_type<uint>(info.x);
+  PathRasterizationVertex out;
+  out.xy_position = record.xy_position;
+  out.st_position = record.st_position;
+  out.bounds = texel_bounds(tables[path]);
+  out.content_mask = load_content_mask(tables, record.content_mask);
+  out.color = load_background(tables, flags, path + 3, texel_hsla(tables[path + 1]));
+  return out;
 }

@@ -744,6 +744,7 @@ impl Style {
                 y: Overflow::Visible,
             } => None,
             _ => {
+                let border_box = bounds.size;
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
 
@@ -777,13 +778,16 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                // Clipping both axes follows the rounded border's inner curve (CSS clips to
-                // the padding box's curve): each radius less the wider of its two borders.
-                let corner_radii = if self.overflow.x != Overflow::Visible
+                // Clipping both axes follows the rounded border's inner curve (CSS Backgrounds 3
+                // 5.2, clipping to the padding box's curve): each corner's horizontal radius less
+                // its side border, its vertical radius less its top or bottom border. A circular
+                // corner inset by unequal borders is elliptical; a corner flat on either axis is
+                // square.
+                let (radii_x, radii_y) = if self.overflow.x != Overflow::Visible
                     && self.overflow.y != Overflow::Visible
                 {
-                    let outer = self.border_box_radii(bounds.size, rem_size).circular();
-                    let inset = |r: Pixels, a: Pixels, b: Pixels| (r - a.max(b)).max(Pixels::ZERO);
+                    // The corners as the border and background are drawn (`fitted_radii`).
+                    let outer = self.fitted_radii(border_box, rem_size);
                     let edges = self.border_widths.to_pixels(rem_size);
                     let bordered = self
                         .border_color
@@ -793,21 +797,29 @@ impl Style {
                     } else {
                         (Pixels::ZERO, Pixels::ZERO, Pixels::ZERO, Pixels::ZERO)
                     };
-                    Corners {
-                        top_left: inset(outer.top_left, top, left),
-                        top_right: inset(outer.top_right, top, right),
-                        bottom_right: inset(outer.bottom_right, bottom, right),
-                        bottom_left: inset(outer.bottom_left, bottom, left),
-                    }
-                    .clamp_radii_for_quad_size(bounds.size)
+                    let (half_w, half_h) = (bounds.size.width / 2., bounds.size.height / 2.);
+                    let inset = |r: Size<Pixels>, side: Pixels, edge: Pixels| {
+                        let x = (r.width - side).max(Pixels::ZERO).min(half_w);
+                        let y = (r.height - edge).max(Pixels::ZERO).min(half_h);
+                        if x <= Pixels::ZERO || y <= Pixels::ZERO {
+                            (Pixels::ZERO, Pixels::ZERO)
+                        } else {
+                            (x, y)
+                        }
+                    };
+                    let tl = inset(outer.top_left, left, top);
+                    let tr = inset(outer.top_right, right, top);
+                    let br = inset(outer.bottom_right, right, bottom);
+                    let bl = inset(outer.bottom_left, left, bottom);
+                    (
+                        Corners { top_left: tl.0, top_right: tr.0, bottom_right: br.0, bottom_left: bl.0 },
+                        Corners { top_left: tl.1, top_right: tr.1, bottom_right: br.1, bottom_left: bl.1 },
+                    )
                 } else {
-                    Corners::default()
+                    (Corners::default(), Corners::default())
                 };
 
-                Some(ContentMask {
-                    bounds,
-                    corner_radii,
-                })
+                Some(ContentMask::<Pixels>::elliptical(bounds, radii_x, radii_y))
             }
         }
     }
@@ -1845,6 +1857,23 @@ mod overflow_mask_tests {
         };
         let mask = style.overflow_mask(bounds, px(16.)).unwrap();
         assert_eq!(mask.corner_radii, Corners::all(px(30.)));
+
+        // A circular corner inset by unequal borders follows the padding box's elliptical
+        // curve: 20 px less a 4 px side border across, less a 12 px top border down.
+        let twenty: LengthOrPercent = px(20.).into();
+        style.corner_radii = Corners { top_left: twenty, top_right: twenty, bottom_right: twenty, bottom_left: twenty };
+        style.border_widths = Edges { top: px(12.).into(), right: px(4.).into(), bottom: px(12.).into(), left: px(4.).into() };
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(16.)));
+        assert_eq!(mask.corner_radii_y, Corners::all(px(8.)));
+        // Inside the 8 px circle a circular mask would use, outside the 16 x 8 ellipse.
+        assert!(!mask.contains(&point(px(14.), px(12.5))), "outside the ellipse");
+        assert!(mask.contains(&point(px(9.), px(15.))));
+        // A border as wide as the radius on one axis leaves the corner square.
+        style.border_widths = Edges { top: px(20.).into(), right: px(4.).into(), bottom: px(20.).into(), left: px(4.).into() };
+        assert!(!style.overflow_mask(bounds, px(16.)).unwrap().is_rounded());
+        style.border_widths = Edges::default();
+        style.border_color = None;
 
         // One clipped axis clips square.
         style.overflow = point(Overflow::Visible, Overflow::Hidden);

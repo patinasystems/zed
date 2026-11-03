@@ -111,7 +111,7 @@ impl MarksShader {
         log::error!("{message}");
         let mut reports = marks_reports();
         reports.by_id.entry(self.id).or_default().compile_error = Some(error.to_string());
-        reports.unchecked.push(message);
+        reports.unchecked.push((std::thread::current().id(), message));
     }
 
     /// For renderers: a draw of this program was skipped because of how it
@@ -126,17 +126,26 @@ impl MarksShader {
         let report = reports.by_id.entry(self.id).or_default();
         report.skipped += 1;
         report.last_skip = Some(reason);
-        reports.unchecked.push(message);
+        reports.unchecked.push((std::thread::current().id(), message));
     }
 }
 
 /// For renderers, where unwinding is safe (no pass or encoder open; Metal
 /// aborts the process when an unwind drops an open encoder): panics in debug
-/// builds when a marks failure was reported since the last check, and clears
-/// the list either way.
+/// builds when a marks failure was reported on this thread since its last
+/// check, and clears those reports either way. Renderers report while they
+/// draw, on the thread that then checks, so one renderer never stops on
+/// another's report (renderers on parallel test threads).
 pub fn check_marks_reports() {
-    let unchecked = std::mem::take(&mut marks_reports().unchecked);
-    debug_assert!(unchecked.is_empty(), "{}", unchecked.join("\n"));
+    let thread = std::thread::current().id();
+    let mine: Vec<String> = {
+        let mut reports = marks_reports();
+        let (mine, others) =
+            std::mem::take(&mut reports.unchecked).into_iter().partition(|(by, _)| *by == thread);
+        reports.unchecked = others;
+        mine.into_iter().map(|(_, message)| message).collect()
+    };
+    debug_assert!(mine.is_empty(), "{}", mine.join("\n"));
 }
 
 /// What renderers reported about one program.
@@ -153,8 +162,8 @@ struct MarksReport {
 #[derive(Default)]
 struct MarksReports {
     by_id: collections::HashMap<MarksShaderId, MarksReport>,
-    /// Reported since the last [`check_marks_reports`].
-    unchecked: Vec<String>,
+    /// Reported since the reporting thread's last [`check_marks_reports`], with that thread.
+    unchecked: Vec<(std::thread::ThreadId, String)>,
 }
 
 fn marks_reports() -> std::sync::MutexGuard<'static, MarksReports> {
@@ -703,9 +712,31 @@ mod tests {
         assert_eq!(t::rects("another").skipped_draws(), (0, None));
     }
 
+    /// A renderer checks only its own thread's reports: one on another thread
+    /// (a parallel test's renderer) neither stops it nor is cleared by it.
+    #[test]
+    fn reports_stop_only_the_thread_that_made_them() {
+        use marks_test_scene as t;
+        let reported = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let checked = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let other = std::thread::spawn({
+            let (reported, checked) = (reported.clone(), checked.clone());
+            move || {
+                t::broken("reports_stop_only_the_thread_that_made_them").report_compile_error("no good");
+                reported.wait();
+                checked.wait();
+                t::expect_report(check_marks_reports);
+            }
+        });
+        reported.wait();
+        check_marks_reports();
+        checked.wait();
+        other.join().expect("the other thread still stops on its own report");
+    }
+
     #[test]
     fn uniforms_layout_matches_the_prelude() {
-        assert_eq!(std::mem::size_of::<MarksUniforms>(), 272);
+        assert_eq!(std::mem::size_of::<MarksUniforms>(), 336);
         assert_eq!(std::mem::offset_of!(MarksUniforms, content_mask), 64);
         assert_eq!(std::mem::offset_of!(MarksUniforms, clips), 80);
     }

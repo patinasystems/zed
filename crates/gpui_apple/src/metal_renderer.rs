@@ -3,9 +3,9 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
-    Path, PlatformAtlas as _, Point, PrimitiveBatch, RetainedShapesDraw, RetainedUpload,
-    ScaledPixels, Scene, ShapeInstance, Size, point, size,
+    AtlasTextureId, BackdropFilter, Bounds, ContentMask, DevicePixels, InstanceTables,
+    PaintSurface, Path, PathRecord, PlatformAtlas as _, PrimitiveBatch, RetainedShapesDraw,
+    RetainedUpload, ScaledPixels, Scene, ShapeInstance, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "window-capture"))]
 use image::RgbaImage;
@@ -63,6 +63,8 @@ pub unsafe fn new_renderer(
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// The scenes' record tables, kept between frames for their capacity.
+    tables: InstanceTables,
 }
 
 impl Default for InstanceBufferPool {
@@ -70,6 +72,7 @@ impl Default for InstanceBufferPool {
         Self {
             buffer_size: 2 * 1024 * 1024,
             buffers: Vec::new(),
+            tables: InstanceTables::default(),
         }
     }
 }
@@ -174,13 +177,13 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: Pipeline,
+    paths_rasterization_pipeline_state: MaskPipelines,
     path_sprites_pipeline_state: Pipeline,
-    shadows_pipeline_state: Pipeline,
-    quads_pipeline_state: Pipeline,
-    underlines_pipeline_state: Pipeline,
-    monochrome_sprites_pipeline_state: Pipeline,
-    polychrome_sprites_pipeline_state: Pipeline,
+    shadows_pipeline_state: MaskPipelines,
+    quads_pipeline_state: MaskPipelines,
+    underlines_pipeline_state: MaskPipelines,
+    monochrome_sprites_pipeline_state: MaskPipelines,
+    polychrome_sprites_pipeline_state: MaskPipelines,
     surfaces_pipeline_state: Pipeline,
     retained_shapes_pipeline_state: Pipeline,
     backdrop_copy_pipeline_state: Pipeline,
@@ -225,16 +228,6 @@ pub struct MetalRenderer {
     headless_render_target: Option<metal::Texture>,
     /// Whether the last [`MetalRenderer::draw`] committed its frame.
     rendered: bool,
-}
-
-#[repr(C)]
-pub struct PathRasterizationVertex {
-    pub xy_position: Point<ScaledPixels>,
-    pub st_position: Point<f32>,
-    pub color: Background,
-    pub bounds: Bounds<ScaledPixels>,
-    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
-    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -417,15 +410,18 @@ impl MetalRenderer {
             );
             texture
         };
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &pipelines,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
+        let paths_rasterization_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_path_rasterization_pipeline_state(
+                &pipelines,
+                &library,
+                "paths_rasterization",
+                "path_rasterization_vertex",
+                "path_rasterization_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                PATH_SAMPLE_COUNT,
+                elliptical_masks,
+            )
+        });
         let backdrop_copy_pipeline_state = build_opaque_pipeline_state(
             &pipelines,
             &library,
@@ -459,46 +455,61 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let shadows_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &pipelines,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let shadows_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "shadows",
+                "shadow_vertex",
+                "shadow_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let quads_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "quads",
+                "quad_vertex",
+                "quad_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let underlines_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "underlines",
+                "underline_vertex",
+                "underline_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let monochrome_sprites_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "monochrome_sprites",
+                "monochrome_sprite_vertex",
+                "monochrome_sprite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
+        let polychrome_sprites_pipeline_state = MaskPipelines::new(|elliptical_masks| {
+            build_pipeline_state(
+                &pipelines,
+                &library,
+                "polychrome_sprites",
+                "polychrome_sprite_vertex",
+                "polychrome_sprite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+                elliptical_masks,
+            )
+        });
         let surfaces_pipeline_state = build_pipeline_state(
             &pipelines,
             &library,
@@ -506,6 +517,7 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
 
         let retained_shapes_pipeline_state = build_pipeline_state(
@@ -515,6 +527,7 @@ impl MetalRenderer {
             "retained_shape_vertex",
             "retained_shape_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
 
         pipelines.finish();
@@ -971,10 +984,13 @@ impl MetalRenderer {
                     self.draw_quads(range, instance_bindings, viewport_size, open(&mut encoder))
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
+                    let paths = &scene.paths[range.clone()];
                     close_encoder(&mut encoder);
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        &instance_bindings.path_records[range],
+                        &instance_bindings.tables,
+                        instance_bindings.elliptical_masks,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -1505,6 +1521,9 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        path_records: &[PathRecord],
+        tables: &InstanceBinding,
+        elliptical_masks: bool,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -1517,17 +1536,14 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-                content_mask: path.content_mask,
-            }));
-        }
-        let vertex_instance_bindings = writer.write(&vertices)?;
+        let vertex_count = paths.iter().map(|path| path.vertices.len()).sum::<usize>();
+        let vertex_instance_bindings = writer.write_counted(
+            paths
+                .iter()
+                .zip(path_records)
+                .flat_map(|(path, &record)| InstanceTables::path_vertices(path, record)),
+            vertex_count,
+        )?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -1556,7 +1572,7 @@ impl MetalRenderer {
             znear: 0.0,
             zfar: 1.0,
         });
-        command_encoder.set_render_pipeline_state(self.paths_rasterization_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.paths_rasterization_pipeline_state.state(elliptical_masks));
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&vertex_instance_bindings.buffer),
@@ -1572,10 +1588,15 @@ impl MetalRenderer {
             Some(&vertex_instance_bindings.buffer),
             vertex_instance_bindings.offset as u64,
         );
+        set_tables(
+            command_encoder,
+            PathRasterizationInputIndex::Tables as u64,
+            tables,
+        );
         command_encoder.draw_primitives(
             metal::MTLPrimitiveType::Triangle,
             0,
-            vertices.len() as u64,
+            vertex_count as u64,
         );
 
         command_encoder.end_encoding();
@@ -1593,7 +1614,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.shadows_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.shadows_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1615,6 +1636,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        set_tables(
+            command_encoder,
+            ShadowInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1635,7 +1661,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.quads_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.quads_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1982,7 +2008,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(self.underlines_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.underlines_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2004,6 +2030,11 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        set_tables(
+            command_encoder,
+            UnderlineInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2032,7 +2063,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(self.monochrome_sprites_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.monochrome_sprites_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2060,6 +2091,11 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
+        set_tables(
+            command_encoder,
+            SpriteInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2088,7 +2124,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(self.polychrome_sprites_pipeline_state.state());
+        command_encoder.set_render_pipeline_state(self.polychrome_sprites_pipeline_state.state(instance_bindings.elliptical_masks));
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2121,6 +2157,11 @@ impl MetalRenderer {
         };
         command_encoder.set_fragment_sampler_state(0, Some(sampler));
 
+        set_tables(
+            command_encoder,
+            SpriteInputIndex::Tables as u64,
+            &instance_bindings.tables,
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -2316,13 +2357,10 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    elliptical_masks: bool,
 ) -> Pipeline {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+    let vertex_fn = mask_function(library, vertex_fn_name, elliptical_masks);
+    let fragment_fn = mask_function(library, fragment_fn_name, elliptical_masks);
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
@@ -2338,7 +2376,12 @@ fn build_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    pipelines.build(&descriptor)
+    if elliptical_masks {
+        // Made on the prewarm thread: ready before the first scene with an elliptical mask.
+        pipelines.build_prewarmed(&descriptor)
+    } else {
+        pipelines.build(&descriptor)
+    }
 }
 
 /// A pipeline that overwrites its target (backdrop copies and blur passes).
@@ -2617,13 +2660,10 @@ fn build_path_rasterization_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
     path_sample_count: u32,
+    elliptical_masks: bool,
 ) -> Pipeline {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+    let vertex_fn = mask_function(library, vertex_fn_name, elliptical_masks);
+    let fragment_fn = mask_function(library, fragment_fn_name, elliptical_masks);
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
@@ -2643,7 +2683,44 @@ fn build_path_rasterization_pipeline_state(
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-    pipelines.build(&descriptor)
+    if elliptical_masks {
+        // Made on the prewarm thread: ready before the first scene with an elliptical mask.
+        pipelines.build_prewarmed(&descriptor)
+    } else {
+        pipelines.build(&descriptor)
+    }
+}
+
+/// `name` from `library`, specialized for scenes with or without elliptical content masks (the
+/// shaders' `ELLIPTICAL_MASKS`).
+fn mask_function(library: &metal::LibraryRef, name: &str, elliptical_masks: bool) -> metal::Function {
+    let constants = metal::FunctionConstantValues::new();
+    constants.set_constant_value_at_index(
+        &elliptical_masks as *const bool as *const c_void,
+        metal::MTLDataType::Bool,
+        0,
+    );
+    library
+        .get_function(name, Some(constants))
+        .unwrap_or_else(|error| panic!("error locating function {name}: {error}"))
+}
+
+/// A pipeline that reads content masks, specialized two ways: most scenes have no elliptical
+/// mask and draw with code that has no elliptical path; the elliptical variant is made on a
+/// background thread after startup, so the first scene with one does not compile it.
+struct MaskPipelines {
+    circular: Pipeline,
+    elliptical: Pipeline,
+}
+
+impl MaskPipelines {
+    fn new(build: impl Fn(bool) -> Pipeline) -> Self {
+        Self { circular: build(false), elliptical: build(true) }
+    }
+
+    fn state(&self, elliptical_masks: bool) -> &metal::RenderPipelineState {
+        if elliptical_masks { self.elliptical.state() } else { self.circular.state() }
+    }
 }
 
 #[derive(Clone)]
@@ -2661,6 +2738,22 @@ struct InstanceBindings {
     surfaces: InstanceBinding,
     /// The window scene's gradient records, which quads in every scene refer to.
     gradients: InstanceBinding,
+    /// The scene's record table ([`InstanceTables`]), which its records index.
+    tables: InstanceBinding,
+    /// Each path's record in `tables`, which its vertices share.
+    path_records: Vec<PathRecord>,
+    /// Whether a mask in `tables` is elliptical: its draws use the elliptical pipelines.
+    elliptical_masks: bool,
+}
+
+/// Binds a scene's record table to both stages at `index`.
+fn set_tables(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    index: u64,
+    tables: &InstanceBinding,
+) {
+    command_encoder.set_vertex_buffer(index, Some(&tables.buffer), tables.offset as u64);
+    command_encoder.set_fragment_buffer(index, Some(&tables.buffer), tables.offset as u64);
 }
 
 /// Writes the window scene's gradient records once per frame; every scene's quads
@@ -2673,24 +2766,57 @@ fn write_gradients(root: &Scene, writer: &mut InstanceBufferWriter) -> Result<In
     }
 }
 
-/// Writes `scene`'s instances; its quads read `gradients` (the window scene's).
+/// Writes `scene`'s records and then their table; its quads read `gradients` (the window
+/// scene's).
 fn write_instances(
     gradients: &InstanceBinding,
     scene: &Scene,
     writer: &mut InstanceBufferWriter,
 ) -> Result<InstanceBindings> {
-    Ok(InstanceBindings {
-        gradients: gradients.clone(),
-        quads: writer.write(&scene.quads)?,
-        shadows: writer.write(&scene.shadows)?,
-        underlines: writer.write(&scene.underlines)?,
-        monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
-        polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
-        surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
-            bounds: surface.bounds,
-            content_mask: surface.content_mask,
-        }))?,
-    })
+    let mut tables = mem::take(&mut writer.tables);
+    tables.clear();
+    let result: Result<InstanceBindings> = (|| {
+        Ok(InstanceBindings {
+            gradients: gradients.clone(),
+            // Quads are fill-heavy (a few large primitives cover most pixels): their shaders read
+            // the whole per-primitive struct in place, so a fragment does no table walk. The
+            // many small primitives (glyphs, underlines, shadows, paths) use compact records
+            // indexing the scene's table, which cut upload bytes. Expanding a record per pixel
+            // cost fill-bound quad scenes 12-17% GPU time on M4 Max (PR 4793), and the
+            // `quad_gradient_frame_cost_stays_at_baseline` bench guards it.
+            quads: writer.write(&scene.quads)?,
+            shadows: writer.write_iter(scene.shadows.iter().map(|shadow| tables.shadow(shadow)))?,
+            underlines: writer.write_iter(
+                scene
+                    .underlines
+                    .iter()
+                    .map(|underline| tables.underline(underline)),
+            )?,
+            monochrome_sprites: writer.write_iter(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| tables.monochrome_sprite(sprite)),
+            )?,
+            polychrome_sprites: writer.write_iter(
+                scene
+                    .polychrome_sprites
+                    .iter()
+                    .map(|sprite| tables.polychrome_sprite(sprite)),
+            )?,
+            surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+            }))?,
+            path_records: scene.paths.iter().map(|path| tables.path(path)).collect(),
+            tables: writer.write(tables.texels())?,
+            // Quads carry their masks whole, outside the table.
+            elliptical_masks: tables.has_elliptical_masks()
+                || scene.quads.iter().any(|quad| quad.content_mask.corner_radii_y != gpui::Corners::default()),
+        })
+    })();
+    writer.tables = tables;
+    result
 }
 
 struct InstanceBufferWriter {
@@ -2700,6 +2826,10 @@ struct InstanceBufferWriter {
     filled: Vec<(InstanceBuffer, usize)>,
     current: InstanceBuffer,
     offset: usize,
+    /// The record table each scene is encoded through, the pool's between frames.
+    tables: InstanceTables,
+    /// Bytes written this frame, for upload measurements.
+    written: usize,
 }
 
 impl InstanceBufferWriter {
@@ -2708,7 +2838,10 @@ impl InstanceBufferWriter {
         pool: &Arc<Mutex<InstanceBufferPool>>,
         unified_memory: bool,
     ) -> Self {
-        let current = pool.lock().acquire(device, unified_memory);
+        let mut locked = pool.lock();
+        let current = locked.acquire(device, unified_memory);
+        let tables = mem::take(&mut locked.tables);
+        drop(locked);
         Self {
             device: device.clone(),
             pool: pool.clone(),
@@ -2716,6 +2849,8 @@ impl InstanceBufferWriter {
             filled: Vec::new(),
             current,
             offset: 0,
+            tables,
+            written: 0,
         }
     }
 
@@ -2727,6 +2862,7 @@ impl InstanceBufferWriter {
             offset = 0;
         }
         self.offset = offset + size;
+        self.written += size;
 
         let binding = InstanceBinding {
             buffer: self.current.metal_buffer.clone(),
@@ -2757,10 +2893,23 @@ impl InstanceBufferWriter {
         &mut self,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<InstanceBinding> {
-        let (binding, destination) = self.allocate::<T>(values.len())?;
+        let count = values.len();
+        self.write_counted(values, count)
+    }
+
+    /// Writes the `count` items `values` yields.
+    fn write_counted<T>(
+        &mut self,
+        values: impl Iterator<Item = T>,
+        count: usize,
+    ) -> Result<InstanceBinding> {
+        let (binding, destination) = self.allocate::<T>(count)?;
+        let mut written = 0;
         for (slot, value) in destination.iter_mut().zip(values) {
             slot.write(value);
+            written += 1;
         }
+        anyhow::ensure!(written == count, "wrote {written} of {count} instances");
         Ok(binding)
     }
 
@@ -2792,12 +2941,17 @@ impl InstanceBufferWriter {
 
     fn finish(self) -> InstanceBuffer {
         let Self {
+            pool,
             unified_memory,
             filled,
             current,
             offset,
+            tables,
+            written,
             ..
         } = self;
+        retained_stats::record_instances(written);
+        pool.lock().tables = tables;
 
         if !unified_memory {
             for (buffer, written) in &filled {
@@ -2829,6 +2983,7 @@ enum ShadowInputIndex {
     Vertices = 0,
     Shadows = 1,
     ViewportSize = 2,
+    Tables = 3,
 }
 
 #[repr(C)]
@@ -2844,6 +2999,7 @@ enum UnderlineInputIndex {
     Vertices = 0,
     Underlines = 1,
     ViewportSize = 2,
+    Tables = 3,
 }
 
 #[repr(C)]
@@ -2853,6 +3009,7 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
+    Tables = 5,
 }
 
 #[repr(C)]
@@ -2869,6 +3026,7 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+    Tables = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2924,6 +3082,7 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Point;
 
     /// Frame cost of 100k retained shapes under a moving camera, offscreen at
     /// 2800x1800: CPU to encode, GPU time, and bytes uploaded after the first
@@ -3307,14 +3466,11 @@ mod tests {
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 2);
     }
 
-    /// Gradients against solid fills: 200 overlapping quarter-screen quads with rounded
-    /// corners at 2880x1800 (about 260 million shaded pixels). Fills alternate each
-    /// round; each line is the median GPU time of a frame. Run with
-    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib gradient_frame_cost -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn gradient_frame_cost() {
-        use gpui::gradient_test_scene::{BenchFill, bench};
+    /// Each fill's median GPU time per frame of `gradient_test_scene::bench` (200 overlapping
+    /// quarter-screen quads with rounded corners at 2880x1800, about 260 million shaded pixels),
+    /// over `rounds` frames each, fills alternating.
+    fn gradient_frame_medians(fills: &[gpui::gradient_test_scene::BenchFill], rounds: usize) -> Vec<f64> {
+        use gpui::gradient_test_scene::bench;
         assert!(
             retained_stats::enabled(),
             "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
@@ -3322,20 +3478,12 @@ mod tests {
         let (width, height) = (2880, 1800);
         let size = size(DevicePixels(width), DevicePixels(height));
         let mut renderer = MetalHeadlessRenderer::new();
-        let fills = [
-            BenchFill::Solid,
-            BenchFill::TwoStop,
-            BenchFill::Linear(2),
-            BenchFill::Linear(8),
-            BenchFill::Radial(4),
-            BenchFill::Radial(16),
-        ];
         let scenes: Vec<Scene> = fills
             .iter()
             .map(|fill| bench(200, width as f32, height as f32, *fill))
             .collect();
         let mut gpu = vec![Vec::new(); scenes.len()];
-        for _ in 0..60 {
+        for _ in 0..rounds {
             for (scene, times) in scenes.iter().zip(&mut gpu) {
                 gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, size)
                     .expect("render");
@@ -3351,12 +3499,344 @@ mod tests {
                 times.extend(recorded);
             }
         }
-        for (fill, times) in fills.iter().zip(&mut gpu) {
-            times.sort_by(f64::total_cmp);
+        gpu.into_iter()
+            .map(|mut times| {
+                times.sort_by(f64::total_cmp);
+                times[times.len() / 2]
+            })
+            .collect()
+    }
+
+    /// Gradients against solid fills ([`gradient_frame_medians`]); each line is the median GPU
+    /// time of a frame. Run with
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib gradient_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gradient_frame_cost() {
+        use gpui::gradient_test_scene::BenchFill;
+        let fills = [
+            BenchFill::Solid,
+            BenchFill::TwoStop,
+            BenchFill::Linear(2),
+            BenchFill::Linear(8),
+            BenchFill::Radial(4),
+            BenchFill::Radial(16),
+        ];
+        for (fill, median) in fills.iter().zip(gradient_frame_medians(&fills, 60)) {
+            println!("{fill:?}: GPU {median:.3} ms per frame (median of 60)");
+        }
+    }
+
+    /// GPU time of a reference fill drawn like `gradient_test_scene::bench`'s quads (200
+    /// overlapping quarter-screen rects at `width` x `height`, blended) with a fragment that only
+    /// returns a color: the cost of the pixels alone at the GPU's current clocks.
+    struct ReferenceFill {
+        queue: metal::CommandQueue,
+        pipeline: metal::RenderPipelineState,
+        target: metal::Texture,
+    }
+
+    impl ReferenceFill {
+        const SHADERS: &str = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 reference_vertex(uint v [[vertex_id]], uint i [[instance_id]]) {
+                float2 corner = float2(float(v == 1 || v == 2 || v == 4), float(v == 2 || v == 4 || v == 5));
+                float2 origin = float2(float(i * 37u % 100u), float(i * 61u % 100u)) / 100.0 * 0.5;
+                float2 at = origin + corner * 0.5;
+                return float4(at.x * 2.0 - 1.0, 1.0 - at.y * 2.0, 0.0, 1.0);
+            }
+            fragment float4 reference_fragment() { return float4(0.31, 0.49, 1.0, 1.0); }
+        "#;
+
+        fn new(width: u64, height: u64) -> Self {
+            let device = metal::Device::system_default().expect("a Metal device");
+            let library = device
+                .new_library_with_source(Self::SHADERS, &metal::CompileOptions::new())
+                .expect("reference shaders");
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_vertex_function(Some(&library.get_function("reference_vertex", None).unwrap()));
+            descriptor.set_fragment_function(Some(&library.get_function("reference_fragment", None).unwrap()));
+            let color = descriptor.color_attachments().object_at(0).unwrap();
+            color.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            color.set_blending_enabled(true);
+            color.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+            color.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+            let pipeline = device.new_render_pipeline_state(&descriptor).expect("reference pipeline");
+            let texture = metal::TextureDescriptor::new();
+            texture.set_width(width);
+            texture.set_height(height);
+            texture.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            texture.set_storage_mode(metal::MTLStorageMode::Private);
+            texture.set_usage(metal::MTLTextureUsage::RenderTarget);
+            let target = device.new_texture(&texture);
+            Self { queue: device.new_command_queue(), pipeline, target }
+        }
+
+        fn frame_ms(&self, quads: u64) -> f64 {
+            let pass = metal::RenderPassDescriptor::new();
+            let color = pass.color_attachments().object_at(0).unwrap();
+            color.set_texture(Some(&self.target));
+            color.set_load_action(metal::MTLLoadAction::Clear);
+            color.set_store_action(metal::MTLStoreAction::Store);
+            let cb = self.queue.new_command_buffer();
+            let encoder = cb.new_render_command_encoder(pass);
+            encoder.set_render_pipeline_state(&self.pipeline);
+            encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, quads);
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let (start, end): (f64, f64) = unsafe {
+                let cb = &*(cb.as_ptr() as *const AnyObject);
+                (objc2::msg_send![cb, GPUStartTime], objc2::msg_send![cb, GPUEndTime])
+            };
+            (end - start) * 1e3
+        }
+    }
+
+    /// Fill-bound quads stay at their recorded cost: each fill's frame time as a multiple of a
+    /// reference fill of the same pixels ([`ReferenceFill`], measured interleaved in the same
+    /// process, so GPU clock states cancel), within 10% of the multiple recorded for this GPU in
+    /// `quad_gradient_baseline.tsv` (GPU name, fill, multiple). The least of three passes'
+    /// multiples counts, which drops a pass another process slowed. Quads read their whole
+    /// struct per pixel; expanding an instance record per pixel instead cost these frames 12-17%
+    /// on M4 Max (PR 4793), which this catches. A GPU with no baseline prints its multiples;
+    /// record them with `GPUI_RECORD_QUAD_BASELINE=1`. Run on an idle Mac with
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib quad_gradient_frame_cost_stays_at_baseline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn quad_gradient_frame_cost_stays_at_baseline() {
+        use gpui::gradient_test_scene::{BenchFill, bench};
+        const TOLERANCE: f64 = 1.10;
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/quad_gradient_baseline.tsv");
+        let gpu = metal::Device::system_default().expect("a Metal device").name().to_string();
+        let (width, height) = (2880, 1800);
+        let viewport = size(DevicePixels(width), DevicePixels(height));
+        let fills = [BenchFill::Solid, BenchFill::TwoStop, BenchFill::Linear(8)];
+        let scenes: Vec<Scene> =
+            fills.iter().map(|fill| bench(200, width as f32, height as f32, *fill)).collect();
+        let mut renderer = MetalHeadlessRenderer::new();
+        let reference = ReferenceFill::new(width as u64, height as u64);
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut multiples = vec![f64::INFINITY; fills.len()];
+        for _ in 0..3 {
+            let mut quad_ms = vec![Vec::new(); fills.len()];
+            let mut reference_ms = vec![Vec::new(); fills.len()];
+            for round in 0..45 {
+                for (k, scene) in scenes.iter().enumerate() {
+                    gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, viewport)
+                        .expect("render");
+                    let mut recorded = retained_stats::take_gpu();
+                    for _ in 0..100 {
+                        if !recorded.is_empty() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        recorded = retained_stats::take_gpu();
+                    }
+                    let fill = reference.frame_ms(200);
+                    if round >= 5 {
+                        quad_ms[k].extend(recorded);
+                        reference_ms[k].push(fill);
+                    }
+                }
+            }
+            for k in 0..fills.len() {
+                let multiple = median(quad_ms[k].clone()) / median(reference_ms[k].clone());
+                multiples[k] = multiples[k].min(multiple);
+            }
+        }
+        let measured: Vec<(String, f64)> =
+            fills.iter().map(|fill| format!("{fill:?}")).zip(multiples).collect();
+        let recorded = std::fs::read_to_string(path).unwrap_or_default();
+        let baseline: Vec<(String, f64)> = recorded
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let (device, fill, multiple) = (fields.next()?, fields.next()?, fields.next()?);
+                (device == gpu).then(|| Some((fill.to_string(), multiple.parse().ok()?)))?
+            })
+            .collect();
+        if std::env::var_os("GPUI_RECORD_QUAD_BASELINE").is_some() {
+            let mut lines: Vec<String> = recorded
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{gpu}\t")))
+                .map(str::to_string)
+                .collect();
+            lines.extend(measured.iter().map(|(fill, multiple)| format!("{gpu}\t{fill}\t{multiple:.3}")));
+            std::fs::write(path, lines.join("\n") + "\n").expect("write the baseline");
+            println!("recorded {gpu}: {measured:?}");
+            return;
+        }
+        if baseline.is_empty() {
+            println!("no baseline for {gpu}: {measured:?} (record with GPUI_RECORD_QUAD_BASELINE=1)");
+            return;
+        }
+        for (fill, multiple) in &measured {
+            let Some((_, base)) = baseline.iter().find(|(name, _)| name == fill) else {
+                continue;
+            };
+            println!("{fill}: {multiple:.3}x the reference fill, baseline {base:.3}x");
+            assert!(
+                *multiple <= base * TOLERANCE,
+                "{fill} quads cost {multiple:.3}x a reference fill on {gpu}, over {:.0}% above the {base:.3}x baseline",
+                (TOLERANCE - 1.) * 100.
+            );
+        }
+    }
+
+    /// Wall time of the first frame with an elliptical content mask, against later ones: the
+    /// elliptical pipeline variants are made on a background thread after startup, so that frame
+    /// should not compile them. Renders `circular_frames` frames of a circular-mask scene first
+    /// (0: the elliptical scene is the renderer's first frame). Run with
+    /// `cargo test -p gpui_apple --release --lib first_elliptical_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn first_elliptical_frame_cost() {
+        use gpui::{ContentMask, Corners, Quad, ScaledPixels};
+        let px = |x: f32| ScaledPixels(x);
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let scene = |elliptical: bool| {
+            let mut scene = Scene::default();
+            for i in 0..200usize {
+                let (x, y) = ((i % 20) as f32 * 60., (i / 20) as f32 * 40.);
+                let mask = if elliptical {
+                    ContentMask::<ScaledPixels>::elliptical(rect(x, y, 60., 40.), Corners::all(px(18.)), Corners::all(px(9.)))
+                } else {
+                    ContentMask::rounded(rect(x, y, 60., 40.), Corners::all(px(9.)))
+                };
+                scene.insert_primitive(Quad {
+                    bounds: rect(x, y, 60., 40.),
+                    content_mask: mask,
+                    background: gpui::Hsla { h: 0.6, s: 0.5, l: 0.5, a: 1. }.into(),
+                    ..Default::default()
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let (circular, elliptical) = (scene(false), scene(true));
+        let viewport = size(DevicePixels(1200), DevicePixels(400));
+        let frame = |renderer: &mut MetalHeadlessRenderer, scene: &Scene| {
+            let t = std::time::Instant::now();
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(renderer, scene, viewport).expect("render");
+            t.elapsed().as_secs_f64() * 1000.
+        };
+        // The renderer's first frame; after 30 circular frames; and after a second more (an app
+        // that shows an elliptical mask a moment after launch).
+        for (circular_frames, idle_ms) in [(0, 0), (30, 0), (30, 1000)] {
+            let mut renderer = MetalHeadlessRenderer::new();
+            for _ in 0..circular_frames {
+                frame(&mut renderer, &circular);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(idle_ms));
+            let first = frame(&mut renderer, &elliptical);
+            let mut later: Vec<f64> = (0..9).map(|_| frame(&mut renderer, &elliptical)).collect();
+            later.sort_by(f64::total_cmp);
             println!(
-                "{fill:?}: GPU {:.3} ms per frame (median of {})",
-                times[times.len() / 2],
-                times.len()
+                "FIRST_ELLIPTICAL_FRAME after {circular_frames} circular frames and {idle_ms} ms: {first:.2} ms, later {:.2} ms",
+                later[later.len() / 2]
+            );
+        }
+    }
+
+    /// Instance-bound frames: many small primitives, so each frame's cost is mostly the
+    /// instance records the GPU fetches, not the pixels it shades. Two scenes at 2400x1600:
+    /// 40k 10 px quads under 400 rounded masks (half with borders), and the same quads plus
+    /// 10k underlines. Scenes alternate each round; each line is the median GPU time
+    /// (command buffer start to end) and the median CPU time of `render_scene_to_image`.
+    /// `GPUI_RETAINED_SHAPES_STATS=1 cargo test -p gpui_apple --release --lib instance_frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn instance_frame_cost() {
+        use gpui::{ContentMask, Corners, Edges, Quad, ScaledPixels, Scene, TransformationMatrix, Underline};
+        assert!(
+            retained_stats::enabled(),
+            "set GPUI_RETAINED_SHAPES_STATS=1 to record GPU times"
+        );
+        let (width, height) = (2400i32, 1600i32);
+        let px = |x: f32| ScaledPixels(x);
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let scene = |underlines: usize| {
+            let mut scene = Scene::default();
+            // 400 masks of 120 x 80 px (20 x 20 of them), each rounded by 12 px.
+            let mask = |i: usize| {
+                let (mx, my) = ((i % 20) as f32 * 120., ((i / 20) % 20) as f32 * 80.);
+                ContentMask::rounded(rect(mx, my, 120., 80.), Corners::all(px(12.)))
+            };
+            for i in 0..40_000usize {
+                let (x, y) = ((i % 240) as f32 * 10., ((i / 240) % 160) as f32 * 10.);
+                let m = (x / 120.) as usize + 20 * (y / 80.) as usize;
+                let bordered = i % 2 == 0;
+                scene.insert_primitive(Quad {
+                    bounds: rect(x + 1., y + 1., 8., 8.),
+                    content_mask: mask(m),
+                    background: gpui::Hsla { h: (i % 7) as f32 / 7., s: 0.5, l: 0.5, a: 1. }.into(),
+                    border_widths: if bordered { Edges::all(px(1.)) } else { Edges::default() },
+                    border_color: gpui::Hsla { h: 0., s: 0., l: 0.1, a: 1. },
+                    corner_radii: Corners::all(px(2.)),
+                    ..Default::default()
+                });
+            }
+            for i in 0..underlines {
+                let (x, y) = ((i % 60) as f32 * 40., ((i / 60) % 160) as f32 * 10. + 8.);
+                scene.insert_primitive(Underline {
+                    order: 0,
+                    pad: 0,
+                    bounds: rect(x, y, 36., 1.),
+                    content_mask: mask((x / 120.) as usize + 20 * (y / 80.) as usize),
+                    color: gpui::Hsla { h: 0.6, s: 0.8, l: 0.4, a: 1. },
+                    thickness: px(1.),
+                    wavy: false.into(),
+                    transformation: TransformationMatrix::unit(),
+                });
+            }
+            scene.finish();
+            scene
+        };
+        let scenes = [("40k quads", scene(0)), ("40k quads + 10k underlines", scene(10_000))];
+        let viewport = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = MetalHeadlessRenderer::new();
+        let mut gpu = vec![Vec::new(); scenes.len()];
+        let mut cpu = vec![Vec::new(); scenes.len()];
+        for round in 0..65 {
+            for (k, (_, scene)) in scenes.iter().enumerate() {
+                let t = std::time::Instant::now();
+                gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, scene, viewport)
+                    .expect("render");
+                let elapsed = t.elapsed().as_secs_f64() * 1000.;
+                // The completion handler runs after the wait returns: let it record.
+                let mut recorded = retained_stats::take_gpu();
+                for _ in 0..100 {
+                    if !recorded.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    recorded = retained_stats::take_gpu();
+                }
+                if round >= 5 {
+                    gpu[k].extend(recorded);
+                    cpu[k].push(elapsed);
+                }
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for (k, (name, _)) in scenes.iter().enumerate() {
+            println!(
+                "INSTANCE_FRAME_COST {name}: GPU {:.3} ms, CPU {:.3} ms per frame (median of {})",
+                median(&mut gpu[k]),
+                median(&mut cpu[k]),
+                cpu[k].len()
             );
         }
     }
@@ -3680,10 +4160,10 @@ mod tests {
                 };
                 scene.insert_primitive(Quad {
                     bounds: bounds(0.),
-                    content_mask: ContentMask {
-                        bounds: bounds(8.),
-                        corner_radii: Corners::all(ScaledPixels(radius)),
-                    },
+                    content_mask: ContentMask::rounded(
+                        bounds(8.),
+                        Corners::all(ScaledPixels(radius)),
+                    ),
                     background: gpui::Hsla {
                         h: 0.6,
                         s: 0.5,
@@ -3796,6 +4276,17 @@ mod tests {
         let (ink, gap, quadrants) = t::ink_and_gaps(|x, y| image.get_pixel(x, y).0);
         assert!(ink > 150 && gap > 150, "ink {ink}, gaps {gap}");
         assert!(quadrants.iter().all(|g| *g > 20), "gaps per quadrant {quadrants:?}");
+    }
+
+    #[test]
+    fn rounded_dashes_sit_where_webkit_draws_them() {
+        use gpui::rounded_dashes_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("rounded_dashes_metal.png")).expect("dump");
+        }
+        t::check(|x, y| image.get_pixel(x, y).0);
     }
 
     #[test]
@@ -4432,6 +4923,8 @@ mod retained_stats {
         encode: Vec<f64>,
         gpu: Vec<f64>,
         uploaded: Vec<usize>,
+        /// Instance buffer bytes written per frame: records, tables, gradients, vertices.
+        instances: Vec<usize>,
     }
 
     static STATS: Mutex<Option<Stats>> = Mutex::new(None);
@@ -4449,6 +4942,15 @@ mod retained_stats {
 
     pub fn record_upload(bytes: usize) {
         with(|s| s.uploaded.push(bytes));
+    }
+
+    /// Records a frame's instance buffer bytes; `GPUI_INSTANCE_BYTES` prints each frame's.
+    pub fn record_instances(bytes: usize) {
+        static PRINT: OnceLock<bool> = OnceLock::new();
+        if *PRINT.get_or_init(|| std::env::var_os("GPUI_INSTANCE_BYTES").is_some()) {
+            eprintln!("GPUI_INSTANCE_BYTES {bytes}");
+        }
+        with(|s| s.instances.push(bytes));
     }
 
     pub fn record_gpu(ms: f64) {
@@ -4478,15 +4980,24 @@ mod retained_stats {
                 };
                 let uploads = s.uploaded.iter().filter(|b| **b > 0).count();
                 let bytes: usize = s.uploaded.iter().sum();
+                s.instances.sort_unstable();
+                let instance_bytes = |p: f64| {
+                    s.instances
+                        .get(((s.instances.len() as f64 * p) as usize).min(s.instances.len().max(1) - 1))
+                        .copied()
+                        .unwrap_or(0)
+                };
                 eprintln!(
-                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {}",
+                    "RETAINED_STATS frames {} encode_cpu_ms p50 {:.3} p95 {:.3} gpu_ms p50 {:.3} p95 {:.3} upload_frames {} upload_bytes {} instance_bytes p50 {} max {}",
                     s.encode.len(),
                     q(&mut s.encode, 0.5),
                     q(&mut s.encode, 0.95),
                     q(&mut s.gpu, 0.5),
                     q(&mut s.gpu, 0.95),
                     uploads,
-                    bytes
+                    bytes,
+                    instance_bytes(0.5),
+                    instance_bytes(1.0),
                 );
                 *s = Stats::default();
             }

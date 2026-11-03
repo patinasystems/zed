@@ -3,8 +3,10 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path,
-    Point, PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropFilter, Bounds, DevicePixels, GpuSpecs, InstanceTables, Path,
+    PathRecord, PathVertexRecord, PolychromeSpriteRecord, PrimitiveBatch, QuadRecord, RebaseRecord,
+    ScaledPixels, Scene, ShadowRecord, Size, SpriteRecord, UnderlineRecord,
+    get_gamma_correction_ratios, point, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -105,17 +107,312 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    /// Where `bounds` is in the path atlas, from where it is drawn: whole pixels.
+    atlas_offset: [f32; 2],
 }
 
-#[derive(Clone, Debug)]
-#[repr(C)]
-struct PathRasterizationVertex {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-    /// The path's content mask, for a rounded clip (`bounds` is already clipped to it).
-    content_mask: ContentMask<ScaledPixels>,
+/// Where a scene's paths rasterize: an atlas the size of their copy regions, not of
+/// the target. Each path batch's regions get a place in a chunk, packed in shelves; a
+/// path draws at its region's place (its record's atlas offset). A chunk is one
+/// rasterization pass (one clear and one resolve, for the area of its places) before
+/// the batches that read it, which then draw in the target's pass. A scene has more
+/// than one chunk only when its regions do not fit in the largest texture.
+#[derive(Default)]
+struct PathAtlasPlan {
+    /// Each chunk's atlas size and the path batches it holds (indices into `batches`).
+    chunks: Vec<(Size<DevicePixels>, Range<usize>)>,
+    /// The scene's path batches, in draw order.
+    batches: Vec<PlannedPathBatch>,
+}
+
+struct PlannedPathBatch {
+    chunk: usize,
+    /// The batch's paths that draw (indices into `Scene::paths`), in order.
+    paths: Vec<usize>,
+    /// The regions to copy from the atlas.
+    sprites: Vec<PathSprite>,
+}
+
+/// A chunk of a scene's path atlas, rasterized: what its batches' sprites read.
+struct PathAtlas {
+    chunk: usize,
+    msaa: Option<Scratch>,
+    resolve: Scratch,
+    bind_group: wgpu::BindGroup,
+}
+
+/// A whole-pixel rectangle: its first pixel and its end, exclusive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PixelRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl PixelRect {
+    /// The pixels a draw of `bounds` touches, within `0..limit`; `None` when none.
+    fn covering(bounds: &Bounds<ScaledPixels>, limit: [i32; 2]) -> Option<Self> {
+        let rect = Self {
+            x0: (bounds.origin.x.0.floor() as i32).max(0),
+            y0: (bounds.origin.y.0.floor() as i32).max(0),
+            x1: ((bounds.origin.x.0 + bounds.size.width.0).ceil() as i32).min(limit[0]),
+            y1: ((bounds.origin.y.0 + bounds.size.height.0).ceil() as i32).min(limit[1]),
+        };
+        (rect.x1 > rect.x0 && rect.y1 > rect.y0).then_some(rect)
+    }
+
+    fn width(&self) -> i32 {
+        self.x1 - self.x0
+    }
+
+    fn height(&self) -> i32 {
+        self.y1 - self.y0
+    }
+
+    /// Whether the two share a pixel.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// A batch's copy regions: the pixels its paths touch, merged where they share a pixel,
+/// so that every pixel is copied once, with everything drawn into it (paths can be
+/// translucent, and paths of one draw order overlap when painted in one
+/// `Window::paint_layer`). More than 256 paths copy their union. Each region lists its
+/// paths in draw order.
+fn path_regions(paths: &[(usize, PixelRect)]) -> Vec<(PixelRect, Vec<usize>)> {
+    if paths.len() > 256 {
+        let union = paths
+            .iter()
+            .map(|(_, rect)| *rect)
+            .reduce(|a, b| a.union(&b))
+            .expect("more than 256 paths");
+        let mut indices: Vec<usize> = paths.iter().map(|(index, _)| *index).collect();
+        indices.sort_unstable();
+        return vec![(union, indices)];
+    }
+    let mut regions: Vec<(PixelRect, Vec<usize>)> = Vec::new();
+    for &(index, rect) in paths {
+        let mut region = (rect, vec![index]);
+        // Merge every region the new one overlaps, again until none overlaps it.
+        while let Some(i) = regions.iter().position(|(r, _)| r.overlaps(&region.0)) {
+            let (r, mut indices) = regions.swap_remove(i);
+            region.0 = region.0.union(&r);
+            indices.append(&mut region.1);
+            region.1 = indices;
+        }
+        regions.push(region);
+    }
+    for (_, indices) in &mut regions {
+        indices.sort_unstable();
+    }
+    regions
+}
+
+/// Next-fit shelf packing into a width, up to a height.
+struct ShelfPacker {
+    width: i32,
+    max_height: i32,
+    x: i32,
+    shelf_y: i32,
+    shelf_height: i32,
+}
+
+impl ShelfPacker {
+    fn new(width: i32, max_height: i32) -> Self {
+        Self {
+            width,
+            max_height,
+            x: 0,
+            shelf_y: 0,
+            shelf_height: 0,
+        }
+    }
+
+    fn height(&self) -> i32 {
+        self.shelf_y + self.shelf_height
+    }
+
+    fn is_empty(&self) -> bool {
+        self.height() == 0
+    }
+
+    /// Places every rectangle, all or none.
+    fn place_all(&mut self, rects: &[PixelRect]) -> Option<Vec<(i32, i32)>> {
+        let saved = (self.x, self.shelf_y, self.shelf_height);
+        let mut places = Vec::with_capacity(rects.len());
+        for rect in rects {
+            let (width, height) = (rect.width(), rect.height());
+            if self.x + width > self.width {
+                self.shelf_y += self.shelf_height;
+                self.x = 0;
+                self.shelf_height = 0;
+            }
+            if width > self.width || self.shelf_y + height > self.max_height {
+                (self.x, self.shelf_y, self.shelf_height) = saved;
+                return None;
+            }
+            places.push((self.x, self.shelf_y));
+            self.x += width;
+            self.shelf_height = self.shelf_height.max(height);
+        }
+        Some(places)
+    }
+}
+
+/// Plans `scene`'s path atlas for a target of `viewport` (see [`PathAtlasPlan`]) and
+/// writes each drawn path's atlas offset into its record.
+fn plan_path_atlas(
+    scene: &Scene,
+    viewport: [i32; 2],
+    max_texture_size: u32,
+    tables: &mut InstanceTables,
+    path_records: &[PathRecord],
+) -> PathAtlasPlan {
+    let mut plan = PathAtlasPlan::default();
+    if scene.paths.is_empty() {
+        return plan;
+    }
+    let max = max_texture_size.min(i32::MAX as u32) as i32;
+    // A larger target is not drawn (render_frame and draw_group refuse it).
+    let viewport = [viewport[0].min(max), viewport[1].min(max)];
+    let mut batches: Vec<Vec<(PixelRect, Vec<usize>)>> = Vec::new();
+    let mut touched = Vec::new();
+    for batch in scene.batches() {
+        if let PrimitiveBatch::Paths(range) = batch {
+            touched.clear();
+            touched.extend(range.filter_map(|index| {
+                Some((
+                    index,
+                    PixelRect::covering(&scene.paths[index].clipped_bounds(), viewport)?,
+                ))
+            }));
+            batches.push(path_regions(&touched));
+        }
+    }
+    let rects = || batches.iter().flatten().map(|(rect, _)| rect);
+    let area: f64 = rects()
+        .map(|rect| f64::from(rect.width()) * f64::from(rect.height()))
+        .sum();
+    let widest = rects().map(PixelRect::width).max().unwrap_or(1);
+    // Atlas sides step up in pool-sized steps, but no further than the target's side
+    // when the need fits in it (a small target keeps a small atlas).
+    let side = |need: i32, target: i32| {
+        let stepped = ((need.max(1) as u32).next_multiple_of(GROUP_IMAGE_STEP) as i32).min(max);
+        if need <= target {
+            stepped.min(target)
+        } else {
+            stepped
+        }
+    };
+    // About square (shelves leave some height unused), never narrower than a region.
+    let width = side(((area.sqrt() * 1.25) as i32).max(widest), viewport[0]);
+    let finish_chunk = |plan: &mut PathAtlasPlan, packer: &ShelfPacker, start: usize| {
+        let height = side(packer.height(), viewport[1]);
+        let size = size(DevicePixels(packer.width), DevicePixels(height));
+        plan.chunks.push((size, start..plan.batches.len()));
+    };
+    let mut packer = ShelfPacker::new(width, max);
+    let mut chunk_start = 0;
+    for mut regions in batches {
+        let mut rects: Vec<PixelRect> = regions.iter().map(|(rect, _)| *rect).collect();
+        let mut places = packer.place_all(&rects);
+        if places.is_none() && !packer.is_empty() {
+            finish_chunk(&mut plan, &packer, chunk_start);
+            chunk_start = plan.batches.len();
+            packer = ShelfPacker::new(width, max);
+            places = packer.place_all(&rects);
+        }
+        if places.is_none() {
+            // Regions that together do not fit an empty atlas copy their union, which
+            // is within the target, so it fits a chunk at least as wide as it.
+            let union = rects.iter().copied().reduce(|a, b| a.union(&b));
+            let mut indices: Vec<usize> = regions.drain(..).flat_map(|(_, i)| i).collect();
+            indices.sort_unstable();
+            regions.extend(union.map(|union| (union, indices)));
+            rects = regions.iter().map(|(rect, _)| *rect).collect();
+            let wide = rects.iter().map(PixelRect::width).max().unwrap_or(0);
+            if wide > packer.width {
+                if !packer.is_empty() {
+                    finish_chunk(&mut plan, &packer, chunk_start);
+                    chunk_start = plan.batches.len();
+                }
+                packer = ShelfPacker::new(side(wide, viewport[0]), max);
+            }
+            places = packer.place_all(&rects);
+        }
+        // Each region is within the target, clamped to the largest texture, so the
+        // union fits; a batch that still does not draws nothing rather than elsewhere.
+        let Some(places) = places else {
+            log::error!("path batch regions {rects:?} do not fit a {max} px atlas; not drawn");
+            plan.batches.push(PlannedPathBatch {
+                chunk: plan.chunks.len(),
+                paths: Vec::new(),
+                sprites: Vec::new(),
+            });
+            continue;
+        };
+        let mut paths = Vec::new();
+        let mut sprites = Vec::with_capacity(regions.len());
+        for ((rect, indices), (x, y)) in regions.iter().zip(places) {
+            let offset = [(x - rect.x0) as f32, (y - rect.y0) as f32];
+            for &index in indices {
+                tables.set_path_atlas_offset(path_records[index], offset);
+            }
+            paths.extend_from_slice(indices);
+            sprites.push(PathSprite {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(rect.x0 as f32), ScaledPixels(rect.y0 as f32)),
+                    size: size(
+                        ScaledPixels(rect.width() as f32),
+                        ScaledPixels(rect.height() as f32),
+                    ),
+                },
+                atlas_offset: offset,
+            });
+        }
+        // Rasterized in draw order, so overlapping paths blend as painted.
+        paths.sort_unstable();
+        plan.batches.push(PlannedPathBatch {
+            chunk: plan.chunks.len(),
+            paths,
+            sprites,
+        });
+    }
+    if plan.batches.len() > chunk_start {
+        finish_chunk(&mut plan, &packer, chunk_start);
+    }
+    plan
+}
+
+/// Encoded records waiting for their scene's table to be written (whose first texel WebGL
+/// offsets their indices by), kept between frames for their capacity.
+#[derive(Default)]
+struct RecordScratch {
+    tables: InstanceTables,
+    quads: Vec<QuadRecord>,
+    shadows: Vec<ShadowRecord>,
+    underlines: Vec<UnderlineRecord>,
+    monochrome_sprites: Vec<SpriteRecord>,
+    subpixel_sprites: Vec<SpriteRecord>,
+    polychrome_sprites: Vec<PolychromeSpriteRecord>,
+    path_vertices: Vec<PathVertexRecord>,
+}
+
+fn rebase<R: RebaseRecord>(records: &mut [R], base: u32) {
+    for record in records {
+        record.rebase(base);
+    }
 }
 
 pub struct WgpuSurfaceConfig {
@@ -131,18 +428,162 @@ pub struct WgpuSurfaceConfig {
 }
 
 struct WgpuPipelines {
-    quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    path_rasterization: wgpu::RenderPipeline,
+    quads: MaskPipelines,
+    shadows: MaskPipelines,
+    path_rasterization: MaskPipelines,
     paths: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
-    mono_sprites: wgpu::RenderPipeline,
-    subpixel_sprites: Option<wgpu::RenderPipeline>,
-    poly_sprites: wgpu::RenderPipeline,
+    underlines: MaskPipelines,
+    mono_sprites: MaskPipelines,
+    subpixel_sprites: Option<MaskPipelines>,
+    poly_sprites: MaskPipelines,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
     retained_shapes: wgpu::RenderPipeline,
     backdrop: BackdropPipelines,
+}
+
+/// Whether pipelines may be made on a background thread while the renderer draws. Not on GL:
+/// wgpu-hal's GL backend holds one exclusive context lock while it makes a pipeline, and panics
+/// when another GL call waits on it more than a second, so a cold compile there could stall or
+/// abort the frames drawn meanwhile. There, as on the web, an elliptical variant is made at
+/// first use.
+fn prewarms_off_thread(adapter: &wgpu::AdapterInfo) -> bool {
+    adapter.backend != wgpu::Backend::Gl
+}
+
+impl WgpuPipelines {
+    fn mask_pipelines(&self) -> impl Iterator<Item = &MaskPipelines> {
+        [
+            &self.quads,
+            &self.shadows,
+            &self.path_rasterization,
+            &self.underlines,
+            &self.mono_sprites,
+            &self.poly_sprites,
+        ]
+        .into_iter()
+        .chain(self.subpixel_sprites.as_ref())
+    }
+
+    /// Makes the elliptical-mask variants on a background thread, so the first scene with an
+    /// elliptical mask does not compile them. Only where [`prewarms_off_thread`].
+    #[cfg(not(target_family = "wasm"))]
+    fn prewarm(&self) {
+        let jobs: Vec<_> = self
+            .mask_pipelines()
+            .map(|pipelines| (pipelines.spec.clone(), pipelines.elliptical.clone()))
+            .collect();
+        let spawned = std::thread::Builder::new()
+            .name("gpui-wgpu-pipeline-prewarm".into())
+            .spawn(move || {
+                for (spec, elliptical) in jobs {
+                    elliptical.get_or_init(|| spec.build(Some(true)));
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not start the pipeline prewarm thread: {error}");
+        }
+    }
+
+    /// The web has no threads here: the elliptical variants are made at first use.
+    #[cfg(target_family = "wasm")]
+    fn prewarm(&self) {}
+}
+
+/// What a render pipeline is made from, kept so its elliptical-mask variant can be made later
+/// (on the prewarm thread, or at first use where there are no threads).
+#[derive(Clone)]
+struct PipelineSpec {
+    device: wgpu::Device,
+    name: String,
+    layout: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
+    vs_entry: &'static str,
+    fs_entry: &'static str,
+    topology: wgpu::PrimitiveTopology,
+    targets: Vec<Option<wgpu::ColorTargetState>>,
+    sample_count: u32,
+}
+
+impl PipelineSpec {
+    /// The pipeline, with `ELLIPTICAL_MASKS` set to `elliptical_masks` when given (the shader's
+    /// default, true, otherwise).
+    fn build(&self, elliptical_masks: Option<bool>) -> wgpu::RenderPipeline {
+        let constants: &[(&str, f64)] = match elliptical_masks {
+            Some(true) => &[("ELLIPTICAL_MASKS", 1.0)],
+            Some(false) => &[("ELLIPTICAL_MASKS", 0.0)],
+            None => &[],
+        };
+        let compilation_options =
+            wgpu::PipelineCompilationOptions { constants, ..wgpu::PipelineCompilationOptions::default() };
+        let label = match elliptical_masks {
+            Some(true) => format!("{}_elliptical", self.name),
+            _ => self.name.clone(),
+        };
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&label),
+            layout: Some(&self.layout),
+            vertex: wgpu::VertexState {
+                module: &self.module,
+                entry_point: Some(self.vs_entry),
+                buffers: &[],
+                compilation_options: compilation_options.clone(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.module,
+                entry_point: Some(self.fs_entry),
+                targets: &self.targets,
+                compilation_options,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: self.topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: self.sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+}
+
+/// A pipeline that reads content masks, specialized on `ELLIPTICAL_MASKS` (`shaders.wgsl`):
+/// most scenes have no elliptical mask and draw with code that has no elliptical path. The
+/// elliptical variant is made on a background thread after startup where that is safe
+/// ([`WgpuPipelines::prewarm`]), so the first scene with one waits only if it is not ready yet,
+/// and at first use on the web and on GL ([`prewarms_off_thread`]).
+struct MaskPipelines {
+    circular: wgpu::RenderPipeline,
+    elliptical: Arc<std::sync::OnceLock<wgpu::RenderPipeline>>,
+    spec: PipelineSpec,
+}
+
+impl MaskPipelines {
+    fn new(spec: PipelineSpec) -> Self {
+        Self {
+            circular: spec.build(Some(false)),
+            elliptical: Arc::default(),
+            spec,
+        }
+    }
+
+    /// The variant for a scene that has (`elliptical_masks`) or lacks elliptical masks.
+    fn get(&self, elliptical_masks: bool) -> &wgpu::RenderPipeline {
+        if elliptical_masks {
+            self.elliptical.get_or_init(|| self.spec.build(Some(true)))
+        } else {
+            &self.circular
+        }
+    }
 }
 
 /// Backdrop filter passes (`shaders_backdrop.wgsl`).
@@ -282,7 +723,8 @@ fn bucket(size: u32) -> u32 {
     size.max(1).next_multiple_of(GROUP_IMAGE_STEP)
 }
 
-/// Offscreen textures (group images, blur and backdrop copies) by size, reused
+/// Offscreen textures (group images, blur and backdrop copies, path atlases) by size and
+/// sample count, reused
 /// within and across frames. A texture released during a frame is reused later in
 /// it: wgpu orders the later pass after the earlier ones. Textures a frame did not
 /// use are freed at its end.
@@ -298,12 +740,15 @@ struct PooledTexture {
 }
 
 impl TexturePool {
+    /// A texture of `width` × `height`; a multisampled one (`sample_count` > 1) is only
+    /// a render attachment, to resolve from.
     fn acquire(
         &self,
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        sample_count: u32,
     ) -> Scratch {
         let (width, height) = (width.max(1), height.max(1));
         let mut entries = self.entries.borrow_mut();
@@ -311,6 +756,7 @@ impl TexturePool {
             !entry.in_use
                 && entry.scratch.texture.width() == width
                 && entry.scratch.texture.height() == height
+                && entry.scratch.texture.sample_count() == sample_count
         }) {
             entry.in_use = true;
             entry.used = true;
@@ -324,13 +770,17 @@ impl TexturePool {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+            usage: if sample_count > 1 {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+            },
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -354,6 +804,12 @@ impl TexturePool {
         }
     }
 
+    fn clear(&self) {
+        for entry in self.entries.borrow_mut().drain(..) {
+            entry.scratch.texture.destroy();
+        }
+    }
+
     fn end_frame(&self) {
         let mut entries = self.entries.borrow_mut();
         entries.retain(|entry| entry.used);
@@ -369,7 +825,10 @@ impl TexturePool {
             .iter()
             .map(|entry| {
                 let texture = &entry.scratch.texture;
-                u64::from(texture.width()) * u64::from(texture.height()) * 4
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * 4
+                    * u64::from(texture.sample_count())
             })
             .sum()
     }
@@ -402,6 +861,16 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    /// The scene's record table ([`InstanceTables`]) at `@group(3)`, which its records index.
+    tables: InstanceBinding,
+    /// Each path's record in the table (offset like the other records' indices), which its
+    /// vertices share.
+    path_records: Vec<PathRecord>,
+    /// Where the scene's paths rasterize.
+    path_atlas: PathAtlasPlan,
+    /// Whether any primitive has an elliptical content mask: the scene draws with the
+    /// elliptical variants of [`MaskPipelines`].
+    elliptical_masks: bool,
 }
 
 struct WgpuBindGroupLayouts {
@@ -442,10 +911,6 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
-    path_intermediate_texture: Option<wgpu::Texture>,
-    path_intermediate_view: Option<wgpu::TextureView>,
-    path_msaa_texture: Option<wgpu::Texture>,
-    path_msaa_view: Option<wgpu::TextureView>,
     retained: retained_shapes::RetainedState,
     marks: marks::MarksState,
     /// Group images and their blur and backdrop copies, reused across frames and
@@ -464,12 +929,32 @@ struct CachedTextureBindGroup {
 }
 
 impl WgpuResources {
+    /// Frees the offscreen textures (path atlases, group images and copies); frames
+    /// make them again as they need them.
     fn invalidate_intermediate_textures(&mut self) {
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
+        self.texture_pool.clear();
     }
+}
+
+/// What [`WgpuRendererCore::warm_pipelines`] draws first: a primitive for each program a
+/// page may first use mid-session. A path draws the path rasterization program into the
+/// path intermediate and the path sprite program into the frame (quads, shadows, sprites
+/// and retained shapes are in nearly every first frame). A two-pixel triangle at the origin.
+fn warm_scene() -> Scene {
+    let corner = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+    let mut path = Path::new(corner(0., 0.));
+    path.line_to(corner(2., 0.));
+    path.line_to(corner(0., 2.));
+    path.color = gpui::black().into();
+    let mut path = path.scale(1.);
+    path.content_mask = gpui::ContentMask {
+        bounds: path.bounds,
+        ..Default::default()
+    };
+    let mut scene = Scene::default();
+    scene.insert_primitive(path);
+    scene.finish();
+    scene
 }
 
 struct WgpuRendererCore {
@@ -483,6 +968,7 @@ struct WgpuRendererCore {
     max_instance_data_size: u64,
     instance_data_alignment: u64,
     uses_webgl_instance_data: bool,
+    records: RecordScratch,
     rendering_params: RenderingParameters,
     is_bgr: bool,
     dual_source_blending: bool,
@@ -491,6 +977,12 @@ struct WgpuRendererCore {
     max_texture_size: u32,
     /// The frame's `GlobalParams::premultiplied_alpha`, for group globals.
     premultiplied_alpha: bool,
+    /// Whether the next frame first draws [`warm_scene`] (GL only, WebGL included): a GL
+    /// driver compiles a program for the state it draws in at its first draw, not when
+    /// wgpu links it, and a software one (SwiftShader, llvmpipe) takes 100–400 ms for the
+    /// path rasterization program. Without the warm frame that cost lands on the first
+    /// frame that paints a path, mid-interaction.
+    warm_pipelines: bool,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -952,6 +1444,7 @@ impl WgpuRendererCore {
         path_sample_count: u32,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
+        prewarm_off_thread: bool,
     ) -> WgpuPipelines {
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
@@ -1008,66 +1501,104 @@ impl WgpuRendererCore {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               texture_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
+        let create_spec = |name: &str,
+                           vs_entry: &'static str,
+                           fs_entry: &'static str,
+                           globals_layout: &wgpu::BindGroupLayout,
+                           data_layout: &wgpu::BindGroupLayout,
+                           texture_layout: Option<&wgpu::BindGroupLayout>,
+                           tables_layout: Option<&wgpu::BindGroupLayout>,
+                           topology: wgpu::PrimitiveTopology,
+                           color_targets: &[Option<wgpu::ColorTargetState>],
+                           sample_count: u32,
+                           module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            if texture_layout.is_some() || tables_layout.is_some() {
+                bind_group_layouts.push(texture_layout);
+            }
+            // `@group(3)`: the scene's record table, for pipelines that draw records.
+            if tables_layout.is_some() {
+                bind_group_layouts.push(tables_layout);
+            }
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
                 immediate_size: 0,
             });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
+            PipelineSpec {
+                device: device.clone(),
+                name: name.to_string(),
+                layout,
+                module: module.clone(),
+                vs_entry,
+                fs_entry,
+                topology,
+                targets: color_targets.to_vec(),
+                sample_count,
+            }
+        };
+        // Pipelines that read no content mask take the shader's default.
+        let create_pipeline = |name: &str,
+                               vs_entry: &'static str,
+                               fs_entry: &'static str,
+                               globals_layout: &wgpu::BindGroupLayout,
+                               data_layout: &wgpu::BindGroupLayout,
+                               texture_layout: Option<&wgpu::BindGroupLayout>,
+                               tables_layout: Option<&wgpu::BindGroupLayout>,
+                               topology: wgpu::PrimitiveTopology,
+                               color_targets: &[Option<wgpu::ColorTargetState>],
+                               sample_count: u32,
+                               module: &wgpu::ShaderModule| {
+            create_spec(
+                name,
+                vs_entry,
+                fs_entry,
+                globals_layout,
+                data_layout,
+                texture_layout,
+                tables_layout,
+                topology,
+                color_targets,
+                sample_count,
+                module,
+            )
+            .build(None)
+        };
+        // Pipelines that read content masks: a circular variant now, an elliptical one later.
+        let create_mask_pipelines = |name: &str,
+                                     vs_entry: &'static str,
+                                     fs_entry: &'static str,
+                                     globals_layout: &wgpu::BindGroupLayout,
+                                     data_layout: &wgpu::BindGroupLayout,
+                                     texture_layout: Option<&wgpu::BindGroupLayout>,
+                                     tables_layout: Option<&wgpu::BindGroupLayout>,
+                                     topology: wgpu::PrimitiveTopology,
+                                     color_targets: &[Option<wgpu::ColorTargetState>],
+                                     sample_count: u32,
+                                     module: &wgpu::ShaderModule| {
+            MaskPipelines::new(create_spec(
+                name,
+                vs_entry,
+                fs_entry,
+                globals_layout,
+                data_layout,
+                texture_layout,
+                tables_layout,
+                topology,
+                color_targets,
+                sample_count,
+                module,
+            ))
         };
 
         // `@group(2)` holds the frame's gradient records, bound like instance data.
-        let quads = create_pipeline(
+        let quads = create_mask_pipelines(
             "quads",
             "vs_quad",
             "fs_quad",
             &layouts.globals,
             &layouts.instances,
+            Some(&layouts.instances),
             Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
@@ -1075,26 +1606,28 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let shadows = create_pipeline(
+        let shadows = create_mask_pipelines(
             "shadows",
             "vs_shadow",
             "fs_shadow",
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
             &shader_module,
         );
 
-        let path_rasterization = create_pipeline(
+        let path_rasterization = create_mask_pipelines(
             "path_rasterization",
             "vs_path_rasterization",
             "fs_path_rasterization",
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleList,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1112,6 +1645,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1122,26 +1656,28 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let underlines = create_pipeline(
+        let underlines = create_mask_pipelines(
             "underlines",
             "vs_underline",
             "fs_underline",
             &layouts.globals,
             &layouts.instances,
             None,
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
             &shader_module,
         );
 
-        let mono_sprites = create_pipeline(
+        let mono_sprites = create_mask_pipelines(
             "mono_sprites",
             "vs_mono_sprite",
             "fs_mono_sprite",
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1162,13 +1698,14 @@ impl WgpuRendererCore {
                 },
             };
 
-            Some(create_pipeline(
+            Some(create_mask_pipelines(
                 "subpixel_sprites",
                 "vs_subpixel_sprite",
                 "fs_subpixel_sprite",
                 &layouts.globals,
                 &layouts.instances,
                 Some(&layouts.texture),
+                Some(&layouts.instances),
                 wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -1182,13 +1719,14 @@ impl WgpuRendererCore {
             None
         };
 
-        let poly_sprites = create_pipeline(
+        let poly_sprites = create_mask_pipelines(
             "poly_sprites",
             "vs_poly_sprite",
             "fs_poly_sprite",
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            Some(&layouts.instances),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1201,6 +1739,7 @@ impl WgpuRendererCore {
             "fs_surface",
             &layouts.globals,
             &layouts.surfaces,
+            None,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
@@ -1215,6 +1754,7 @@ impl WgpuRendererCore {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.retained_uniforms),
+            None,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -1223,7 +1763,7 @@ impl WgpuRendererCore {
 
         let backdrop = Self::create_backdrop_pipelines(device, &layouts.texture, surface_format);
 
-        WgpuPipelines {
+        let pipelines = WgpuPipelines {
             backdrop,
             retained_shapes,
             quads,
@@ -1235,7 +1775,11 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+        };
+        if prewarm_off_thread {
+            pipelines.prewarm();
         }
+        pipelines
     }
 
     fn create_backdrop_pipelines(
@@ -1369,58 +1913,6 @@ impl WgpuRendererCore {
             uniform_layout,
         }
     }
-
-    fn create_path_intermediate(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_intermediate"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
-    fn create_msaa_if_needed(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        sample_count: u32,
-    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
-        if sample_count <= 1 {
-            return None;
-        }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("path_msaa"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Some((texture, view))
-    }
 }
 
 impl WgpuRenderer {
@@ -1459,17 +1951,8 @@ impl WgpuRenderer {
             warn!("Failed to poll device during resize: {e:?}");
         }
 
-        // Destroy old textures before allocating new ones to avoid GPU memory spikes
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
-        }
-
-        // Invalidate intermediate textures - they will be lazily recreated
-        // in draw() after we confirm the surface is healthy. This avoids
-        // panics when the device/surface is in an invalid state during resize.
+        // Free offscreen textures before the surface reallocates, to avoid GPU memory
+        // spikes; frames make them again as they need them.
         resources.invalidate_intermediate_textures();
 
         if let RendererState::Ready { surface, core } = &self.state {
@@ -1508,6 +1991,7 @@ impl WgpuRenderer {
             core.rendering_params.path_sample_count,
             core.dual_source_blending,
             core.uses_webgl_instance_data,
+            prewarms_off_thread(&core.adapter_info),
         );
 
         if let RendererState::Ready { surface, core } = &self.state {
@@ -1664,6 +2148,7 @@ impl WgpuRendererCore {
             rendering_params.path_sample_count,
             dual_source_blending,
             uses_webgl_instance_data,
+            prewarms_off_thread(&context.adapter.get_info()),
         );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -1788,10 +2273,6 @@ impl WgpuRendererCore {
                 globals_bind_group,
                 path_globals_bind_group,
                 instance_data,
-                path_intermediate_texture: None,
-                path_intermediate_view: None,
-                path_msaa_texture: None,
-                path_msaa_view: None,
                 retained: Default::default(),
                 marks: Default::default(),
                 texture_pool: TexturePool::default(),
@@ -1805,9 +2286,11 @@ impl WgpuRendererCore {
             max_instance_data_size,
             instance_data_alignment,
             uses_webgl_instance_data,
+            records: RecordScratch::default(),
             rendering_params,
             is_bgr: false,
             dual_source_blending,
+            warm_pipelines: context.adapter.get_info().backend == wgpu::Backend::Gl,
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
@@ -1823,41 +2306,6 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        if self
-            .resources
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
-        {
-            return;
-        }
-
-        let format = self.target_format;
-        let path_sample_count = self.rendering_params.path_sample_count;
-        let resources = &mut self.resources;
-
-        let (texture, view) =
-            Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.path_intermediate_texture = Some(texture);
-        resources.path_intermediate_view = Some(view);
-
-        let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
-            &resources.device,
-            format,
-            width,
-            height,
-            path_sample_count,
-        )
-        .map(|(texture, view)| (Some(texture), Some(view)))
-        .unwrap_or((None, None));
-        resources.path_msaa_texture = path_msaa_texture;
-        resources.path_msaa_view = path_msaa_view;
-    }
 
     fn render_frame(
         &mut self,
@@ -1879,7 +2327,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1914,6 +2361,13 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
+        if std::mem::take(&mut self.warm_pipelines) {
+            // Into the frame's own targets, so each program compiles for the state it draws
+            // in; the frame's clear then covers it.
+            if let Err(error) = self.record_frame(&warm_scene(), target_view, size, clear_color) {
+                warn!("pipeline warm-up frame failed: {error:#}");
+            }
+        }
         self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
@@ -1997,9 +2451,9 @@ impl WgpuRendererCore {
         };
         let mut retained_base = 0;
         let mut marks_base = 0;
-        for drawn in &scenes {
+        for &(drawn, viewport) in &viewports {
             let instance_bindings = self
-                .write_instances(drawn, &mut instance_offset)
+                .write_instances(drawn, viewport, &mut instance_offset)
                 .with_context(|| {
                     format!(
                         "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -2114,6 +2568,20 @@ impl WgpuRendererCore {
             .context("scene not prepared for the frame")?;
         let instance_bindings = &drawn.instance_bindings;
         let target_view = target.view;
+        // The first chunk of paths rasterizes before the target's pass opens, so the
+        // batches that read it draw in that pass.
+        let mut path_atlas = if instance_bindings.path_atlas.chunks.is_empty() {
+            None
+        } else {
+            Some(self.rasterize_path_chunk(
+                encoder,
+                scene,
+                instance_bindings,
+                0,
+                instance_offset,
+            )?)
+        };
+        let mut path_batches = instance_bindings.path_atlas.batches.iter();
         let mut pass = clear.map(|color| target_pass(encoder, target, Some(color), "main_pass"));
 
         for batch in scene.batches() {
@@ -2124,45 +2592,64 @@ impl WgpuRendererCore {
                     pass.set_bind_group(2, &frame.gradients.bind_group, &[]);
                     self.draw_instances(
                         &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
+                        &instance_bindings.tables,
+                        self.resources().pipelines.quads.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         pass,
                     )
                 }
                 PrimitiveBatch::Shadows(range) => self.draw_instances(
                     &instance_bindings.shadows,
-                    &self.resources().pipelines.shadows,
+                    &instance_bindings.tables,
+                    self.resources().pipelines.shadows.get(instance_bindings.elliptical_masks),
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    if paths.is_empty() {
+                PrimitiveBatch::Paths(_) => {
+                    let batch = path_batches
+                        .next()
+                        .context("path batch not in the scene's path atlas plan")?;
+                    if batch.sprites.is_empty() {
                         continue;
                     }
-
-                    pass = None;
-                    let rasterized =
-                        self.draw_paths_to_intermediate(encoder, paths, instance_offset, size)?;
-                    if rasterized {
-                        self.draw_paths_from_intermediate(
-                            paths,
+                    if path_atlas
+                        .as_ref()
+                        .is_none_or(|atlas| atlas.chunk != batch.chunk)
+                    {
+                        // The next chunk replaces the last, whose batches have drawn.
+                        pass = None;
+                        if let Some(atlas) = path_atlas.take() {
+                            self.release_path_atlas(atlas);
+                        }
+                        path_atlas = Some(self.rasterize_path_chunk(
+                            encoder,
+                            scene,
+                            instance_bindings,
+                            batch.chunk,
                             instance_offset,
-                            open_pass(&mut pass, encoder, target),
-                        )?;
+                        )?);
                     }
+                    let atlas = path_atlas.as_ref().expect("rasterized above");
+                    self.draw_path_sprites(
+                        &batch.sprites,
+                        atlas,
+                        instance_offset,
+                        open_pass(&mut pass, encoder, target),
+                    )?;
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_instances(
                     &instance_bindings.underlines,
-                    &self.resources().pipelines.underlines,
+                    &instance_bindings.tables,
+                    self.resources().pipelines.underlines.get(instance_bindings.elliptical_masks),
                     instance_range(range),
                     open_pass(&mut pass, encoder, target),
                 ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                     self.draw_sprites(
                         &instance_bindings.monochrome_sprites,
+                        &instance_bindings.tables,
                         texture_id,
-                        &self.resources().pipelines.mono_sprites,
+                        self.resources().pipelines.mono_sprites.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2171,12 +2658,14 @@ impl WgpuRendererCore {
                     let resources = self.resources();
                     self.draw_sprites(
                         &instance_bindings.subpixel_sprites,
+                        &instance_bindings.tables,
                         texture_id,
                         resources
                             .pipelines
                             .subpixel_sprites
                             .as_ref()
-                            .unwrap_or(&resources.pipelines.mono_sprites),
+                            .unwrap_or(&resources.pipelines.mono_sprites)
+                            .get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2184,8 +2673,9 @@ impl WgpuRendererCore {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_sprites(
                         &instance_bindings.polychrome_sprites,
+                        &instance_bindings.tables,
                         texture_id,
-                        &self.resources().pipelines.poly_sprites,
+                        self.resources().pipelines.poly_sprites.get(instance_bindings.elliptical_masks),
                         instance_range(range),
                         open_pass(&mut pass, encoder, target),
                     )?;
@@ -2266,6 +2756,10 @@ impl WgpuRendererCore {
                     }
                 }
             }
+        }
+        drop(pass);
+        if let Some(atlas) = path_atlas {
+            self.release_path_atlas(atlas);
         }
         Ok(())
     }
@@ -2354,6 +2848,7 @@ impl WgpuRendererCore {
             self.target_format,
             bucket(size.width.0 as u32),
             bucket(size.height.0 as u32),
+            1,
         );
         let image_target = DrawTarget {
             view: &image.view,
@@ -2463,6 +2958,7 @@ impl WgpuRendererCore {
                     self.target_format,
                     bucket(image_size.width.0 as u32),
                     bucket(image_size.height.0 as u32),
+                    1,
                 );
                 let mask_target = DrawTarget {
                     view: &texture.view,
@@ -2684,7 +3180,7 @@ impl WgpuRendererCore {
         let (width, height) = (width as u32, height as u32);
         let pool = &self.resources().texture_pool;
         let device = &self.resources().device;
-        let copy = pool.acquire(device, self.target_format, width, height);
+        let copy = pool.acquire(device, self.target_format, width, height, 1);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: frame_texture,
@@ -2717,8 +3213,8 @@ impl WgpuRendererCore {
         let scale = (sigma / 8.).ceil().max(1.);
         let small_width = ((width as f32) / scale).ceil().max(1.) as u32;
         let small_height = ((height as f32) / scale).ceil().max(1.) as u32;
-        let a = pool.acquire(device, self.target_format, small_width, small_height);
-        let b = pool.acquire(device, self.target_format, small_width, small_height);
+        let a = pool.acquire(device, self.target_format, small_width, small_height, 1);
+        let b = pool.acquire(device, self.target_format, small_width, small_height, 1);
         let (copy_view, a_view, b_view) = (&copy.view, &a.view, &b.view);
         let sigma = sigma / scale;
         let radius = (sigma * 3.).ceil() as i32;
@@ -2860,42 +3356,125 @@ impl WgpuRendererCore {
         pass.draw(0..4, 0..1);
     }
 
+    /// Writes `scene`'s record table, then its records, whose table indices WebGL offsets by
+    /// the table's first texel.
     fn write_instances(
         &mut self,
         scene: &Scene,
+        viewport: [f32; 2],
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
+        let mut records = std::mem::take(&mut self.records);
+        let result = self.write_scene_records(scene, viewport, instance_offset, &mut records);
+        self.records = records;
+        result
+    }
+
+    fn write_scene_records(
+        &mut self,
+        scene: &Scene,
+        viewport: [f32; 2],
+        instance_offset: &mut u64,
+        records: &mut RecordScratch,
+    ) -> Result<InstanceBindings> {
+        fn encode<P, R>(out: &mut Vec<R>, primitives: &[P], record: impl FnMut(&P) -> R) {
+            out.clear();
+            out.extend(primitives.iter().map(record));
+        }
+        let RecordScratch {
+            tables,
+            quads,
+            shadows,
+            underlines,
+            monochrome_sprites,
+            subpixel_sprites,
+            polychrome_sprites,
+            ..
+        } = records;
+        tables.clear();
+        // Quads are fill-heavy (a few large primitives cover most pixels): storage backends upload
+        // them whole and their shaders read each quad in place, so a fragment does no table walk.
+        // Expanding a record per pixel cost fill-bound quad scenes 12-17% GPU time on M4 Max
+        // (PR 4793). The many small primitives (glyphs, underlines, shadows, paths) use compact
+        // records indexing the scene's table, which cut upload bytes. WebGL's texture transport
+        // reads quads as records too: a whole quad there is as many texel fetches.
+        let webgl = self.uses_webgl_instance_data;
+        quads.clear();
+        if webgl {
+            encode(quads, &scene.quads, |quad| tables.quad(quad));
+        }
+        encode(shadows, &scene.shadows, |shadow| tables.shadow(shadow));
+        encode(underlines, &scene.underlines, |underline| {
+            tables.underline(underline)
+        });
+        encode(monochrome_sprites, &scene.monochrome_sprites, |sprite| {
+            tables.monochrome_sprite(sprite)
+        });
+        encode(subpixel_sprites, &scene.subpixel_sprites, |sprite| {
+            tables.subpixel_sprite(sprite)
+        });
+        encode(polychrome_sprites, &scene.polychrome_sprites, |sprite| {
+            tables.polychrome_sprite(sprite)
+        });
+        let mut path_records: Vec<PathRecord> =
+            scene.paths.iter().map(|path| tables.path(path)).collect();
+        let path_atlas = plan_path_atlas(
+            scene,
+            [viewport[0] as i32, viewport[1] as i32],
+            self.max_texture_size,
+            tables,
+            &path_records,
+        );
+
+        let table_binding =
+            self.write_instance_binding("tables_bind_group", instance_offset, tables.texels())?;
+        if self.uses_webgl_instance_data {
+            let base = table_binding.first_instance;
+            rebase(quads, base);
+            rebase(shadows, base);
+            rebase(underlines, base);
+            rebase(monochrome_sprites, base);
+            rebase(subpixel_sprites, base);
+            rebase(polychrome_sprites, base);
+            rebase(&mut path_records, base);
+        }
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
-                "quads_bind_group",
-                instance_offset,
-                &scene.quads,
-            )?,
-            shadows: self.write_instance_binding(
-                "shadows_bind_group",
-                instance_offset,
-                &scene.shadows,
-            )?,
+            quads: if webgl {
+                self.write_instance_binding("quads_bind_group", instance_offset, quads)?
+            } else {
+                self.write_instance_binding("quads_bind_group", instance_offset, &scene.quads)?
+            },
+            shadows: self.write_instance_binding("shadows_bind_group", instance_offset, shadows)?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
                 instance_offset,
-                &scene.underlines,
+                underlines,
             )?,
             monochrome_sprites: self.write_instance_binding(
                 "monochrome_sprites_bind_group",
                 instance_offset,
-                &scene.monochrome_sprites,
+                monochrome_sprites,
             )?,
             subpixel_sprites: self.write_instance_binding(
                 "subpixel_sprites_bind_group",
                 instance_offset,
-                &scene.subpixel_sprites,
+                subpixel_sprites,
             )?,
             polychrome_sprites: self.write_instance_binding(
                 "polychrome_sprites_bind_group",
                 instance_offset,
-                &scene.polychrome_sprites,
+                polychrome_sprites,
             )?,
+            tables: table_binding,
+            path_records,
+            path_atlas,
+            // Quads uploaded whole carry their masks outside the table.
+            elliptical_masks: tables.has_elliptical_masks()
+                || (!webgl
+                    && scene
+                        .quads
+                        .iter()
+                        .any(|quad| quad.content_mask.corner_radii_y != gpui::Corners::default())),
         })
     }
 
@@ -2988,6 +3567,7 @@ impl WgpuRendererCore {
     fn draw_instances(
         &self,
         instances: &InstanceBinding,
+        tables: &InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
@@ -2998,6 +3578,7 @@ impl WgpuRendererCore {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.set_bind_group(3, &tables.bind_group, &[]);
         pass.draw(
             0..4,
             instances.first_instance + range.start..instances.first_instance + range.end,
@@ -3007,6 +3588,7 @@ impl WgpuRendererCore {
     fn draw_sprites(
         &self,
         sprite_instances: &InstanceBinding,
+        tables: &InstanceBinding,
         texture_id: AtlasTextureId,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
@@ -3025,6 +3607,7 @@ impl WgpuRendererCore {
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
+        pass.set_bind_group(3, &tables.bind_group, &[]);
         pass.draw(
             0..4,
             sprite_instances.first_instance + range.start
@@ -3042,33 +3625,21 @@ impl WgpuRendererCore {
         }
     }
 
-    fn draw_paths_from_intermediate(
+    /// Draws a batch's regions from the path atlas into the pass.
+    fn draw_path_sprites(
         &mut self,
-        paths: &[Path<ScaledPixels>],
+        sprites: &[PathSprite],
+        atlas: &PathAtlas,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
-        // Each pixel is copied at most once (paths can be translucent): overlapping paths'
-        // bounds are copied as one region.
-        let sprites: Vec<PathSprite> = gpui::path_copy_bounds(paths)
-            .into_iter()
-            .map(|bounds| PathSprite { bounds })
-            .collect();
-
-        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
-            return Ok(());
-        };
         let instances =
-            self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
-        let texture = self.create_texture_bind_group(
-            "path_intermediate_texture_bind_group",
-            &path_intermediate_view,
-        );
+            self.write_instance_binding("path_sprites_bind_group", instance_offset, sprites)?;
         let resources = self.resources();
         pass.set_pipeline(&resources.pipelines.paths);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(2, &atlas.bind_group, &[]);
         pass.draw(
             0..4,
             instances.first_instance..instances.first_instance + sprites.len() as u32,
@@ -3076,51 +3647,67 @@ impl WgpuRendererCore {
         Ok(())
     }
 
-    fn draw_paths_to_intermediate(
+    /// Rasterizes the paths of `chunk` of the scene's path atlas plan into a pooled
+    /// atlas (multisampled, then resolved), each at its place, in one pass.
+    fn rasterize_path_chunk(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        paths: &[Path<ScaledPixels>],
+        scene: &Scene,
+        bindings: &InstanceBindings,
+        chunk: usize,
         instance_offset: &mut u64,
-        size: Size<DevicePixels>,
-    ) -> Result<bool> {
-        let mut vertices = Vec::new();
-        for path in paths {
-            let bounds = path.clipped_bounds();
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds,
-                content_mask: path.content_mask,
-            }));
+    ) -> Result<PathAtlas> {
+        let (size, ref batches) = bindings.path_atlas.chunks[chunk];
+        let mut vertices = std::mem::take(&mut self.records.path_vertices);
+        vertices.clear();
+        for batch in &bindings.path_atlas.batches[batches.clone()] {
+            for &index in &batch.paths {
+                vertices.extend(InstanceTables::path_vertices(
+                    &scene.paths[index],
+                    bindings.path_records[index],
+                ));
+            }
         }
+        let vertex_count = vertices.len() as u32;
+        let vertex_binding = (!vertices.is_empty())
+            .then(|| {
+                self.write_instance_binding(
+                    "path_rasterization_bind_group",
+                    instance_offset,
+                    &vertices,
+                )
+            })
+            .transpose();
+        self.records.path_vertices = vertices;
+        let vertex_binding = vertex_binding?;
 
-        if vertices.is_empty() {
-            return Ok(false);
-        }
-
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
-
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let sample_count = self.rendering_params.path_sample_count;
+        let resources = &self.resources;
+        let resolve =
+            resources
+                .texture_pool
+                .acquire(&resources.device, self.target_format, width, height, 1);
+        let msaa = (sample_count > 1).then(|| {
+            resources.texture_pool.acquire(
+                &resources.device,
+                self.target_format,
+                width,
+                height,
+                sample_count,
+            )
+        });
+        let path_globals = self.group_globals(size).1;
         let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return Ok(false);
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = resources.path_msaa_view {
-            (msaa_view, Some(path_intermediate_view))
-        } else {
-            (path_intermediate_view, None)
-        };
-
         {
+            let (view, resolve_target) = match &msaa {
+                Some(msaa) => (&msaa.view, Some(&resolve.view)),
+                None => (&resolve.view, None),
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("path_rasterization_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
+                    view,
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -3131,23 +3718,41 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
-
-            // The target may be smaller than the intermediate texture (a group's image).
-            pass.set_viewport(0., 0., size.width.0 as f32, size.height.0 as f32, 0., 1.);
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
-            pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
-            pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
-            // The path rasterization shader loads records by vertex index
-            // rather than instance index, so the allocation's base shifts the
-            // vertex range here.
-            pass.draw(
-                vertex_binding.first_instance
-                    ..vertex_binding.first_instance + vertices.len() as u32,
-                0..1,
-            );
+            if let Some(vertex_binding) = &vertex_binding {
+                pass.set_pipeline(
+                    resources
+                        .pipelines
+                        .path_rasterization
+                        .get(bindings.elliptical_masks),
+                );
+                pass.set_bind_group(0, &path_globals, &[]);
+                pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
+                pass.set_bind_group(3, &bindings.tables.bind_group, &[]);
+                // The path rasterization shader loads records by vertex index
+                // rather than instance index, so the allocation's base shifts the
+                // vertex range here.
+                pass.draw(
+                    vertex_binding.first_instance..vertex_binding.first_instance + vertex_count,
+                    0..1,
+                );
+            }
         }
+        let bind_group = self.create_texture_bind_group("path_atlas_bind_group", &resolve.view);
+        Ok(PathAtlas {
+            chunk,
+            msaa,
+            resolve,
+            bind_group,
+        })
+    }
 
-        Ok(true)
+    /// Returns a path atlas's textures to the pool: later passes may reuse them.
+    fn release_path_atlas(&self, atlas: PathAtlas) {
+        let pool = &self.resources.texture_pool;
+        pool.release(&atlas.resolve.texture);
+        if let Some(msaa) = &atlas.msaa {
+            pool.release(&msaa.texture);
+        }
     }
 
     fn write_instance_binding<T>(
@@ -3959,12 +4564,265 @@ pub(crate) fn begin_load_pass<'a>(
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, MonochromeSprite,
-        PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, TransformationMatrix, Underline,
-        linear_color_stop, linear_gradient,
+        BorderStyle, ColorSpace, ContentMask, Corners, Edges, Hsla, Point, Quad, Size,
+        TransformationMatrix, linear_color_stop, linear_gradient,
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+
+    /// The warm-up frame draws one path batch, inside its content mask (a culled path would
+    /// compile nothing).
+    #[test]
+    fn warm_scene_draws_one_path() {
+        let scene = warm_scene();
+        let batches: Vec<_> = scene.batches().collect();
+        assert!(
+            matches!(batches.as_slice(), [PrimitiveBatch::Paths(range)] if range.len() == 1),
+            "{:?}",
+            batches.iter().map(|b| b.label()).collect::<Vec<_>>()
+        );
+    }
+
+    fn rect_path(
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        color: Hsla,
+        mask: Bounds<ScaledPixels>,
+    ) -> Path<ScaledPixels> {
+        let at = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+        let mut path = Path::new(at(x0, y0));
+        path.line_to(at(x1, y0));
+        path.line_to(at(x1, y1));
+        path.line_to(at(x0, y1));
+        path.line_to(at(x0, y0));
+        let mut path = path.scale(1.);
+        path.color = color.into();
+        path.content_mask = ContentMask::from(mask);
+        path
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+            size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    /// Copy regions merge paths that share a pixel, not only those whose bounds overlap:
+    /// two paths meeting at x = 10.5 both draw into pixel 10, which is copied once.
+    #[test]
+    fn path_regions_merge_paths_that_share_a_pixel() {
+        let rect = |x0, y0, x1, y1| PixelRect { x0, y0, x1, y1 };
+        let regions = path_regions(&[
+            (0, rect(0, 0, 11, 4)),
+            (1, rect(10, 0, 20, 4)),
+            (2, rect(20, 0, 24, 4)),
+            (3, rect(40, 0, 44, 4)),
+        ]);
+        let mut regions: Vec<_> = regions.into_iter().map(|(r, i)| (r.x0, r.x1, i)).collect();
+        regions.sort();
+        // 2 touches 1's edge (pixel 19 against 20) without sharing a pixel.
+        assert_eq!(
+            regions,
+            [(0, 20, vec![0, 1]), (20, 24, vec![2]), (40, 44, vec![3])]
+        );
+        let covering = PixelRect::covering(&scaled_bounds(-3.5, 2.25, 14., 1.), [8, 8]);
+        assert_eq!(covering, Some(rect(0, 2, 8, 4)));
+        assert_eq!(
+            PixelRect::covering(&scaled_bounds(9., 0., 2., 2.), [8, 8]),
+            None
+        );
+    }
+
+    /// A scene whose path regions outgrow the largest texture rasterizes in chunks, each
+    /// region placed once, within its chunk.
+    #[test]
+    fn path_atlas_plan_packs_regions_into_chunks() {
+        let full = scaled_bounds(0., 0., 256., 256.);
+        let mut scene = Scene::default();
+        for i in 0..6 {
+            // A quad over everything between each path splits the paths into six batches.
+            scene.insert_primitive(Quad {
+                bounds: full,
+                content_mask: ContentMask::from(full),
+                ..Default::default()
+            });
+            let x = 10. + 25. * i as f32;
+            scene.insert_primitive(rect_path(x, 10., x + 100., 110., gpui::red(), full));
+        }
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        // Four 100 × 100 regions fit a 256 × 256 atlas.
+        let plan = plan_path_atlas(&scene, [256, 256], 256, &mut tables, &records);
+        assert_eq!(plan.batches.len(), 6);
+        assert!(plan.chunks.len() >= 2, "{} chunks", plan.chunks.len());
+        for (chunk, (size, batches)) in plan.chunks.iter().enumerate() {
+            assert!(size.width.0 <= 256 && size.height.0 <= 256, "{size:?}");
+            let mut placed = Vec::new();
+            for batch in &plan.batches[batches.clone()] {
+                assert_eq!(batch.chunk, chunk);
+                for sprite in &batch.sprites {
+                    let x = sprite.bounds.origin.x.0 + sprite.atlas_offset[0];
+                    let y = sprite.bounds.origin.y.0 + sprite.atlas_offset[1];
+                    let (w, h) = (sprite.bounds.size.width.0, sprite.bounds.size.height.0);
+                    assert!(x >= 0. && y >= 0., "{x}, {y}");
+                    assert!(x + w <= size.width.0 as f32 && y + h <= size.height.0 as f32);
+                    for &(px, py, pw, ph) in &placed {
+                        let apart: bool =
+                            x >= px + pw || px >= x + w || y >= py + ph || py >= y + h;
+                        assert!(apart, "places overlap");
+                    }
+                    placed.push((x, y, w, h));
+                }
+            }
+        }
+    }
+
+    /// A batch whose regions do not fit an empty chunk copies their union, in a chunk
+    /// as wide as the union (wider than the atlas planned for the scene's regions).
+    #[test]
+    fn path_atlas_plan_widens_a_chunk_for_a_union() {
+        let full = scaled_bounds(0., 0., 256., 256.);
+        let mut scene = Scene::default();
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(0., 0., 16., 228., gpui::red(), full));
+        scene.insert_primitive(rect_path(130., 0., 252., 32., gpui::red(), full));
+        scene.pop_layer();
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        let plan = plan_path_atlas(&scene, [256, 256], 256, &mut tables, &records);
+        assert_eq!(plan.batches.len(), 1);
+        let batch = &plan.batches[0];
+        assert_eq!(batch.paths, [0, 1]);
+        assert_eq!(batch.sprites.len(), 1);
+        assert_eq!(batch.sprites[0].bounds.size.width.0, 252.);
+        let (size, _) = plan.chunks[batch.chunk];
+        assert!(size.width.0 >= 252 && size.width.0 <= 256, "{size:?}");
+    }
+
+    /// A small target's atlas is no larger than the target.
+    #[test]
+    fn path_atlas_of_a_small_target_is_within_it() {
+        let full = scaled_bounds(0., 0., 40., 30.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(rect_path(2., 2., 30., 20., gpui::red(), full));
+        scene.finish();
+        let mut tables = InstanceTables::default();
+        let records: Vec<_> = scene.paths.iter().map(|path| tables.path(path)).collect();
+        let plan = plan_path_atlas(&scene, [40, 30], 8192, &mut tables, &records);
+        let (size, _) = plan.chunks[0];
+        assert!(size.width.0 <= 40 && size.height.0 <= 30, "{size:?}");
+    }
+
+    /// Paths rasterize in the atlas and draw back where they belong: translucent paths of
+    /// one layer overlap once, paths meeting at a half pixel fill it as one coverage, a
+    /// path partly off the target draws its visible part, a masked path draws only
+    /// inside its mask, and batches between quads each read their own places.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn paths_draw_from_the_atlas_where_they_belong() -> anyhow::Result<()> {
+        use gpui::PlatformHeadlessRenderer;
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let full = scaled_bounds(0., 0., 64., 48.);
+        let white = gpui::white();
+        let translucent = |color: Hsla| Hsla { a: 0.5, ..color };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full,
+            content_mask: ContentMask::from(full),
+            background: white.into(),
+            ..Default::default()
+        });
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(4., 4., 20., 20., translucent(gpui::red()), full));
+        scene.insert_primitive(rect_path(
+            12.,
+            4.,
+            28.,
+            20.,
+            translucent(gpui::blue()),
+            full,
+        ));
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(30., 4., 4., 4.),
+            content_mask: ContentMask::from(full),
+            background: gpui::green().into(),
+            ..Default::default()
+        });
+        scene.push_layer(full);
+        scene.insert_primitive(rect_path(36., 4., 44.5, 12., gpui::black(), full));
+        scene.insert_primitive(rect_path(44.5, 4., 52., 12., gpui::black(), full));
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(30., 24., 4., 4.),
+            content_mask: ContentMask::from(full),
+            background: gpui::green().into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(rect_path(-6., 30., 6., 40., gpui::red(), full));
+        scene.insert_primitive(rect_path(
+            20.,
+            30.,
+            60.,
+            44.,
+            gpui::blue(),
+            scaled_bounds(40., 30., 10., 14.),
+        ));
+        scene.finish();
+        let batches = scene
+            .batches()
+            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(_)))
+            .count();
+        assert!(batches >= 3, "{batches} path batches");
+
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(64),
+                height: DevicePixels(48),
+            },
+        )?;
+        if let Some(dir) = std::env::var_os("GPUI_RETAINED_DUMP") {
+            image.save(std::path::Path::new(&dir).join("path_atlas_wgpu.png"))?;
+        }
+        let check = |x: u32, y: u32, expected: [u8; 4]| {
+            let actual = image.get_pixel(x, y).0;
+            assert!(
+                actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 3),
+                "pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+            );
+        };
+        // Red at 50% over white; blue at 50% over that; blue alone.
+        check(8, 10, [255, 128, 128, 255]);
+        check(16, 10, [128, 64, 191, 255]);
+        check(24, 10, [128, 128, 255, 255]);
+        // Pixel 44: half of each black path. Their samples resolve together, so it is
+        // black (copied from separate places it would be 75% black, a seam).
+        check(40, 8, [0, 0, 0, 255]);
+        check(44, 8, [0, 0, 0, 255]);
+        check(48, 8, [0, 0, 0, 255]);
+        // Off the target's left edge, its visible part.
+        check(0, 35, [255, 0, 0, 255]);
+        check(5, 35, [255, 0, 0, 255]);
+        check(8, 35, [255, 255, 255, 255]);
+        // Masked to x 40..50.
+        check(25, 35, [255, 255, 255, 255]);
+        check(45, 35, [0, 0, 255, 255]);
+        check(55, 35, [255, 255, 255, 255]);
+        check(31, 5, [0, 128, 0, 255]);
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -4509,6 +5367,70 @@ mod tests {
         Ok(())
     }
 
+    /// A quad clipped by an elliptical content mask (10 px wide, 40 px tall corners) draws with
+    /// the elliptical pipeline variant, though quads upload whole and their masks are not in the
+    /// record table; the same quad under a circular mask draws with the circular variant.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn quads_under_elliptical_masks_use_the_elliptical_variant() -> anyhow::Result<()> {
+        use gpui::{ContentMask, Corners, DevicePixels, PlatformHeadlessRenderer, Quad, ScaledPixels};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let bounds = Bounds::new(gpui::point(ScaledPixels(0.), ScaledPixels(0.)), gpui::size(ScaledPixels(100.), ScaledPixels(100.)));
+        let scene = |mask: ContentMask<ScaledPixels>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: mask,
+                background: gpui::Hsla { h: 0., s: 0., l: 1., a: 1. }.into(),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let size = Size { width: DevicePixels(100), height: DevicePixels(100) };
+        // How much of the white quad covers (1, 1), outside both corners, and (2, 8), inside a
+        // 10 px circular corner but outside a 10 x 40 px elliptical one (red over the clear color;
+        // the target's alpha is opaque).
+        let alpha_at = |renderer: &mut WgpuHeadlessRenderer, mask| -> anyhow::Result<(u8, u8)> {
+            let image = renderer.render_scene_to_image(&scene(mask), size)?;
+            assert_eq!(image.get_pixel(50, 50).0[0], 255, "the quad's middle is drawn");
+            Ok((image.get_pixel(1, 1).0[0], image.get_pixel(2, 8).0[0]))
+        };
+        let circular = alpha_at(&mut renderer, ContentMask::rounded(bounds, Corners::all(ScaledPixels(10.))))?;
+        let elliptical = alpha_at(
+            &mut renderer,
+            ContentMask::<ScaledPixels>::elliptical(bounds, Corners::all(ScaledPixels(10.)), Corners::all(ScaledPixels(40.))),
+        )?;
+        println!("circular {circular:?}, elliptical {elliptical:?}");
+        assert!(circular.0 < 64 && circular.1 > 192, "circular corner: {circular:?}");
+        assert!(elliptical.0 < 64 && elliptical.1 < 64, "elliptical corner: {elliptical:?}");
+        Ok(())
+    }
+
+    /// Rounded dashed borders: dashes and gaps where WebKit draws them.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn rounded_dashes_sit_where_webkit_draws_them() -> anyhow::Result<()> {
+        use gpui::rounded_dashes_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let image = renderer.render_scene_to_image(&t::scene(), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
+        Ok(())
+    }
+
     /// A dashed border on an oval: dashes alternate with gaps around the whole elliptical arc, in every quadrant.
     #[cfg(not(target_family = "wasm"))]
     #[test]
@@ -4995,20 +5917,60 @@ mod tests {
             .expect("shader should validate");
     }
 
+    /// The WebGL shaders take `ELLIPTICAL_MASKS` either way through the GLSL ES 3.00 writer
+    /// wgpu's GL backend uses, for the stages that read content masks.
+    #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 46 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
+    fn webgl_shaders_specialize_on_elliptical_masks() {
+        use naga::back::glsl;
+        let module = naga::front::wgsl::parse_str(WEBGL_SHADERS).expect("shader should parse");
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+            .validate(&module)
+            .expect("shader should validate");
+        let entries = [
+            ("vs_quad", naga::ShaderStage::Vertex),
+            ("fs_quad", naga::ShaderStage::Fragment),
+            ("vs_mono_sprite", naga::ShaderStage::Vertex),
+            ("fs_mono_sprite", naga::ShaderStage::Fragment),
+            ("fs_underline", naga::ShaderStage::Fragment),
+        ];
+        for elliptical_masks in [0.0, 1.0] {
+            let mut constants = naga::back::PipelineConstants::default();
+            constants.insert("ELLIPTICAL_MASKS".to_string(), elliptical_masks);
+            for (entry_point, stage) in entries {
+                let (module, info) =
+                    naga::back::pipeline_constants::process_overrides(&module, &info, Some((stage, entry_point)), &constants)
+                        .expect("overrides should apply");
+                let options = glsl::Options {
+                    version: glsl::Version::Embedded { version: 300, is_webgl: true },
+                    ..Default::default()
+                };
+                let pipeline_options = glsl::PipelineOptions {
+                    shader_stage: stage,
+                    entry_point: entry_point.to_string(),
+                    multiview: None,
+                };
+                let mut out = String::new();
+                glsl::Writer::new(&mut out, &module, &info, &options, &pipeline_options, Default::default())
+                    .and_then(|mut writer| writer.write())
+                    .unwrap_or_else(|error| panic!("{entry_point} with ELLIPTICAL_MASKS = {elliptical_masks}: {error}"));
+            }
+        }
     }
 
     #[test]
-    fn webgl_quad_layout_matches_fixed_decoder() {
+    fn webgl_record_sizes_match_shader_word_strides() {
+        assert_eq!(std::mem::size_of::<QuadRecord>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<ShadowRecord>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PathVertexRecord>(), 6 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);
+        assert_eq!(std::mem::size_of::<UnderlineRecord>(), 12 * 4);
+        assert_eq!(std::mem::size_of::<SpriteRecord>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSpriteRecord>(), 16 * 4);
+    }
+
+    #[test]
+    fn webgl_quad_record_matches_fixed_decoder() {
         let quad = Quad {
             order: 41,
             border_style: BorderStyle::Dashed,
@@ -5038,6 +6000,22 @@ mod tests {
                     top_right: 91.0.into(),
                     bottom_right: 92.0.into(),
                     bottom_left: 93.0.into(),
+                },
+                rounded_bounds: Bounds {
+                    origin: Point {
+                        x: 94.0.into(),
+                        y: 95.0.into(),
+                    },
+                    size: Size {
+                        width: 96.0.into(),
+                        height: 97.0.into(),
+                    },
+                },
+                corner_radii_y: Corners {
+                    top_left: 98.0.into(),
+                    top_right: 99.0.into(),
+                    bottom_right: 100.0.into(),
+                    bottom_left: 101.0.into(),
                 },
             },
             background: linear_gradient(
@@ -5093,67 +6071,57 @@ mod tests {
             corner_shapes: [0; 2],
         };
 
-        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };
+        let mut tables = InstanceTables::default();
+        let record = tables.quad(&quad);
+        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&record)) };
         let words: &[u32] = bytemuck::cast_slice(bytes);
+        let f = |value: f32| value.to_bits();
+        // Dashed, a linear gradient (tag 1), Oklab, a border and elliptical corners.
+        let flags = 1 | 1 << 1 | 1 << 4 | 1 << 5 | 1 << 6;
         assert_eq!(
             words,
             &[
-                41,
-                1,
-                1.0_f32.to_bits(),
-                2.0_f32.to_bits(),
-                3.0_f32.to_bits(),
-                4.0_f32.to_bits(),
-                5.0_f32.to_bits(),
-                6.0_f32.to_bits(),
-                7.0_f32.to_bits(),
-                8.0_f32.to_bits(),
-                90.0_f32.to_bits(),
-                91.0_f32.to_bits(),
-                92.0_f32.to_bits(),
-                93.0_f32.to_bits(),
-                1,
-                1,
+                f(1.0),
+                f(2.0),
+                f(3.0),
+                f(4.0),
+                f(26.0),
+                f(27.0),
+                f(28.0),
+                f(29.0),
                 0,
                 0,
                 0,
                 0,
-                11.0_f32.to_bits(),
-                12.0_f32.to_bits(),
-                13.0_f32.to_bits(),
-                14.0_f32.to_bits(),
-                15.0_f32.to_bits(),
-                16.0_f32.to_bits(),
-                17.0_f32.to_bits(),
-                18.0_f32.to_bits(),
-                19.0_f32.to_bits(),
-                20.0_f32.to_bits(),
-                21.0_f32.to_bits(),
-                0,
-                22.0_f32.to_bits(),
-                23.0_f32.to_bits(),
-                24.0_f32.to_bits(),
-                25.0_f32.to_bits(),
-                26.0_f32.to_bits(),
-                27.0_f32.to_bits(),
-                28.0_f32.to_bits(),
-                29.0_f32.to_bits(),
-                40.0_f32.to_bits(),
-                41.0_f32.to_bits(),
-                42.0_f32.to_bits(),
-                43.0_f32.to_bits(),
-                30.0_f32.to_bits(),
-                31.0_f32.to_bits(),
-                32.0_f32.to_bits(),
-                33.0_f32.to_bits(),
-                34.0_f32.to_bits(),
-                35.0_f32.to_bits(),
-                36.0_f32.to_bits(),
-                37.0_f32.to_bits(),
-                38.0_f32.to_bits(),
-                39.0_f32.to_bits(),
-                0,
-                0,
+                flags,
+                2 | gpui::MASK_ELLIPTICAL,
+                6,
+                8,
+            ]
+        );
+        let texels: Vec<[u32; 4]> = tables
+            .texels()
+            .iter()
+            .map(|texel| texel.map(f32::to_bits))
+            .collect();
+        assert_eq!(
+            texels,
+            [
+                [f(1.0), 0, 0, f(1.0)],
+                [0, 0, 0, 0],
+                [f(5.0), f(6.0), f(7.0), f(8.0)],
+                [f(90.0), f(91.0), f(92.0), f(93.0)],
+                [f(94.0), f(95.0), f(96.0), f(97.0)],
+                [f(98.0), f(99.0), f(100.0), f(101.0)],
+                [f(34.0), f(35.0), f(36.0), f(37.0)],
+                [f(38.0), f(39.0), 0, 0],
+                [f(30.0), f(31.0), f(32.0), f(33.0)],
+                [f(22.0), f(23.0), f(24.0), f(25.0)],
+                [f(40.0), f(41.0), f(42.0), f(43.0)],
+                [f(11.0), 0, f(15.0), 0],
+                [f(12.0), f(13.0), f(14.0), f(15.0)],
+                [f(17.0), f(18.0), f(19.0), f(20.0)],
+                [f(16.0), f(21.0), 0, 0],
             ]
         );
     }

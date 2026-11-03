@@ -97,6 +97,10 @@ struct GammaParams {
 @group(2) @binding(1) var s_sprite: sampler;
 
 const M_PI_F: f32 = 3.1415926;
+// Whether a pipeline may meet elliptical content masks (`corner_radii_y`). Each pipeline that
+// reads masks is made twice: most scenes draw with the variant where this is false, whose code
+// has no elliptical path; a scene with an elliptical mask uses the one where it is true.
+override ELLIPTICAL_MASKS: bool = true;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
 struct Bounds {
@@ -114,6 +118,9 @@ struct Corners {
 struct ContentMask {
     bounds: Bounds,
     corner_radii: Corners,
+    rounded_bounds: Bounds,
+    // Each corner's vertical radius; zero where the corner is circular.
+    corner_radii_y: Corners,
 }
 
 struct Edges {
@@ -428,11 +435,6 @@ fn pick_corner_radii_xy(center_to_point: vec2<f32>, x: Corners, y: Corners) -> v
 // A corner's (rx, ry), or (0, 0) when either is zero (a square corner).
 fn corner_pair(x: f32, y: f32) -> vec2<f32> {
     return select(vec2<f32>(x, y), vec2<f32>(0.0), x <= 0.0 || y <= 0.0);
-}
-
-// The length of a quarter ellipse of radii `r` (Ramanujan's approximation; exact for a circle).
-fn quarter_arc_length(r: vec2<f32>) -> f32 {
-    return (M_PI_F / 4.0) * (3.0 * (r.x + r.y) - sqrt((3.0 * r.x + r.y) * (r.x + 3.0 * r.y)));
 }
 
 // Each corner's circle of the smaller radius: what dashed borders lay out around (an
@@ -1141,145 +1143,41 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 dash_velocity = dv_numerator / border_width;
                 t = select(point.y, point.x, is_horizontal) * dash_velocity;
                 max_t = select(size.y, size.x, is_horizontal) * dash_velocity;
-            } else {
-                // When corners are rounded, the dashes are laid out clockwise
-                // around the whole perimeter.
 
-                // Each corner's (rx, ry): an elliptical corner's dashes follow its arc.
-                let r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
-                let r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
-                let r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
-                let r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+                let dash_length = dash_length_per_width / dash_period_per_width;
+                let desired_dash_gap = dash_gap_per_width / dash_period_per_width;
 
-                let w_t = quad.border_widths.top;
-                let w_r = quad.border_widths.right;
-                let w_b = quad.border_widths.bottom;
-                let w_l = quad.border_widths.left;
-
-                // Straight side dash velocities
-                let dv_t = select(dv_numerator / w_t, 0.0, w_t <= 0.0);
-                let dv_r = select(dv_numerator / w_r, 0.0, w_r <= 0.0);
-                let dv_b = select(dv_numerator / w_b, 0.0, w_b <= 0.0);
-                let dv_l = select(dv_numerator / w_l, 0.0, w_l <= 0.0);
-
-                // Straight side lengths in dash space
-                let s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
-                let s_r = (size.y - r_tr.y - r_br.y) * dv_r;
-                let s_b = (size.x - r_br.x - r_bl.x) * dv_b;
-                let s_l = (size.y - r_bl.y - r_tl.y) * dv_l;
-
-                let corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
-                let corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
-                let corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
-                let corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
-
-                // Corner lengths in dash space
-                let c_tr = quarter_arc_length(r_tr) * corner_dash_velocity_tr;
-                let c_br = quarter_arc_length(r_br) * corner_dash_velocity_br;
-                let c_bl = quarter_arc_length(r_bl) * corner_dash_velocity_bl;
-                let c_tl = quarter_arc_length(r_tl) * corner_dash_velocity_tl;
-
-                // Cumulative dash space upto each segment
-                let upto_tr = s_t;
-                let upto_r = upto_tr + c_tr;
-                let upto_br = upto_r + s_r;
-                let upto_b = upto_br + c_br;
-                let upto_bl = upto_b + s_b;
-                let upto_l = upto_bl + c_bl;
-                let upto_tl = upto_l + s_l;
-                max_t = upto_tl + c_tl;
-
-                if (is_near_rounded_corner) {
-                    // The angle in the corner's unit circle (an ellipse's parameter), spread over its arc.
-                    let radians = atan2(corner_center_to_point.y / max(corner_radii_xy.y, 1e-4),
-                                        corner_center_to_point.x / max(corner_radii_xy.x, 1e-4));
-                    let corner_t = select(radians * quarter_arc_length(corner_radii_xy) / (M_PI_F / 2.0),
-                                          radians * corner_radius,
-                                          corner_radii_xy.x == corner_radii_xy.y);
-
-                    if (center_to_point.x >= 0.0) {
-                        if (center_to_point.y < 0.0) {
-                            dash_velocity = corner_dash_velocity_tr;
-                            // Subtracted because radians is pi/2 to 0 when
-                            // going clockwise around the top right corner,
-                            // since the y axis has been flipped
-                            t = upto_r - corner_t * dash_velocity;
-                        } else {
-                            dash_velocity = corner_dash_velocity_br;
-                            // Added because radians is 0 to pi/2 when going
-                            // clockwise around the bottom-right corner
-                            t = upto_br + corner_t * dash_velocity;
-                        }
-                    } else {
-                        if (center_to_point.y >= 0.0) {
-                            dash_velocity = corner_dash_velocity_bl;
-                            // Subtracted because radians is pi/2 to 0 when
-                            // going clockwise around the bottom-left corner,
-                            // since the x axis has been flipped
-                            t = upto_l - corner_t * dash_velocity;
-                        } else {
-                            dash_velocity = corner_dash_velocity_tl;
-                            // Added because radians is 0 to pi/2 when going
-                            // clockwise around the top-left corner, since both
-                            // axis were flipped
-                            t = upto_tl + corner_t * dash_velocity;
-                        }
-                    }
-                } else {
-                    // Straight borders
-                    let is_horizontal =
-                            corner_center_to_point.x <
-                            corner_center_to_point.y;
-                    if (is_horizontal) {
-                        if (center_to_point.y < 0.0) {
-                            dash_velocity = dv_t;
-                            t = (point.x - r_tl.x) * dash_velocity;
-                        } else {
-                            dash_velocity = dv_b;
-                            t = upto_bl - (point.x - r_bl.x) * dash_velocity;
-                        }
-                    } else {
-                        if (center_to_point.x < 0.0) {
-                            dash_velocity = dv_l;
-                            t = upto_tl - (point.y - r_tl.y) * dash_velocity;
-                        } else {
-                            dash_velocity = dv_r;
-                            t = upto_r + (point.y - r_tr.y) * dash_velocity;
-                        }
-                    }
-                }
-            }
-
-            let dash_length = dash_length_per_width / dash_period_per_width;
-            let desired_dash_gap = dash_gap_per_width / dash_period_per_width;
-
-            // Straight borders should start and end with a dash, so max_t is
-            // reduced to cause this.
-            max_t -= select(0.0, dash_length, unrounded);
-            if (max_t >= 1.0) {
-                // Adjust dash gap to evenly divide max_t.
-                let dash_count = floor(max_t);
-                let dash_period = max_t / dash_count;
-                border_color.a *= dash_alpha(
-                    t,
-                    dash_period,
-                    dash_length,
-                    dash_velocity,
-                    antialias_threshold);
-            } else if (unrounded) {
-                // When there isn't enough space for the full gap between the
-                // two start / end dashes of a straight border, reduce gap to
-                // make them fit.
-                let dash_gap = max_t - dash_length;
-                if (dash_gap > 0.0) {
-                    let dash_period = dash_length + dash_gap;
+                // Straight borders should start and end with a dash, so max_t is
+                // reduced to cause this.
+                max_t -= dash_length;
+                if (max_t >= 1.0) {
+                    // Adjust dash gap to evenly divide max_t.
+                    let dash_count = floor(max_t);
+                    let dash_period = max_t / dash_count;
                     border_color.a *= dash_alpha(
                         t,
                         dash_period,
                         dash_length,
                         dash_velocity,
                         antialias_threshold);
+                } else {
+                    // When there isn't enough space for the full gap between the
+                    // two start / end dashes of a straight border, reduce gap to
+                    // make them fit.
+                    let dash_gap = max_t - dash_length;
+                    if (dash_gap > 0.0) {
+                        let dash_period = dash_length + dash_gap;
+                        border_color.a *= dash_alpha(
+                            t,
+                            dash_period,
+                            dash_length,
+                            dash_velocity,
+                            antialias_threshold);
+                    }
                 }
+            } else {
+                border_color.a *= rounded_dash_alpha(quad, point, size, center_to_point, corner_to_point,
+                    corner_center_to_point, is_near_rounded_corner, corner_radii_xy, antialias_threshold);
             }
         }
 
@@ -1293,22 +1191,120 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     return clip_output(blend_color(color, saturate(antialias_threshold - outer_sdf)), clip_alpha);
 }
 
-// Returns the dash velocity of a corner given the dash velocity of the two
-// sides, by returning the slower velocity (larger dashes).
-//
-// Since 0 is used for dash velocity when the border width is 0 (instead of
-// +inf), this returns the other dash velocity in that case.
-//
-// An alternative to this might be to appropriately interpolate the dash
-// velocity around the corner, but that seems overcomplicated.
-fn corner_dash_velocity(dv1: f32, dv2: f32) -> f32 {
-    if (dv1 == 0.0) {
-        return dv2;
-    } else if (dv2 == 0.0) {
-        return dv1;
+// The alpha of a rounded dashed border at `point` (from the quad's origin), as WebKit draws it
+// (`BorderPainter::drawBoxSideFromPath`). Each side strokes the outer edge's path, which starts
+// halfway down the straight part of the right edge and runs clockwise (down the right edge
+// first), with dashes three times the side's width and gaps as long. When the count of dashes
+// along the whole path is odd and not whole, each gap grows by a dash over half that count. The
+// pattern starts with a gap (a dash offset of one dash), and under four dashes the side is solid.
+// A pixel takes the position of the point of the outer edge nearest to it, and the pattern of the
+// side whose part of the border holds it: each corner splits along the line from the box's outer
+// corner to the border's inner corner.
+fn rounded_dash_alpha(
+    quad: Quad,
+    point: vec2<f32>,
+    size: vec2<f32>,
+    center_to_point: vec2<f32>,
+    corner_to_point: vec2<f32>,
+    corner_center_to_point: vec2<f32>,
+    is_near_rounded_corner: bool,
+    corner_radii_xy: vec2<f32>,
+    antialias_threshold: f32,
+) -> f32 {
+    let r_tr = corner_pair(quad.corner_radii.top_right, quad.corner_radii_y.top_right);
+    let r_br = corner_pair(quad.corner_radii.bottom_right, quad.corner_radii_y.bottom_right);
+    let r_bl = corner_pair(quad.corner_radii.bottom_left, quad.corner_radii_y.bottom_left);
+    let r_tl = corner_pair(quad.corner_radii.top_left, quad.corner_radii_y.top_left);
+    let q_tr = ellipse_arc_length(r_tr, M_PI_F / 2.0);
+    let q_br = ellipse_arc_length(r_br, M_PI_F / 2.0);
+    let q_bl = ellipse_arc_length(r_bl, M_PI_F / 2.0);
+    let q_tl = ellipse_arc_length(r_tl, M_PI_F / 2.0);
+
+    // Where each piece of the path starts, along it.
+    let start_y = (r_tr.y + size.y - r_br.y) / 2.0;
+    let at_br = size.y - r_br.y - start_y;
+    let at_b = at_br + q_br;
+    let at_bl = at_b + (size.x - r_br.x - r_bl.x);
+    let at_l = at_bl + q_bl;
+    let at_tl = at_l + (size.y - r_bl.y - r_tl.y);
+    let at_t = at_tl + q_tl;
+    let at_tr = at_t + (size.x - r_tl.x - r_tr.x);
+    let at_r = at_tr + q_tr;
+    let total = at_r + (start_y - r_tr.y);
+
+    let right = center_to_point.x >= 0.0;
+    let bottom = center_to_point.y >= 0.0;
+    var s = 0.0;
+    if (is_near_rounded_corner) {
+        let arc = ellipse_arc_length(corner_radii_xy,
+            ellipse_nearest_angle(corner_center_to_point, corner_radii_xy));
+        if (right) {
+            s = select(at_tr + q_tr - arc, at_br + arc, bottom);
+        } else {
+            s = select(at_tl + arc, at_bl + q_bl - arc, bottom);
+        }
+    } else if (corner_to_point.y > corner_to_point.x) {
+        // Nearest a horizontal edge.
+        s = select(at_t + (point.x - r_tl.x), at_b + (size.x - r_br.x - point.x), bottom);
+    } else if (right) {
+        s = select(at_r + (point.y - r_tr.y), point.y - start_y, point.y >= start_y);
     } else {
-        return min(dv1, dv2);
+        s = at_l + (size.y - r_bl.y - point.y);
     }
+
+    let from_corner = -corner_to_point;
+    let horizontal_width = select(quad.border_widths.top, quad.border_widths.bottom, bottom);
+    let vertical_width = select(quad.border_widths.left, quad.border_widths.right, right);
+    let width = select(vertical_width, horizontal_width,
+        from_corner.y * vertical_width < from_corner.x * horizontal_width);
+    let dash = 3.0 * width;
+    if (dash <= 0.0) {
+        return 1.0;
+    }
+    let count = total / dash;
+    if (count < 4.0) {
+        return 1.0;
+    }
+    var gap = dash;
+    if ((i32(count) & 1) == 1 && fract(count) > 0.0) {
+        gap += dash / (count / 2.0);
+    }
+    return dash_alpha(s + dash, dash + gap, dash, 1.0, antialias_threshold);
+}
+
+// The arc length of an ellipse of radii `r` from parametric angle 0 (the end of its horizontal
+// radius) to `t`: Simpson's rule over eight steps, exact for a circle.
+fn ellipse_arc_length(r: vec2<f32>, t: f32) -> f32 {
+    if (r.x == r.y) {
+        return r.x * t;
+    }
+    let h = t / 8.0;
+    var sum = 0.0;
+    for (var i = 0; i <= 8; i++) {
+        let a = h * f32(i);
+        let weight = select(select(2.0, 4.0, (i & 1) == 1), 1.0, i == 0 || i == 8);
+        sum += weight * length(vec2<f32>(r.x * sin(a), r.y * cos(a)));
+    }
+    return sum * h / 3.0;
+}
+
+// The parametric angle of the point of an ellipse of radii `r` (centered at the origin) nearest
+// to `p`, both components of `p` at least 0: where the ellipse's normal through `p` meets it. Three
+// iterations of the evolute method; exact for a circle.
+fn ellipse_nearest_angle(p: vec2<f32>, r: vec2<f32>) -> f32 {
+    if (r.x == r.y) {
+        return atan2(p.y, p.x);
+    }
+    var t = vec2<f32>(0.70710678);
+    for (var i = 0; i < 3; i++) {
+        let e = vec2<f32>((r.x * r.x - r.y * r.y) * t.x * t.x * t.x / r.x,
+                          (r.y * r.y - r.x * r.x) * t.y * t.y * t.y / r.y);
+        let q = p - e;
+        let scale = length(r * t - e) / max(length(q), 1e-4);
+        t = clamp((q * scale + e) / r, vec2<f32>(0.0), vec2<f32>(1.0));
+        t /= max(length(t), 1e-4);
+    }
+    return atan2(t.y, t.x);
 }
 
 // Returns alpha used to render antialiased dashes.
@@ -1497,6 +1493,8 @@ struct PathRasterizationVertex {
     color: Background,
     bounds: Bounds,
     content_mask: ContentMask,
+    // Where the path is drawn in the path atlas, from where it is drawn in the target.
+    atlas_offset: vec2<f32>,
 }
 
 
@@ -1514,7 +1512,8 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     let v = load_path_vertex(vertex_id);
 
     var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
+    // Drawn into its place in the path atlas (whose size is the viewport here).
+    out.position = to_device_position_impl(v.xy_position + v.atlas_offset);
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
@@ -1530,7 +1529,9 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     }
 
     let v = load_path_vertex(input.vertex_id);
-    let clip_alpha = content_mask_alpha(input.position.xy, v.content_mask);
+    // The pixel's position in the target, which the mask and the gradient are in.
+    let position = input.position.xy - v.atlas_offset;
+    let clip_alpha = content_mask_alpha(position, v.content_mask);
     let background = v.color;
     let bounds = v.bounds;
 
@@ -1550,7 +1551,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, position, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return (vec4<f32>(color.rgb * color.a * alpha, color.a * alpha)) * clip_alpha;
 }
@@ -1559,11 +1560,14 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    // Where the region is in the path atlas, from where it is drawn.
+    atlas_offset: vec2<f32>,
 }
 
 
 struct PathVarying {
     @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) atlas_offset: vec2<f32>,
 }
 
 @vertex
@@ -1573,14 +1577,14 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     // Don't apply content mask because it was already accounted for when rasterizing the path.
     var out = PathVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.atlas_offset = sprite.atlas_offset;
     return out;
 }
 
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
-    // The intermediate texture holds the paths at the target's pixels (it may be larger
-    // than the target, a group's image).
-    return textureLoad(t_sprite, vec2<i32>(input.position.xy), 0);
+    // The path atlas holds the region's pixels at a whole-pixel offset.
+    return textureLoad(t_sprite, vec2<i32>(input.position.xy + input.atlas_offset), 0);
 }
 
 // --- underlines --- //
@@ -1693,9 +1697,11 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
-    // The content mask (`ContentMask`): bounds, then corner radii.
+    // The content mask's rounded rectangle (`ContentMask::rounded_bounds`), then its corner
+    // radii; the square clip is `clip_distances`.
     @location(2) @interpolate(flat) mask_bounds: vec4<f32>,
     @location(4) @interpolate(flat) mask_radii: vec4<f32>,
+    @location(5) @interpolate(flat) mask_radii_y: vec4<f32>,
 }
 
 @vertex
@@ -1709,9 +1715,11 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
-    out.mask_bounds = vec4<f32>(sprite.content_mask.bounds.origin, sprite.content_mask.bounds.size);
+    out.mask_bounds = vec4<f32>(sprite.content_mask.rounded_bounds.origin, sprite.content_mask.rounded_bounds.size);
     let r = sprite.content_mask.corner_radii;
     out.mask_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
+    let ry = sprite.content_mask.corner_radii_y;
+    out.mask_radii_y = vec4<f32>(ry.top_left, ry.top_right, ry.bottom_right, ry.bottom_left);
     return out;
 }
 
@@ -1728,6 +1736,8 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let mask = ContentMask(
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_radii.x, input.mask_radii.y, input.mask_radii.z, input.mask_radii.w),
+        Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
+        Corners(input.mask_radii_y.x, input.mask_radii_y.y, input.mask_radii_y.z, input.mask_radii_y.w),
     );
     let clip_alpha = content_mask_alpha(input.position.xy, mask);
     return clip_output(blend_color(input.color, alpha_corrected), clip_alpha);
@@ -1874,6 +1884,7 @@ struct RetainedClip {
     t: vec2<f32>,
     half_size: vec2<f32>,
     radii: vec4<f32>, // top-left, top-right, bottom-right, bottom-left
+    radii_y: vec4<f32>, // vertical radii, the same order; zero is circular
 }
 
 struct RetainedShapesUniforms {
@@ -2090,14 +2101,21 @@ fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
         if c.half_size.x < 0.0 {
             return 0.0;
         }
-        let p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
-        let d = retained_rect_sdf(p, c.half_size, c.radii);
-        // The distance's gradient in clip space, then in device pixels.
+        var p = vec2<f32>(c.m.x * pos.x + c.m.z * pos.y, c.m.y * pos.x + c.m.w * pos.y) + c.t - c.half_size;
         let side = select(c.radii.xw, c.radii.yz, p.x >= 0.0);
         let radius = select(side.x, side.y, p.y >= 0.0);
-        let q = abs(p) - c.half_size + radius;
+        // An elliptical corner (a vertical radius; zero is circular) is its circle in a space
+        // whose y is scaled by rx / ry: a quadrant's distance depends on its own corner only.
+        let side_y = select(c.radii_y.xw, c.radii_y.yz, p.x >= 0.0);
+        let radius_y = select(side_y.x, side_y.y, p.y >= 0.0);
+        let k = select(1.0, radius / radius_y, radius > 0.0 && radius_y > 0.0);
+        p.y *= k;
+        let half_size = vec2<f32>(c.half_size.x, c.half_size.y * k);
+        let d = retained_rect_sdf(p, half_size, vec4<f32>(radius));
+        // The distance's gradient in clip space (through the y scale), then in device pixels.
+        let q = abs(p) - half_size + radius;
         var g = select(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), q.x > q.y), normalize(q), q.x > 0.0 && q.y > 0.0);
-        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0));
+        g *= vec2<f32>(select(1.0, -1.0, p.x < 0.0), select(1.0, -1.0, p.y < 0.0) * k);
         let per_px = length(vec2<f32>(c.m.x * g.x + c.m.y * g.y, c.m.z * g.x + c.m.w * g.y));
         // The intersection: the least covered clip (a product would darken shared edges).
         coverage = min(coverage, clamp(0.5 - d / max(per_px, 1e-30), 0.0, 1.0));
@@ -2160,15 +2178,27 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
 }
 
 // Coverage of a device pixel by a rounded content mask (an `overflow` clip that
-// follows a rounded border): 1 inside, antialiased over one pixel at the curve.
-// The rectangle itself is clipped by the clip distances; a square mask costs this
-// one test.
+// follows a rounded border): 1 inside, antialiased over one pixel at the curve of
+// the mask's rounded rectangle. The square clip (`bounds`) is the clip distances';
+// a square mask costs this one test.
 fn content_mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     let r = mask.corner_radii;
     if (r.top_left <= 0.0 && r.top_right <= 0.0 && r.bottom_right <= 0.0 && r.bottom_left <= 0.0) {
         return 1.0;
     }
-    return saturate(0.5 - quad_sdf(position, mask.bounds, r));
+    let y = mask.corner_radii_y;
+    if (!ELLIPTICAL_MASKS
+        || (y.top_left <= 0.0 && y.top_right <= 0.0 && y.bottom_right <= 0.0 && y.bottom_left <= 0.0)) {
+        return saturate(0.5 - quad_sdf(position, mask.rounded_bounds, r));
+    }
+    // Elliptical corners: a zero vertical radius is the corner's horizontal one (circular).
+    let ry = Corners(
+        select(r.top_left, y.top_left, y.top_left > 0.0),
+        select(r.top_right, y.top_right, y.top_right > 0.0),
+        select(r.bottom_right, y.bottom_right, y.bottom_right > 0.0),
+        select(r.bottom_left, y.bottom_left, y.bottom_left > 0.0),
+    );
+    return saturate(0.5 - quad_sdf_xy(position, mask.rounded_bounds, r, ry));
 }
 
 // A fragment's color with its content mask coverage applied, in the target's alpha
@@ -2178,4 +2208,243 @@ fn clip_output(color: vec4<f32>, clip: f32) -> vec4<f32> {
         return color * clip;
     }
     return vec4<f32>(color.rgb, color.a * clip);
+}
+
+// --- instance records (`gpui::InstanceTables`) --- //
+// Renderers upload a compact record per primitive and one table of texels per scene: its
+// distinct content masks (3 texels, and a 4th, the vertical radii, when the index has
+// MASK_ELLIPTICAL set), transformations (2 texels, the identity at texel 0) and
+// each primitive's aux record. The transports load records and table texels
+// (`load_*_record`, `load_table_texel`); `load_*` below expand them into the full layouts.
+
+struct QuadRecord {
+    bounds: Bounds,
+    corner_radii: Corners,
+    background: Hsla,
+    flags: u32,
+    content_mask: u32,
+    transformation: u32,
+    aux: u32,
+}
+
+struct ShadowRecord {
+    bounds: Bounds,
+    corner_radii: Corners,
+    color: Hsla,
+    element_bounds: Bounds,
+    element_corner_radii: Corners,
+    blur_radius: f32,
+    content_mask: u32,
+    transformation: u32,
+    // Bit 0: inset. Bits 1 and up: the vertical radii's texel, or 0.
+    info: u32,
+}
+
+struct UnderlineRecord {
+    bounds: Bounds,
+    color: Hsla,
+    thickness: f32,
+    wavy: u32,
+    content_mask: u32,
+    transformation: u32,
+}
+
+struct SpriteRecord {
+    tile_bounds: AtlasBounds,
+    bounds: Bounds,
+    color: Hsla,
+    content_mask: u32,
+    transformation: u32,
+    pad: vec2<u32>,
+}
+
+struct PolychromeSpriteRecord {
+    tile_bounds: AtlasBounds,
+    bounds: Bounds,
+    corner_radii: Corners,
+    opacity: f32,
+    content_mask: u32,
+    transformation: u32,
+    // Bit 0: exact scale. Bit 1: grayscale. Bits 2 and up: the vertical radii's texel, or 0.
+    info: u32,
+}
+
+struct PathVertexRecord {
+    xy_position: vec2<f32>,
+    st_position: vec2<f32>,
+    // The first texel of the path's record.
+    path: u32,
+    content_mask: u32,
+}
+
+// `gpui::QuadRecord::flags`.
+const QUAD_DASHED: u32 = 1u;
+const QUAD_BORDER: u32 = 32u;
+const QUAD_ELLIPTICAL: u32 = 64u;
+const QUAD_SHAPED: u32 = 128u;
+
+fn texel_bounds(texel: vec4<f32>) -> Bounds {
+    return Bounds(texel.xy, texel.zw);
+}
+
+fn texel_corners(texel: vec4<f32>) -> Corners {
+    return Corners(texel.x, texel.y, texel.z, texel.w);
+}
+
+fn texel_hsla(texel: vec4<f32>) -> Hsla {
+    return Hsla(texel.x, texel.y, texel.z, texel.w);
+}
+
+fn load_content_mask(index: u32) -> ContentMask {
+    let at = index & 0x7fffffffu;
+    // A circular mask has no fourth texel (`MASK_ELLIPTICAL`); circular pipelines compile it out.
+    var radii_y = vec4<f32>(0.0);
+    if ELLIPTICAL_MASKS && (index & 0x80000000u) != 0u {
+        radii_y = load_table_texel(at + 3u);
+    }
+    return ContentMask(
+        texel_bounds(load_table_texel(at)),
+        texel_corners(load_table_texel(at + 1u)),
+        texel_bounds(load_table_texel(at + 2u)),
+        texel_corners(radii_y),
+    );
+}
+
+fn load_transformation(index: u32) -> TransformationMatrix {
+    let rotation_scale = load_table_texel(index);
+    let translation = load_table_texel(index + 1u);
+    return TransformationMatrix(
+        mat2x2<f32>(rotation_scale.xy, rotation_scale.zw),
+        translation.xy,
+    );
+}
+
+// A background from its tag and color space (`flags`, bits 1-3 and 4), its solid color and,
+// unless solid, its block at `block`: the angle or pattern height, the gradient record and the
+// gradient's opacity, then a linear gradient's two stops.
+fn load_background(flags: u32, block: u32, solid: Hsla) -> Background {
+    var background: Background;
+    background.tag = (flags >> 1u) & 7u;
+    background.color_space = (flags >> 4u) & 1u;
+    background.solid = solid;
+    if (background.tag != 0u) {
+        let head = load_table_texel(block);
+        background.gradient_angle_or_pattern_height = head.x;
+        background.gradient = bitcast<u32>(head.y);
+        background.colors[0].color.a = head.z;
+        if (background.tag == 1u) {
+            background.colors[0].color = texel_hsla(load_table_texel(block + 1u));
+            background.colors[1].color = texel_hsla(load_table_texel(block + 2u));
+            let percentages = load_table_texel(block + 3u);
+            background.colors[0].percentage = percentages.x;
+            background.colors[1].percentage = percentages.y;
+        }
+    }
+    return background;
+}
+
+// A quad from its record (WebGL's transport; storage backends read whole quads, see
+// `shaders_storage.wgsl`).
+fn expand_quad_record(record: QuadRecord) -> Quad {
+    var quad: Quad;
+    quad.border_style = record.flags & QUAD_DASHED;
+    quad.bounds = record.bounds;
+    quad.content_mask = load_content_mask(record.content_mask);
+    quad.corner_radii = record.corner_radii;
+    quad.corner_radii_y = record.corner_radii;
+    quad.transformation = load_transformation(record.transformation);
+    var aux = record.aux;
+    if ((record.flags & QUAD_BORDER) != 0u) {
+        let widths = load_table_texel(aux);
+        quad.border_widths = Edges(widths.x, widths.y, widths.z, widths.w);
+        quad.border_color = texel_hsla(load_table_texel(aux + 1u));
+        aux += 2u;
+    }
+    if ((record.flags & QUAD_ELLIPTICAL) != 0u) {
+        quad.corner_radii_y = texel_corners(load_table_texel(aux));
+        aux += 1u;
+    }
+    if ((record.flags & QUAD_SHAPED) != 0u) {
+        quad.corner_shapes = bitcast<vec2<u32>>(load_table_texel(aux).xy);
+        aux += 1u;
+    }
+    quad.background = load_background(record.flags, aux, record.background);
+    return quad;
+}
+
+fn load_shadow(instance_id: u32) -> Shadow {
+    let record = load_shadow_record(instance_id);
+    var shadow: Shadow;
+    shadow.blur_radius = record.blur_radius;
+    shadow.bounds = record.bounds;
+    shadow.corner_radii = record.corner_radii;
+    shadow.corner_radii_y = record.corner_radii;
+    shadow.content_mask = load_content_mask(record.content_mask);
+    shadow.color = record.color;
+    shadow.element_bounds = record.element_bounds;
+    shadow.element_corner_radii = record.element_corner_radii;
+    shadow.element_corner_radii_y = record.element_corner_radii;
+    shadow.inset = record.info & 1u;
+    let aux = record.info >> 1u;
+    if (aux != 0u) {
+        shadow.corner_radii_y = texel_corners(load_table_texel(aux));
+        shadow.element_corner_radii_y = texel_corners(load_table_texel(aux + 1u));
+    }
+    shadow.transformation = load_transformation(record.transformation);
+    return shadow;
+}
+
+fn load_underline(instance_id: u32) -> Underline {
+    let record = load_underline_record(instance_id);
+    var underline: Underline;
+    underline.bounds = record.bounds;
+    underline.content_mask = load_content_mask(record.content_mask);
+    underline.color = record.color;
+    underline.thickness = record.thickness;
+    underline.wavy = record.wavy;
+    underline.transformation = load_transformation(record.transformation);
+    return underline;
+}
+
+fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
+    let record = load_mono_sprite_record(instance_id);
+    var sprite: MonochromeSprite;
+    sprite.tile.bounds = record.tile_bounds;
+    sprite.bounds = record.bounds;
+    sprite.content_mask = load_content_mask(record.content_mask);
+    sprite.color = record.color;
+    sprite.transformation = load_transformation(record.transformation);
+    return sprite;
+}
+
+fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
+    let record = load_poly_sprite_record(instance_id);
+    var sprite: PolychromeSprite;
+    sprite.exact_scale = record.info & 1u;
+    sprite.tile.bounds = record.tile_bounds;
+    sprite.grayscale = (record.info >> 1u) & 1u;
+    sprite.opacity = record.opacity;
+    sprite.bounds = record.bounds;
+    sprite.content_mask = load_content_mask(record.content_mask);
+    sprite.corner_radii = record.corner_radii;
+    sprite.corner_radii_y = record.corner_radii;
+    let aux = record.info >> 2u;
+    if (aux != 0u) {
+        sprite.corner_radii_y = texel_corners(load_table_texel(aux));
+    }
+    sprite.transformation = load_transformation(record.transformation);
+    return sprite;
+}
+
+fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
+    let record = load_path_vertex_record(vertex_id);
+    let info = load_table_texel(record.path + 2u);
+    return PathRasterizationVertex(
+        record.xy_position,
+        record.st_position,
+        load_background(bitcast<u32>(info.x), record.path + 3u, texel_hsla(load_table_texel(record.path + 1u))),
+        texel_bounds(load_table_texel(record.path)),
+        load_content_mask(record.content_mask),
+        info.yz,
+    );
 }

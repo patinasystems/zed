@@ -212,6 +212,26 @@ impl PlatformTextSystem for AppleTextSystem {
         self.0.write().font_id_for_postscript_name(postscript_name)
     }
 
+    fn font_id_for_postscript_name_with_variations(
+        &self,
+        postscript_name: &str,
+        variations: &[(u32, f32)],
+    ) -> Option<FontId> {
+        if variations.is_empty() {
+            return self.font_id_for_postscript_name(postscript_name);
+        }
+        let key = variation_key(postscript_name, variations);
+        if let Some(font_id) = self.0.read().font_ids_by_postscript_name.get(&key) {
+            return Some(*font_id);
+        }
+        let base = self.font_id_for_postscript_name(postscript_name)?;
+        Some(
+            self.0
+                .write()
+                .id_for_variations(base, postscript_name, key, variations),
+        )
+    }
+
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         font_kit_metrics_to_metrics(self.0.read().fonts[font_id.0].metrics())
     }
@@ -664,6 +684,51 @@ impl AppleTextSystemState {
         Some(self.id_for_native_font(font))
     }
 
+    /// The face `base` at `variations`, registered under `key`. Core Text instances the font
+    /// itself (`kCTFontVariationAttribute` on a copy of the face, not a descriptor resolved
+    /// again), so glyph ids stay the face's; the optical size still follows the drawn size
+    /// (`font_at_size` makes the font from its `CGFont`, which keeps the other axes).
+    fn id_for_variations(
+        &mut self,
+        base: FontId,
+        postscript_name: &str,
+        key: String,
+        variations: &[(u32, f32)],
+    ) -> FontId {
+        if let Some(font_id) = self.font_ids_by_postscript_name.get(&key) {
+            return *font_id;
+        }
+        let native = self.fonts[base.0].native_font();
+        let pairs: Vec<(CFNumber, CFNumber)> = variations
+            .iter()
+            .map(|&(tag, value)| (CFNumber::from(tag as i64), CFNumber::from(value as f64)))
+            .collect();
+        let coordinates = CFDictionary::from_CFType_pairs(&pairs);
+        let attribute = unsafe {
+            CFString::wrap_under_get_rule(core_text::font_descriptor::kCTFontVariationAttribute)
+        };
+        let attributes = core_text::font_descriptor::new_from_attributes(
+            &CFDictionary::from_CFType_pairs(&[(attribute, coordinates.as_CFType())]),
+        );
+        let instance = unsafe {
+            CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+                native.as_concrete_TypeRef(),
+                0.0,
+                std::ptr::null(),
+                attributes.as_concrete_TypeRef(),
+            ))
+        };
+        let font_id = FontId(self.fonts.len());
+        self.font_ids_by_postscript_name.insert(key, font_id);
+        self.postscript_names_by_font_id
+            .insert(font_id, postscript_name.to_string());
+        self.fonts
+            .push(font_kit::font::Font::from_core_graphics_font(
+                instance.copy_to_CGFont(),
+            ));
+        font_id
+    }
+
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
         let postscript_name = requested_font.postscript_name();
         if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
@@ -966,6 +1031,16 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
+/// The registry key of a face at variation coordinates: its PostScript name, then each axis
+/// tag and value (no PostScript name has a NUL).
+fn variation_key(postscript_name: &str, variations: &[(u32, f32)]) -> String {
+    let mut key = postscript_name.to_string();
+    for (tag, value) in variations {
+        key.push_str(&format!("\0{tag:08x}={}", value.to_bits()));
+    }
+    key
+}
+
 /// The `opsz` variation axis tag.
 const OPSZ: i64 = 0x6f70_737a;
 
@@ -1197,6 +1272,35 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_font_id_for_postscript_name_with_variations() {
+        let fonts = AppleTextSystem::new();
+        let wght = u32::from_be_bytes(*b"wght");
+        let regular = fonts.font_id_for_postscript_name(".SFNS-Regular").unwrap();
+        let at = |w: f32| {
+            fonts
+                .font_id_for_postscript_name_with_variations(".SFNS-Regular", &[(wght, w)])
+                .unwrap()
+        };
+        let (medium, heavy) = (at(500.), at(650.));
+        assert_ne!(medium, regular);
+        assert_eq!(at(500.), medium, "one face per instance");
+        assert_eq!(
+            fonts.font_id_for_postscript_name_with_variations(".SFNS-Regular", &[]),
+            Some(regular)
+        );
+        // The instance keeps the face's glyph ids and widens with the weight.
+        let h = fonts.glyph_for_char(regular, 'H').unwrap();
+        assert_eq!(fonts.glyph_for_char(medium, 'H'), Some(h));
+        let width = |id| fonts.advance(id, h).unwrap().width;
+        assert!(width(regular) < width(medium) && width(medium) < width(heavy));
+        assert!(
+            fonts
+                .font_id_for_postscript_name_with_variations("NoSuchFont-Regular", &[(wght, 500.)])
+                .is_none()
+        );
     }
 
     #[test]

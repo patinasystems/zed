@@ -38,6 +38,12 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+impl From<PaddedBool32> for bool {
+    fn from(value: PaddedBool32) -> Self {
+        value.0 != 0
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -587,7 +593,7 @@ impl Scene {
     /// further right and down: a group's scene moves to its own image's origin.
     fn translate(&mut self, offset: Point<ScaledPixels>) {
         let bounds = |b: &mut Bounds<ScaledPixels>| b.origin = b.origin + offset;
-        let mask = |m: &mut ContentMask<ScaledPixels>| m.bounds.origin = m.bounds.origin + offset;
+        let mask = |m: &mut ContentMask<ScaledPixels>| *m = m.translate(offset);
         // A transformation applied to content in window pixels, conjugated: content
         // moved by `offset`, transformed, lands `offset` from where it did.
         let conjugate = |t: &mut TransformationMatrix| {
@@ -1488,7 +1494,7 @@ impl BackdropFilter {
     /// The same filter moved by `offset` (bounds and content mask).
     pub fn translated(mut self, offset: Point<ScaledPixels>) -> Self {
         self.bounds.origin = self.bounds.origin + offset;
-        self.content_mask.bounds.origin = self.content_mask.bounds.origin + offset;
+        self.content_mask = self.content_mask.translate(offset);
         self
     }
 
@@ -2130,10 +2136,7 @@ impl OpenGroup {
             mask: None,
             masked_out: false,
             effects: GroupEffects {
-                content_mask: ContentMask {
-                    bounds,
-                    corner_radii: Corners::default(),
-                },
+                content_mask: ContentMask::from(bounds),
                 ..GroupEffects::default()
             },
             scene: Scene {
@@ -2977,7 +2980,9 @@ pub mod element_transformation_test_scene {
             corner_radii_y: Corners::default(),
             content_mask: full,
             color: color(1., 1., 0.),
-            element_bounds: bounds(40., 40., 12., 12.),
+            // Its element is 100 px left, off the scene (`box-shadow: 100px 0`): a drop shadow
+            // paints only outside its element (CSS Backgrounds 3 §7.1.1).
+            element_bounds: bounds(-60., 40., 12., 12.),
             element_corner_radii: Corners::default(),
             element_corner_radii_y: Corners::default(),
             inset: 0,
@@ -3893,9 +3898,8 @@ pub mod rounded_clip_test_scene {
             background: color(1., 1., 1.).into(),
             ..Default::default()
         });
-        let masks = MASKS.map(|[x, y, w, h]| ContentMask {
-            bounds: bounds(x, y, w, h),
-            corner_radii: Corners::all(ScaledPixels(RADIUS)),
+        let masks = MASKS.map(|[x, y, w, h]| {
+            ContentMask::rounded(bounds(x, y, w, h), Corners::all(ScaledPixels(RADIUS)))
         });
         // Each primitive overfills its mask by 4 px on every side.
         let over = |m: &ContentMask<ScaledPixels>| {
@@ -3921,7 +3925,13 @@ pub mod rounded_clip_test_scene {
             corner_radii_y: Corners::default(),
             content_mask: masks[1],
             color: color(0., 1., 0.),
-            element_bounds: over(&masks[1]),
+            // The element sits off the scene (`box-shadow: 0 100px`): a drop shadow paints only
+            // outside its element (CSS Backgrounds 3 §7.1.1), so here only the mask clips it.
+            element_bounds: {
+                let mut element = over(&masks[1]);
+                element.origin.y.0 -= 100.;
+                element
+            },
             element_corner_radii: Corners::default(),
             element_corner_radii_y: Corners::default(),
             inset: 0,
@@ -4388,6 +4398,100 @@ pub mod elliptical_dashes_test_scene {
     }
 }
 
+/// Rounded dashed borders where WebKit draws their dashes: a 100 x 100 circle and a 200 x 100 box
+/// with 20 px corners, each with a 4 px dashed black border. The expected dashes and gaps are
+/// WebKit's (Playwright WebKit on macOS at 2x, measured along the outer edge from halfway down the
+/// right edge, clockwise).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod rounded_dashes_test_scene {
+    use super::*;
+    use crate::{Rgba, size};
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (240, 240);
+
+    /// Each box: its bounds `[x, y, w, h]` and corner radius.
+    const BOXES: [([f32; 4], f32); 2] = [([10., 10., 100., 100.], 50.), ([10., 120., 200., 100.], 20.)];
+
+    /// Positions along each box's outer edge at the middle of a WebKit dash (`true`) or gap.
+    const EXPECTED: [&[(f32, bool)]; 2] = [
+        &[(6., false), (18., true), (30., false), (42., true), (54., false), (66., true), (162., true), (174., false), (306., true)],
+        &[(2., false), (6., false), (18.2, true), (30.7, false), (43., true), (55.5, false), (67.7, true), (80., false), (92.2, true), (104.4, false), (264., true), (276., false), (532.8, true)],
+    ];
+
+    pub fn scene() -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let color = |v: f32| -> Hsla { Rgba { r: v, g: v, b: v, a: 1. }.into() };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad { bounds: full.bounds, content_mask: full, background: color(1.).into(), ..Default::default() });
+        let b = ScaledPixels(4.);
+        for ([x, y, w, h], r) in BOXES {
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(point(ScaledPixels(x), ScaledPixels(y)), size(ScaledPixels(w), ScaledPixels(h))),
+                content_mask: full,
+                background: color(1.).into(),
+                border_color: color(0.),
+                border_style: BorderStyle::Dashed,
+                corner_radii: Corners::all(ScaledPixels(r)),
+                corner_radii_y: Corners::all(ScaledPixels(r)),
+                border_widths: Edges { top: b, right: b, bottom: b, left: b },
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// The point of a box's outer edge `s` along it (from halfway down the right edge, clockwise)
+    /// and the inward normal there.
+    fn along([x, y, w, h]: [f32; 4], r: f32, mut s: f32) -> ([f32; 2], [f32; 2]) {
+        use std::f32::consts::FRAC_PI_2;
+        let arc = |cx: f32, cy: f32, a0: f32, s: f32| {
+            let a = a0 + s / r;
+            ([cx + r * a.cos(), cy + r * a.sin()], [-a.cos(), -a.sin()])
+        };
+        let (side_v, side_h, quarter) = (h - 2. * r, w - 2. * r, r * FRAC_PI_2);
+        let pieces: [(f32, &dyn Fn(f32) -> ([f32; 2], [f32; 2])); 9] = [
+            (side_v / 2., &|s| ([x + w, y + h / 2. + s], [-1., 0.])),
+            (quarter, &|s| arc(x + w - r, y + h - r, 0., s)),
+            (side_h, &|s| ([x + w - r - s, y + h], [0., -1.])),
+            (quarter, &|s| arc(x + r, y + h - r, FRAC_PI_2, s)),
+            (side_v, &|s| ([x, y + h - r - s], [1., 0.])),
+            (quarter, &|s| arc(x + r, y + r, 2. * FRAC_PI_2, s)),
+            (side_h, &|s| ([x + r + s, y], [0., 1.])),
+            (quarter, &|s| arc(x + w - r, y + r, 3. * FRAC_PI_2, s)),
+            (side_v / 2., &|s| ([x + w, y + r + s], [-1., 0.])),
+        ];
+        for (len, at) in pieces {
+            if s <= len {
+                return at(s);
+            }
+            s -= len;
+        }
+        pieces[8].1(pieces[8].0)
+    }
+
+    /// Checks each expected dash and gap at the border's mid-depth; panics with every miss.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let mut misses = Vec::new();
+        for ((rect, r), expected) in BOXES.into_iter().zip(EXPECTED) {
+            for &(s, dash) in expected {
+                let (p, n) = along(rect, r, s);
+                let (px, py) = (p[0] + n[0] * 2., p[1] + n[1] * 2.);
+                let v = pixel(px as u32, py as u32)[0];
+                if (dash && v > 80) || (!dash && v < 180) {
+                    misses.push(format!("box {rect:?} at {s} ({px:.1}, {py:.1}): expected {}, red {v}", if dash { "a dash" } else { "a gap" }));
+                }
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+}
+
 /// Shadows of an oval (rx 32, ry 18): sharp, and blurred.
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 #[doc(hidden)]
@@ -4398,7 +4502,13 @@ pub mod elliptical_shadow_test_scene {
     /// The scene's size in device pixels.
     pub const SIZE: (i32, i32) = (80, 100);
 
-    /// A black shadow of a 64 x 36 oval at (8, 8) with no blur, and one at (8, 56) with a blur of 4.
+    /// How far right of its shadow each oval element sits (`box-shadow: -40px 0 ...`). A drop
+    /// shadow paints only outside its element (CSS Backgrounds 3 §7.1.1), so a shadow that its
+    /// own element covered would show nothing.
+    pub const ELEMENT_OFFSET: f32 = 40.;
+
+    /// A black shadow of a 64 x 36 oval at (8, 8) with no blur, and one at (8, 56) with a blur of 4,
+    /// each cast by an oval element 40 px to its right.
     pub fn scene() -> Scene {
         let full = ContentMask::from(Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
@@ -4415,6 +4525,7 @@ pub mod elliptical_shadow_test_scene {
         });
         for (y, blur) in [(8., 0.), (56., 4.)] {
             let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(y)), size(ScaledPixels(64.), ScaledPixels(36.)));
+            let element_bounds = Bounds::new(point(ScaledPixels(8. + ELEMENT_OFFSET), ScaledPixels(y)), bounds.size);
             scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: ScaledPixels(blur),
@@ -4423,7 +4534,7 @@ pub mod elliptical_shadow_test_scene {
                 corner_radii_y: Corners::all(ScaledPixels(18.)),
                 content_mask: full,
                 color: black,
-                element_bounds: bounds,
+                element_bounds,
                 element_corner_radii: Corners::all(ScaledPixels(32.)),
                 element_corner_radii_y: Corners::all(ScaledPixels(18.)),
                 inset: 0,
@@ -4452,6 +4563,12 @@ pub mod elliptical_shadow_test_scene {
         assert!(corner > edge + 40, "blurred corner {corner} against center {edge}");
         // A sharp circle of radius 32 would reach (40, 8 + 4): the oval's top edge at x = 40 is y = 8.
         assert!(at(40, 10) < 60, "the oval's top edge is shadowed: {}", at(40, 10));
+        // Under the element (an oval centered at (80, 26)) the shadow is clipped away, though
+        // (64, 26) is inside the shadow's oval too. Left of the element's tip (x = 48) it stays.
+        assert!(at(64, 26) > 235, "no shadow under its element: {}", at(64, 26));
+        assert!(at(44, 26) < 20, "shadowed left of the element's tip: {}", at(44, 26));
+        // (52, 12) is inside the element's box but outside its oval: the clip is the oval, not the box.
+        assert!(at(52, 12) < 20, "the clip follows the element's oval: {}", at(52, 12));
     }
 }
 

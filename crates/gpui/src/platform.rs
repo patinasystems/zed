@@ -1552,6 +1552,18 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id_for_postscript_name(&self, _postscript_name: &str) -> Option<FontId> {
         None
     }
+    /// The face [`Self::font_id_for_postscript_name`] finds, at the variation coordinates
+    /// `variations` (OpenType axis tag, user value): a variable font's instance between its
+    /// named ones (CSS `font-weight: 450`, `font-variation-settings`). Its glyph ids are the
+    /// face's. Axes the face lacks are ignored. Platforms that cannot instance a face return
+    /// the face itself.
+    fn font_id_for_postscript_name_with_variations(
+        &self,
+        postscript_name: &str,
+        _variations: &[(u32, f32)],
+    ) -> Option<FontId> {
+        self.font_id_for_postscript_name(postscript_name)
+    }
     /// The weight and style of the face `font_id` names, which may differ from the descriptor
     /// that asked for it (the closest face a family has). `None`: the system does not say.
     fn font_weight_and_style(&self, _font_id: FontId) -> Option<(crate::FontWeight, crate::FontStyle)> {
@@ -1853,7 +1865,8 @@ pub trait PlatformAtlas {
 
     /// Copies `source` into external texture `id` on the GPU, from its
     /// top-left corner. Which sources a platform takes is its own: the web
-    /// takes `web_sys::{OffscreenCanvas, HtmlCanvasElement, ImageBitmap}`.
+    /// takes `web_sys::{OffscreenCanvas, HtmlCanvasElement, ImageBitmap, HtmlVideoElement}`
+    /// (a video's current frame).
     fn copy_to_external_texture(
         &self,
         _id: ExternalTextureId,
