@@ -16,9 +16,10 @@ use crate::{Bounds, ContentMask, Corners, DrawOrder, ScaledPixels, Transformatio
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::{
+    any::Any,
     ops::Range,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -89,6 +90,38 @@ pub fn rgba8(color: crate::Rgba) -> u32 {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Storage for a buffer's instances that the GPU reads in place: on unified
+/// memory (Apple silicon) a shared-storage Metal buffer, so each instance has
+/// one copy at rest instead of a CPU copy plus a GPU copy. A platform installs
+/// a maker with [`set_retained_storage`]; buffers made before that, or where it
+/// makes none, keep their instances in a `Vec` and renderers upload copies.
+///
+/// # Safety
+///
+/// [`RetainedStorage::as_mut_ptr`] points at [`RetainedStorage::capacity`]
+/// instances that stay valid, aligned and exclusive to this storage for its
+/// whole life.
+pub unsafe trait RetainedStorage: Send + 'static {
+    /// The first instance.
+    fn as_mut_ptr(&self) -> *mut ShapeInstance;
+    /// How many instances fit.
+    fn capacity(&self) -> usize;
+    /// For the renderer that made it, to find its GPU handle.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Makes storage for `capacity` instances, or `None` to keep them in a `Vec`.
+pub type RetainedStorageMaker = fn(capacity: usize) -> Option<Box<dyn RetainedStorage>>;
+
+static STORAGE_MAKER: OnceLock<RetainedStorageMaker> = OnceLock::new();
+
+/// Installs the maker every [`RetainedShapes`] allocates its storage with from
+/// now on (the first call wins). The Metal renderer installs one that makes
+/// shared-storage buffers on its device.
+pub fn set_retained_storage(maker: RetainedStorageMaker) {
+    let _ = STORAGE_MAKER.set(maker);
+}
+
 /// The CPU side of a retained instance buffer. Clones share the buffer.
 #[derive(Clone)]
 pub struct RetainedShapes {
@@ -96,8 +129,87 @@ pub struct RetainedShapes {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// Where the instances live.
+enum Store {
+    /// A CPU copy; renderers keep their own GPU copy.
+    Vec(Vec<ShapeInstance>),
+    /// Storage the GPU reads in place ([`RetainedStorage`]): the only copy.
+    Shared {
+        storage: Box<dyn RetainedStorage>,
+        len: usize,
+    },
+}
+
+impl Store {
+    /// Storage for `capacity` instances: shared when a maker is installed and
+    /// makes one, else a `Vec`.
+    fn with_capacity(capacity: usize) -> Store {
+        if capacity == 0 {
+            return Store::Vec(Vec::new());
+        }
+        match STORAGE_MAKER.get().and_then(|make| make(capacity)) {
+            Some(storage) => Store::Shared { storage, len: 0 },
+            None => Store::Vec(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Store::Vec(v) => v.len(),
+            Store::Shared { len, .. } => *len,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Store::Vec(v) => v.capacity(),
+            Store::Shared { storage, .. } => storage.capacity(),
+        }
+    }
+
+    fn as_slice(&self) -> &[ShapeInstance] {
+        match self {
+            Store::Vec(v) => v,
+            // SAFETY: `RetainedStorage`'s contract; the first `len` are written.
+            Store::Shared { storage, len } => unsafe {
+                std::slice::from_raw_parts(storage.as_mut_ptr(), *len)
+            },
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [ShapeInstance] {
+        match self {
+            Store::Vec(v) => v,
+            // SAFETY: as above, and `&mut self` makes the access exclusive.
+            Store::Shared { storage, len } => unsafe {
+                std::slice::from_raw_parts_mut(storage.as_mut_ptr(), *len)
+            },
+        }
+    }
+
+    /// Appends `values`; the caller made room.
+    fn append(&mut self, values: &[ShapeInstance]) {
+        match self {
+            Store::Vec(v) => v.extend_from_slice(values),
+            Store::Shared { storage, len } => {
+                debug_assert!(*len + values.len() <= storage.capacity());
+                // SAFETY: in capacity (the caller grew it), and past what any
+                // draw reads, so frames in flight never see these writes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr(),
+                        storage.as_mut_ptr().add(*len),
+                        values.len(),
+                    );
+                }
+                *len += values.len();
+            }
+        }
+    }
+}
+
 struct Inner {
-    instances: Vec<ShapeInstance>,
+    store: Store,
     /// Bumps on every write.
     version: u64,
     /// Ranges written since version `dirty_since`. A renderer whose copy is at
@@ -132,12 +244,12 @@ impl std::fmt::Debug for RetainedShapes {
 }
 
 impl RetainedShapes {
-    /// An empty buffer with a fresh id.
+    /// An empty buffer with a fresh id. It allocates nothing until written.
     pub fn new() -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::new(Mutex::new(Inner {
-                instances: Vec::new(),
+                store: Store::Vec(Vec::new()),
                 version: 1,
                 dirty: Vec::new(),
                 dirty_since: 0,
@@ -157,7 +269,7 @@ impl RetainedShapes {
 
     /// Number of instances.
     pub fn len(&self) -> usize {
-        self.inner.lock().instances.len()
+        self.inner.lock().store.len()
     }
 
     /// True when there are no instances.
@@ -165,17 +277,82 @@ impl RetainedShapes {
         self.len() == 0
     }
 
-    /// Replace every instance. Renderers upload the whole buffer.
+    /// How many instances fit before the storage is replaced.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().store.capacity()
+    }
+
+    /// Whether the instances live in storage the GPU reads in place
+    /// ([`RetainedStorage`]), with no CPU copy.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.inner.lock().store, Store::Shared { .. })
+    }
+
+    /// Replace every instance. Renderers upload the whole buffer. The storage
+    /// is new and sized to `instances` exactly, so frames in flight keep
+    /// drawing the old one.
     pub fn set_all(&self, instances: Vec<ShapeInstance>) {
+        let mut store = Store::with_capacity(instances.len());
+        match &mut store {
+            Store::Vec(_) => store = Store::Vec(instances),
+            Store::Shared { .. } => store.append(&instances),
+        }
+        self.install(store);
+    }
+
+    /// Replace every instance with those `fill` appends, in new storage of
+    /// `capacity` instances (at least what `fill` appends): no CPU copy is made
+    /// on the way when the storage is shared. Renderers upload the whole buffer.
+    pub fn set_all_with(&self, capacity: usize, fill: impl FnOnce(&mut RetainedAppend<'_>)) {
+        let mut store = Store::with_capacity(capacity);
+        fill(&mut RetainedAppend { store: &mut store });
+        self.install(store);
+    }
+
+    fn install(&self, store: Store) {
         let mut inner = self.inner.lock();
-        inner.instances = instances;
+        inner.store = store;
         inner.version += 1;
         inner.dirty.clear();
         // No renderer can use ranges against the old contents.
         inner.dirty_since = 0;
     }
 
+    /// Room for `additional` more instances past the length, exactly: storage
+    /// that is too small is replaced by storage of `len + additional` (frames in
+    /// flight keep drawing the old one). The caller picks the growth policy.
+    pub fn reserve_exact(&self, additional: usize) {
+        let mut inner = self.inner.lock();
+        let len = inner.store.len();
+        if inner.store.capacity() >= len + additional {
+            return;
+        }
+        if let Store::Vec(v) = &mut inner.store {
+            v.reserve_exact(additional);
+            return;
+        }
+        let mut store = Store::with_capacity(len + additional);
+        store.append(inner.store.as_slice());
+        inner.store = store;
+    }
+
+    /// Appends `values` past the length and returns where they start.
+    /// Renderers upload the new range. Storage too small grows to exactly fit
+    /// ([`RetainedShapes::reserve_exact`] first to pick the room).
+    pub fn extend(&self, values: &[ShapeInstance]) -> usize {
+        self.reserve_exact(values.len());
+        let mut inner = self.inner.lock();
+        let start = inner.store.len();
+        if !values.is_empty() {
+            inner.store.append(values);
+            inner.mark(start..start + values.len());
+        }
+        start
+    }
+
     /// Overwrite instances starting at `start`. Renderers upload this range.
+    /// Shared storage is written in place: a frame the GPU is drawing may
+    /// already see the new values.
     ///
     /// Panics if the range is out of bounds.
     pub fn write(&self, start: usize, values: &[ShapeInstance]) {
@@ -183,39 +360,88 @@ impl RetainedShapes {
             return;
         }
         let mut inner = self.inner.lock();
-        inner.instances[start..start + values.len()].copy_from_slice(values);
+        inner.store.as_mut_slice()[start..start + values.len()].copy_from_slice(values);
         inner.mark(start..start + values.len());
     }
 
     /// Edit instances in place. `f` returns the range it changed, which
-    /// renderers upload; an empty range uploads nothing.
+    /// renderers upload; an empty range uploads nothing. Shared storage is
+    /// written in place, as [`RetainedShapes::write`] says.
     pub fn update(&self, f: impl FnOnce(&mut [ShapeInstance]) -> Range<usize>) {
         let mut inner = self.inner.lock();
-        let range = f(&mut inner.instances);
-        let len = inner.instances.len();
+        let range = f(inner.store.as_mut_slice());
+        let len = inner.store.len();
         let range = range.start.min(len)..range.end.min(len);
         if !range.is_empty() {
             inner.mark(range);
         }
     }
 
+    /// Reads the instances.
+    pub fn read<R>(&self, f: impl FnOnce(&[ShapeInstance]) -> R) -> R {
+        f(self.inner.lock().store.as_slice())
+    }
+
+    /// For renderers that read storage in place: `f` gets the storage (when
+    /// shared) and the length.
+    pub fn with_storage<R>(&self, f: impl FnOnce(Option<&dyn RetainedStorage>, usize) -> R) -> R {
+        let inner = self.inner.lock();
+        match &inner.store {
+            Store::Shared { storage, len } => f(Some(&**storage), *len),
+            Store::Vec(v) => f(None, v.len()),
+        }
+    }
+
     /// For renderers: given the version their copy holds (0 for none), call
-    /// `upload` with what to copy, and return the version they then hold.
-    pub fn sync(&self, have: u64, upload: impl FnOnce(RetainedUpload<'_>)) -> u64 {
+    /// `upload` with what to copy and the capacity in instances (size a GPU
+    /// copy to it, so growth follows the caller's policy), and return the
+    /// version they then hold.
+    pub fn sync(&self, have: u64, upload: impl FnOnce(RetainedUpload<'_>, usize)) -> u64 {
         let mut inner = self.inner.lock();
         let version = inner.version;
+        let capacity = inner.store.capacity();
         if have == version {
-            upload(RetainedUpload::None);
+            upload(RetainedUpload::None, capacity);
             return version;
         }
         if have != 0 && have == inner.dirty_since {
-            upload(RetainedUpload::Ranges(&inner.instances, &inner.dirty));
+            upload(RetainedUpload::Ranges(inner.store.as_slice(), &inner.dirty), capacity);
         } else {
-            upload(RetainedUpload::All(&inner.instances));
+            upload(RetainedUpload::All(inner.store.as_slice()), capacity);
         }
         inner.dirty.clear();
         inner.dirty_since = version;
         version
+    }
+}
+
+/// Appends instances into a buffer's new storage ([`RetainedShapes::set_all_with`]).
+pub struct RetainedAppend<'a> {
+    store: &'a mut Store,
+}
+
+impl RetainedAppend<'_> {
+    /// Appends `values` and returns where they start. Past the capacity given
+    /// the storage grows to fit exactly.
+    pub fn extend(&mut self, values: &[ShapeInstance]) -> usize {
+        let start = self.store.len();
+        if start + values.len() > self.store.capacity() {
+            let mut store = Store::with_capacity(start + values.len());
+            store.append(self.store.as_slice());
+            *self.store = store;
+        }
+        self.store.append(values);
+        start
+    }
+
+    /// Instances appended so far.
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    /// True when none were appended.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1082,8 +1308,8 @@ mod tests {
         let shapes = RetainedShapes::new();
         shapes.set_all(vec![ShapeInstance::default(); 10]);
         let mut seen = vec![];
-        let v1 = shapes.sync(0, |u| seen.push(describe(u)));
-        let v2 = shapes.sync(v1, |u| seen.push(describe(u)));
+        let v1 = shapes.sync(0, |u, _| seen.push(describe(u)));
+        let v2 = shapes.sync(v1, |u, _| seen.push(describe(u)));
         assert_eq!(v1, v2);
         shapes.write(3, &[ShapeInstance::default(); 2]);
         shapes.write(5, &[ShapeInstance::default()]);
@@ -1091,26 +1317,87 @@ mod tests {
             s[8].width = 1.0;
             8..9
         });
-        let v3 = shapes.sync(v2, |u| seen.push(describe(u)));
+        let v3 = shapes.sync(v2, |u, _| seen.push(describe(u)));
         assert!(v3 > v2);
         assert_eq!(seen, ["all 10", "none", "ranges [3..6, 8..9]"]);
+    }
+
+    #[test]
+    fn extend_appends_and_uploads_only_the_new_range() {
+        let shapes = RetainedShapes::new();
+        shapes.set_all_with(8, |a| {
+            assert_eq!(a.extend(&[ShapeInstance::default(); 3]), 0);
+            assert_eq!(a.len(), 3);
+        });
+        assert_eq!(shapes.capacity(), 8);
+        let mut seen = vec![];
+        let v1 = shapes.sync(0, |u, cap| seen.push(format!("{} cap {cap}", describe(u))));
+        let mut wide = ShapeInstance::default();
+        wide.width = 7.0;
+        assert_eq!(shapes.extend(&[wide; 2]), 3);
+        shapes.sync(v1, |u, cap| seen.push(format!("{} cap {cap}", describe(u))));
+        assert_eq!(seen, ["all 3 cap 8", "ranges [3..5] cap 8"]);
+        // Past the room: grows to fit exactly, keeping what it held.
+        shapes.extend(&[wide; 4]);
+        assert_eq!((shapes.len(), shapes.capacity()), (9, 9));
+        shapes.read(|s| assert_eq!(s.iter().map(|i| i.width).collect::<Vec<_>>(), [0., 0., 0., 7., 7., 7., 7., 7., 7.]));
+    }
+
+    /// Heap storage standing in for a GPU-shared buffer.
+    struct HeapStorage(Box<[std::cell::UnsafeCell<ShapeInstance>]>);
+    // SAFETY: only reached through the buffer's lock.
+    unsafe impl Send for HeapStorage {}
+    // SAFETY: the box is never resized or moved out of.
+    unsafe impl RetainedStorage for HeapStorage {
+        fn as_mut_ptr(&self) -> *mut ShapeInstance {
+            self.0.as_ptr() as *mut ShapeInstance
+        }
+        fn capacity(&self) -> usize {
+            self.0.len()
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn shared_storage_holds_the_only_copy() {
+        set_retained_storage(|n| {
+            Some(Box::new(HeapStorage((0..n).map(|_| Default::default()).collect())))
+        });
+        let shapes = RetainedShapes::new();
+        let mut a = ShapeInstance::default();
+        a.width = 1.0;
+        shapes.set_all(vec![a; 2]);
+        assert!(shapes.is_shared());
+        shapes.reserve_exact(3);
+        assert_eq!(shapes.capacity(), 5);
+        let mut b = a;
+        b.width = 2.0;
+        assert_eq!(shapes.extend(&[b]), 2);
+        shapes.write(0, &[b]);
+        shapes.read(|s| assert_eq!(s.iter().map(|i| i.width).collect::<Vec<_>>(), [2., 1., 2.]));
+        let in_place = shapes.with_storage(|storage, len| {
+            storage.is_some_and(|s| s.as_any().is::<HeapStorage>()) && len == 3
+        });
+        assert!(in_place);
     }
 
     #[test]
     fn a_second_renderer_behind_the_ranges_gets_everything() {
         let shapes = RetainedShapes::new();
         shapes.set_all(vec![ShapeInstance::default(); 4]);
-        let a = shapes.sync(0, |_| {});
-        let b = shapes.sync(0, |_| {});
+        let a = shapes.sync(0, |_, _| {});
+        let b = shapes.sync(0, |_, _| {});
         assert_eq!(a, b);
         shapes.write(1, &[ShapeInstance::default()]);
         let mut first = String::new();
-        shapes.sync(a, |u| first = describe(u));
+        shapes.sync(a, |u, _| first = describe(u));
         assert_eq!(first, "ranges [1..2]");
         // Window A consumed the ranges; window B, at the same old version, cannot
         // use them any more.
         let mut second = String::new();
-        shapes.sync(b, |u| second = describe(u));
+        shapes.sync(b, |u, _| second = describe(u));
         assert_eq!(second, "all 4");
     }
 
@@ -1118,11 +1405,11 @@ mod tests {
     fn scattered_writes_coalesce_past_64_ranges() {
         let shapes = RetainedShapes::new();
         shapes.set_all(vec![ShapeInstance::default(); 1000]);
-        let v = shapes.sync(0, |_| {});
+        let v = shapes.sync(0, |_, _| {});
         for i in 0..100 {
             shapes.write(i * 10, &[ShapeInstance::default()]);
         }
-        shapes.sync(v, |u| match u {
+        shapes.sync(v, |u, _| match u {
             RetainedUpload::Ranges(_, r) => {
                 assert!(r.len() <= 64);
                 assert_eq!(r.first().unwrap().start, 0);

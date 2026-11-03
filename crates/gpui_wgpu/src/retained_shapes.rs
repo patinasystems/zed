@@ -77,7 +77,7 @@ impl WgpuRendererCore {
             let mut result: Result<()> = Ok(());
             let mut uploaded = 0u64;
             let entries = &mut state.entries;
-            let version = draw.shapes.sync(have, |upload| {
+            let version = draw.shapes.sync(have, |upload, room| {
                 let (data, ranges): (&[ShapeInstance], Vec<Range<usize>>) = match upload {
                     RetainedUpload::None => return,
                     RetainedUpload::All(data) => (data, vec![0..data.len()]),
@@ -88,7 +88,8 @@ impl WgpuRendererCore {
                     .get(&id)
                     .is_none_or(|e| e.capacity < bytes.len() as u64);
                 let ranges = if needs_new {
-                    let wanted = (bytes.len() as u64 + bytes.len() as u64 / 2).max(256);
+                    // Sized to the buffer's room, which its owner's growth policy picked.
+                    let wanted = (bytes.len() as u64).max(room as u64 * RECORD_SIZE).max(256);
                     match create_storage(
                         device,
                         &resources.bind_group_layouts.instances,

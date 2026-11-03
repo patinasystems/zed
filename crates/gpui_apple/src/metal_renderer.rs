@@ -330,6 +330,11 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
+        // Retained shapes on unified memory live in shared-storage buffers the
+        // GPU reads in place: one copy of each instance at rest.
+        if device.has_unified_memory() {
+            gpui::set_retained_storage(shared_retained_storage);
+        }
         #[cfg(feature = "runtime_shaders")]
         let library = device
             .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
@@ -1355,14 +1360,36 @@ impl MetalRenderer {
                     len: 0,
                     version: 0,
                     last_frame: frame,
+                    shared: false,
                 });
-            if entry.last_frame == frame && entry.version != 0 {
+            if entry.last_frame == frame && (entry.version != 0 || entry.shared) {
                 continue;
             }
             entry.last_frame = frame;
+            // Storage the GPU reads in place, on this device: bind it, upload nothing.
+            let device_id = self.device.registry_id();
+            let shared = draw.shapes.with_storage(|storage, len| {
+                storage
+                    .and_then(|s| s.as_any().downcast_ref::<SharedRetainedStorage>())
+                    .filter(|s| s.buffer.device().registry_id() == device_id)
+                    .map(|s| (s.buffer.clone(), len))
+            });
+            if let Some((buffer, len)) = shared {
+                entry.buffer = Some(buffer);
+                entry.len = len;
+                entry.capacity = 0;
+                entry.version = 0;
+                entry.shared = true;
+                continue;
+            }
+            if entry.shared {
+                // Moved off shared storage: the next copy is a whole one.
+                entry.buffer = None;
+                entry.shared = false;
+            }
             let mut result: Result<()> = Ok(());
             let device = &self.device;
-            let version = draw.shapes.sync(entry.version, |upload| {
+            let version = draw.shapes.sync(entry.version, |upload, room| {
                 let (data, ranges): (&[ShapeInstance], Vec<std::ops::Range<usize>>) = match upload {
                     RetainedUpload::None => return,
                     RetainedUpload::All(data) => (data, vec![0..data.len()]),
@@ -1374,8 +1401,9 @@ impl MetalRenderer {
                     return;
                 }
                 if entry.capacity < bytes {
-                    // Grow (by half again) and copy everything into the new buffer.
-                    let capacity = (bytes + bytes / 2).next_multiple_of(4096);
+                    // Sized to the buffer's room, which its owner's growth policy
+                    // picked, and copied whole.
+                    let capacity = bytes.max(room * mem::size_of::<ShapeInstance>());
                     entry.buffer = Some(
                         device.new_buffer(capacity as u64, MTLResourceOptions::StorageModePrivate),
                     );
@@ -4742,8 +4770,18 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        // On unified memory the buffer's storage is the GPU's: bound in place, never
+        // uploaded; elsewhere a GPU copy at the buffer's version.
+        let unified = renderer.renderer.device.has_unified_memory();
         let gpu = &renderer.renderer.retained_shapes[&shapes.id()];
-        assert_eq!((gpu.len, gpu.version), (5, shapes.version()));
+        assert_eq!(gpu.len, 5);
+        assert_eq!(shapes.is_shared(), unified);
+        if unified {
+            assert!(gpu.shared);
+            assert_eq!(renderer.renderer.retained_uploaded_bytes, 0);
+        } else {
+            assert_eq!(gpu.version, shapes.version());
+        }
 
         // A range write: the next frame shows it.
         let mut red = t::instances()[0];
@@ -4753,10 +4791,42 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> {
             gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &scene, size)
                 .expect("render");
         assert_eq!(image.get_pixel(16, 16).0, [0, 0, 255, 255]);
-        assert_eq!(
-            renderer.renderer.retained_shapes[&shapes.id()].version,
-            shapes.version()
+        if unified {
+            assert_eq!(renderer.renderer.retained_uploaded_bytes, 0);
+        } else {
+            assert_eq!(
+                renderer.renderer.retained_shapes[&shapes.id()].version,
+                shapes.version()
+            );
+        }
+
+        // Grown past its room (new storage): the next frame draws the new instance
+        // from the new storage, and the old instances with it.
+        shapes.reserve_exact(0);
+        let room = shapes.capacity();
+        let mut green = t::instances()[0];
+        green.fill = 0x00ff00ff;
+        let at = shapes.extend(&vec![green; room + 1 - shapes.len()]) as u32;
+        assert!(shapes.capacity() > room);
+        let full = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            gpui::size(ScaledPixels(64.), ScaledPixels(64.)),
         );
+        let mut grown = Scene::default();
+        grown.insert_primitive(RetainedShapesDraw {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask::from(full),
+            shapes: shapes.clone(),
+            paint: gpui::RetainedShapesPaint::new(at..at + 1, gpui::TransformationMatrix::unit()),
+            opacity: 1.0,
+        });
+        grown.finish();
+        let image =
+            gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &grown, size)
+                .expect("render");
+        assert_eq!(image.get_pixel(16, 16).0, [0, 255, 0, 255]);
+        assert_eq!(renderer.renderer.retained_shapes[&shapes.id()].len, shapes.len());
 
         // Arrow parts and text bars.
         let kinds = gpui::RetainedShapes::new();
@@ -4870,7 +4940,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> {
     }
 }
 
-/// A retained shape buffer's GPU copy.
+/// A retained shape buffer's GPU copy, or its shared storage bound in place.
 struct RetainedGpu {
     buffer: Option<metal::Buffer>,
     capacity: usize,
@@ -4878,6 +4948,50 @@ struct RetainedGpu {
     len: usize,
     version: u64,
     last_frame: u64,
+    /// `buffer` is the buffer's own shared storage ([`SharedRetainedStorage`]),
+    /// bound this frame: nothing was copied.
+    shared: bool,
+}
+
+/// Retained shape instances in a shared-storage buffer on the preferred device
+/// ([`gpui::RetainedStorage`]): the CPU writes what the GPU reads, so an
+/// instance has one copy. Frames in flight keep a buffer alive after its owner
+/// replaces it (command buffers retain what they bind).
+struct SharedRetainedStorage {
+    buffer: metal::Buffer,
+    capacity: usize,
+}
+
+// SAFETY: `contents` of a shared-storage buffer stays mapped at one address for
+// the buffer's life, sized to `capacity` instances, 4-byte aligned or better.
+unsafe impl gpui::RetainedStorage for SharedRetainedStorage {
+    fn as_mut_ptr(&self) -> *mut ShapeInstance {
+        self.buffer.contents().cast()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// [`gpui::RetainedStorageMaker`] for unified memory: an exact-size shared
+/// buffer on the device GPUI renders with.
+fn shared_retained_storage(capacity: usize) -> Option<Box<dyn gpui::RetainedStorage>> {
+    static DEVICE: std::sync::OnceLock<metal::Device> = std::sync::OnceLock::new();
+    let device = DEVICE.get_or_init(preferred_device);
+    let bytes = (capacity * mem::size_of::<ShapeInstance>()) as u64;
+    if !device.has_unified_memory() || bytes == 0 {
+        return None;
+    }
+    let buffer = device.new_buffer(
+        bytes,
+        MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeDefaultCache,
+    );
+    Some(Box::new(SharedRetainedStorage { buffer, capacity }))
 }
 
 #[allow(clippy::too_many_arguments)]
