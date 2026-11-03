@@ -166,6 +166,7 @@ impl BackdropPipelines {
     fn group_composite(&self, blend_mode: gpui::BlendMode) -> &wgpu::RenderPipeline {
         match blend_mode {
             gpui::BlendMode::PlusLighter => &self.group_add,
+            mode if mode.porter_duff().is_some() => &self.group_replace,
             gpui::BlendMode::PlusDarker
             | gpui::BlendMode::ColorDodge
             | gpui::BlendMode::ColorBurn => &self.group_replace,
@@ -220,12 +221,12 @@ struct BackdropCompositeParams {
     corner_radii: [f32; 4],
     corner_radii_y: [f32; 4],
     region: [f32; 4],
+    /// `ColorFilter::gpu` codes, four to a vector; `filter_count` apply.
+    filter_kinds: [[u32; 4]; 2],
+    filter_amounts: [[f32; 4]; 2],
     viewport_size: [f32; 2],
-    saturate: f32,
-    brightness: f32,
-    contrast: f32,
     opacity: f32,
-    pad: [f32; 2],
+    filter_count: u32,
 }
 
 /// The scenes a frame draws (the window's first, then its groups', depth first) with
@@ -2217,6 +2218,15 @@ impl WgpuRendererCore {
                                     self.filter_backdrop(encoder, filter, target_texture, size)
                                 })
                                 .flatten();
+                            // A texture input (`ShaderInput::Texture`) binds where the
+                            // backdrop does.
+                            let input = filter
+                                .shader
+                                .texture(root)
+                                .and_then(|id| self.atlas.external_texture(id))
+                                .map(|texture| {
+                                    texture.create_view(&wgpu::TextureViewDescriptor::default())
+                                });
                             let resources = &self.resources;
                             self.custom_shaders.draw(
                                 &resources.device,
@@ -2229,7 +2239,8 @@ impl WgpuRendererCore {
                                 filter.shader.uniforms(root),
                                 backdrop
                                     .as_ref()
-                                    .map(|(scratch, region)| (&scratch.view, *region)),
+                                    .map(|(scratch, region)| (&scratch.view, *region))
+                                    .or(input.as_ref().map(|view| (view, [0., 0., 1., 1.]))),
                                 [size.width.0 as f32, size.height.0 as f32],
                             );
                             if let Some((scratch, _)) = &backdrop {
@@ -2835,12 +2846,11 @@ impl WgpuRendererCore {
                 radii_y.bottom_left.0,
             ],
             region,
+            filter_kinds: filter.filter_kinds,
+            filter_amounts: filter.filter_amounts,
             viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
-            saturate: filter.saturate,
-            brightness: filter.brightness,
-            contrast: filter.contrast,
             opacity: filter.opacity,
-            pad: [0.; 2],
+            filter_count: filter.filter_count,
         };
         let uniforms = self.backdrop_uniforms(bytemuck::bytes_of(&params));
         let source = self.create_texture_bind_group("backdrop_filtered", filtered);
@@ -4107,6 +4117,56 @@ mod tests {
         Ok(())
     }
 
+    /// The shared backdrop filter chain scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn backdrop_filter_chains_render() -> anyhow::Result<()> {
+        use gpui::backdrop_chain_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
+        Ok(())
+    }
+
+    /// The shared Porter-Duff and luminance-to-alpha scene on the wgpu backend.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn porter_duff_groups_render() -> anyhow::Result<()> {
+        use gpui::porter_duff_test_scene as t;
+        use gpui::{DevicePixels, PlatformHeadlessRenderer};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let (scene, probes) = t::scene();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            Size {
+                width: DevicePixels(t::SIZE.0),
+                height: DevicePixels(t::SIZE.1),
+            },
+        )?;
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
+        Ok(())
+    }
+
     /// The shared backdrop filter scene on the wgpu backend.
     #[cfg(not(target_family = "wasm"))]
     #[test]
@@ -4510,6 +4570,31 @@ mod tests {
             .expect("tile");
         let image = renderer.render_scene_to_image(&t::scene(tile), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
         t::check(|x, y| image.get_pixel(x, y).0, |p| p[1] > 100 && p[0] < 60 && p[2] < 60);
+        Ok(())
+    }
+
+    /// Linear and nearest image sprites in one batch (`image-rendering: auto` and `pixelated`).
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn images_sample_nearest_or_linear_per_sprite() -> anyhow::Result<()> {
+        use gpui::image_sampling_test_scene as t;
+        use gpui::{AtlasKey, DevicePixels, ImageId, PlatformHeadlessRenderer, RenderImageParams};
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("skipped: no wgpu adapter ({error:#})");
+                return Ok(());
+            }
+        };
+        let atlas = renderer.sprite_atlas();
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(8), frame_index: 0 }),
+                &mut || Ok(Some((Size { width: DevicePixels(t::IMAGE_SIZE.0), height: DevicePixels(t::IMAGE_SIZE.1) }, std::borrow::Cow::Borrowed(&t::PIXELS[..])))),
+            )?
+            .expect("tile");
+        let image = renderer.render_scene_to_image(&t::scene(tile), Size { width: DevicePixels(t::SIZE.0), height: DevicePixels(t::SIZE.1) })?;
+        t::check(|x, y| image.get_pixel(x, y).0);
         Ok(())
     }
 

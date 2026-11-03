@@ -2059,7 +2059,9 @@ impl<T> AtlasTextureList<T> {
 /// A texture an app owns and fills itself (from a GPU source: a browser
 /// canvas, a texture it renders), drawn like an image with
 /// [`crate::Window::paint_external_texture`]. Ids are the app's to choose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ExternalTextureId(pub u64);
 
 /// How a texture is sampled when drawn at another size.

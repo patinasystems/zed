@@ -1838,9 +1838,15 @@ impl MetalRenderer {
         } else {
             None
         };
-        let (backdrop, region) = match &filtered {
-            Some((texture, region)) => (texture.as_ref(), *region),
-            None => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
+        // A texture input (`ShaderInput::Texture`) binds where the backdrop does.
+        let input = filter.shader.texture(root).and_then(|id| {
+            let tile = self.sprite_atlas.external_texture_tile(id)?;
+            self.sprite_atlas.metal_texture(tile.texture_id)
+        });
+        let (backdrop, region) = match (&filtered, &input) {
+            (Some((texture, region)), _) => (texture.as_ref(), *region),
+            (None, Some(texture)) => (texture.as_ref(), [0., 0., 1., 1.]),
+            (None, None) => (self.blank_texture.as_ref(), [0., 0., 1., 1.]),
         };
         let params = crate::metal_custom_shader::ShaderParams::new(
             filter,
@@ -2526,6 +2532,7 @@ impl GroupCompositePipelines {
     fn for_blend_mode(&self, blend_mode: gpui::BlendMode) -> &metal::RenderPipelineStateRef {
         match blend_mode {
             gpui::BlendMode::PlusLighter => self.add.state(),
+            mode if mode.porter_duff().is_some() => self.replace.state(),
             gpui::BlendMode::PlusDarker
             | gpui::BlendMode::ColorDodge
             | gpui::BlendMode::ColorBurn => self.replace.state(),
@@ -3128,7 +3135,7 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile,
             grayscale: PaddedBool32::from(false),
             opacity: 1.,
@@ -3150,14 +3157,15 @@ mod tests {
 
     #[test]
     fn images_at_whole_scales_keep_their_hard_edges() {
-        // A 1x2 image (green over transparent) drawn 2x: with `exact_scale` each texel fills its
-        // 2x2 device pixels; without it, linear filtering bleeds a quarter of the green into the
-        // first transparent row.
+        // A 1x2 image (green over transparent) drawn 2x: with `nearest` (`image-rendering:
+        // pixelated`) each texel fills its 2x2 device pixels; without it (`auto`), linear
+        // filtering blends a quarter of the green into the first transparent row, as WebKit and
+        // Chromium draw it.
         use gpui::{
             AtlasKey, Bounds, ContentMask, Corners, ImageId, PaddedBool32, PolychromeSprite,
             RenderImageParams, ScaledPixels, TransformationMatrix,
         };
-        let draw = |exact_scale: u32| {
+        let draw = |nearest: u32| {
             let mut renderer = MetalHeadlessRenderer::new();
             renderer.renderer.update_transparency(true);
             let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
@@ -3174,7 +3182,7 @@ mod tests {
             let mut scene = Scene::default();
             scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                exact_scale,
+                nearest,
                 tile,
                 grayscale: PaddedBool32::from(false),
                 opacity: 1.,
@@ -3202,7 +3210,7 @@ mod tests {
 
     #[test]
     fn backdrop_filters_keep_transparent_backdrops_transparent() {
-        use gpui::{BackdropFilter, Bounds, ContentMask, Corners, ScaledPixels};
+        use gpui::{BackdropFilter, Bounds, ColorFilter, ContentMask, Corners, ScaledPixels};
         let mut renderer = MetalHeadlessRenderer::new();
         renderer.renderer.update_transparency(true);
         let bounds = Bounds::new(
@@ -3210,20 +3218,19 @@ mod tests {
             size(ScaledPixels(16.), ScaledPixels(16.)),
         );
         let mut scene = Scene::default();
-        scene.insert_primitive(BackdropFilter {
-            bounds,
-            content_mask: ContentMask::from(bounds),
-            corner_radii: Corners::default(),
-            corner_radii_y: Corners::default(),
-            blur_radius: ScaledPixels(2.),
-            opacity: 1.,
-            saturate: 1.,
-            brightness: 1.,
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds,
+                content_mask: ContentMask::from(bounds),
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+                blur_radius: ScaledPixels(2.),
+                opacity: 1.,
+                ..Default::default()
+            }
             // Mid gray where there is color; nothing where there is none.
-            contrast: 0.,
-            order: 0,
-            shader: gpui::ShaderDraw::NONE,
-        });
+            .with_color_filters(&[ColorFilter::Contrast(0.)]),
+        );
         scene.finish();
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
             &mut renderer,
@@ -3251,6 +3258,34 @@ mod tests {
                 .expect("dump");
         }
         t::check(|x, y| image.get_pixel(x, y).0, &probes, 12);
+    }
+
+    #[test]
+    fn backdrop_filter_chains_render() {
+        use gpui::backdrop_chain_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 4);
+    }
+
+    #[test]
+    fn porter_duff_groups_render() {
+        use gpui::porter_duff_test_scene as t;
+        let mut renderer = MetalHeadlessRenderer::new();
+        let (scene, probes) = t::scene();
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(
+            &mut renderer,
+            &scene,
+            size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1)),
+        )
+        .expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0, &probes, 3);
     }
 
     #[test]
@@ -3788,6 +3823,24 @@ mod tests {
             .expect("tile");
         let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(tile), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
         t::check(|x, y| image.get_pixel(x, y).0, |p| p[3] > 128);
+    }
+
+    #[test]
+    fn images_sample_nearest_or_linear_per_sprite() {
+        use gpui::image_sampling_test_scene as t;
+        use gpui::{AtlasKey, ImageId, RenderImageParams};
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.update_transparency(true);
+        let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+        let tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Image(RenderImageParams { image_id: ImageId(8), frame_index: 0 }),
+                &mut || Ok(Some((size(DevicePixels(t::IMAGE_SIZE.0), DevicePixels(t::IMAGE_SIZE.1)), std::borrow::Cow::Borrowed(&t::PIXELS[..])))),
+            )
+            .expect("insert")
+            .expect("tile");
+        let image = gpui::PlatformHeadlessRenderer::render_scene_to_image(&mut renderer, &t::scene(tile), size(DevicePixels(t::SIZE.0), DevicePixels(t::SIZE.1))).expect("render");
+        t::check(|x, y| image.get_pixel(x, y).0);
     }
 
     #[test]

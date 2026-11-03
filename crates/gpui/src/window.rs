@@ -5153,7 +5153,7 @@ impl Window {
             self.backdrop_filter(
                 backdrop.bounds,
                 backdrop.corner_radii,
-                backdrop.backdrop,
+                &backdrop.backdrop,
                 1.,
             )
         });
@@ -5869,8 +5869,8 @@ impl Window {
     }
 
     /// Filters what is already painted behind `bounds` (CSS `backdrop-filter`): a gaussian
-    /// blur of standard deviation `backdrop.blur_radius`, then saturation, brightness and
-    /// contrast, drawn back inside `bounds` with `corner_radii` and the current content mask.
+    /// blur of standard deviation `backdrop.blur_radius`, then its color filters in order,
+    /// drawn back inside `bounds` with `corner_radii` and the current content mask.
     /// Paint it before the element's own background. Under an element transformation it
     /// filters the transformed bounding box.
     ///
@@ -5879,7 +5879,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: impl Into<Corners<Size<Pixels>>>,
-        backdrop: Backdrop,
+        backdrop: &Backdrop,
     ) {
         let corner_radii = corner_radii.into();
         self.invalidator.debug_assert_paint();
@@ -5891,7 +5891,7 @@ impl Window {
         &self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Size<Pixels>>,
-        backdrop: Backdrop,
+        backdrop: &Backdrop,
         opacity: f32,
     ) -> BackdropFilter {
         let scale_factor = self.scale_factor();
@@ -5913,19 +5913,20 @@ impl Window {
             corner_radii: fitted.horizontal().scale(scale_factor),
             corner_radii_y: fitted.vertical().scale(scale_factor),
             blur_radius: backdrop.blur_radius.scale(scale_factor),
-            saturate: backdrop.saturate,
-            brightness: backdrop.brightness,
-            contrast: backdrop.contrast,
             shader: crate::ShaderDraw::NONE,
+            ..BackdropFilter::default()
         }
+        .with_color_filters(&backdrop.color_filters)
     }
 
     /// Paints `shader` over `bounds`, clipped to `corner_radii` and the content
     /// mask and faded by the element opacity. `uniforms` bind at `@group(0)
     /// @binding(3)` (at most 4096 bytes; laid out as the shader declares them).
     /// With [`ShaderInput::Backdrop`], `backdrop(uv)` reads what is drawn behind
-    /// `bounds`, which orders the draw after it, like a backdrop filter. Under an
-    /// element transformation it draws the transformed bounding box.
+    /// `bounds`, which orders the draw after it, like a backdrop filter. With
+    /// [`ShaderInput::Texture`], `texture_input(uv)` reads an external texture
+    /// (one painted with [`Window::paint_to_texture`] this frame is drawn first).
+    /// Under an element transformation it draws the transformed bounding box.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_shader(
@@ -5954,7 +5955,7 @@ impl Window {
         let draw = self.next_frame.scene.add_shader(
             shader,
             uniforms,
-            input == crate::ShaderInput::Backdrop,
+            input,
             scale_factor,
         );
         self.next_frame.scene.insert_primitive(BackdropFilter {
@@ -6389,7 +6390,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                exact_scale: 0,
+                nearest: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -6493,11 +6494,16 @@ impl Window {
             frame_index,
             grayscale,
             TransformationMatrix::unit(),
+            TextureSampling::Linear,
         )
     }
 
     /// Paints an image like [`Window::paint_image`], then applies `transformation` to the
-    /// painted sprite, including its rounded corners.
+    /// painted sprite, including its rounded corners. `sampling` is how its texels scale:
+    /// [`TextureSampling::Nearest`] keeps them square (CSS `image-rendering: pixelated` and
+    /// `crisp-edges`); [`TextureSampling::Linear`] filters between them (`auto`) at every
+    /// scale, as WebKit and Chromium draw `auto` images, whole numbers of device pixels per
+    /// texel included.
     ///
     /// `transformation` maps window coordinates in device pixels to window coordinates in
     /// device pixels, the same space [`Window::paint_svg`] uses. The content mask is applied
@@ -6513,6 +6519,7 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
         transformation: TransformationMatrix,
+        sampling: TextureSampling,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -6549,7 +6556,7 @@ impl Window {
             tile,
             grayscale,
             transformation,
-            true,
+            sampling,
         );
         Ok(())
     }
@@ -6586,7 +6593,8 @@ impl Window {
             tile,
             false,
             TransformationMatrix::unit(),
-            false,
+            // The atlas samples an external texture as it was set.
+            TextureSampling::Linear,
         );
     }
 
@@ -6637,9 +6645,8 @@ impl Window {
     }
 
     /// The sprite for `tile` (an image's) drawn over `image_bounds`, clipped
-    /// to `visible_bounds`, which lies inside it. With `exact`, a tile drawn at a whole
-    /// number of device pixels per texel, with no rotation or scale, samples texel centres
-    /// (as browsers draw images at integer scales) instead of filtering between texels.
+    /// to `visible_bounds`, which lies inside it. With [`TextureSampling::Nearest`] it
+    /// samples the nearest texel at any scale; otherwise it filters between texels.
     fn paint_tile(
         &mut self,
         visible_bounds: Bounds<Pixels>,
@@ -6648,7 +6655,7 @@ impl Window {
         tile: AtlasTile,
         grayscale: bool,
         transformation: TransformationMatrix,
-        exact: bool,
+        sampling: TextureSampling,
     ) {
         let transformation = self.device_element_transformation().compose(transformation);
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
@@ -6693,14 +6700,7 @@ impl Window {
             }
         };
 
-        // Checked on the sprite as drawn: its snapped bounds, moved by the translation, over
-        // the texels it shows.
-        let exact_scale = exact
-            && sprite_samples_texel_centres(
-                visible_bounds_snapped,
-                sub_tile.bounds.size,
-                &transformation,
-            );
+        let nearest = sampling == TextureSampling::Nearest;
         let content_mask = self.snapped_content_mask();
         // Circular corners keep GPUI's per-radius clamp; elliptical ones scale together (CSS 5.5).
         let fitted = if corner_radii.is_circular() {
@@ -6714,7 +6714,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: exact_scale as u32,
+            nearest: nearest as u32,
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
@@ -9584,33 +9584,6 @@ fn snap_bounds_to_device(bounds: Bounds<Pixels>, scale_factor: f32) -> Bounds<Sc
     )
 }
 
-/// Whether a sprite drawn over `sprite` (snapped device bounds) through the device-space
-/// `transformation`, showing `texels`, puts every texel edge on a device pixel edge: no
-/// rotation or scale, a pixel-aligned origin once translated, and a whole number (at least
-/// one) of device pixels per texel. Only then does sampling texel centres match how browsers
-/// draw images.
-fn sprite_samples_texel_centres(
-    sprite: Bounds<ScaledPixels>,
-    texels: Size<DevicePixels>,
-    transformation: &TransformationMatrix,
-) -> bool {
-    // Device coordinates are f32; this absorbs rounding noise, not real offsets.
-    const TOLERANCE: f32 = 1e-2;
-    let aligned = |device: f32| (device - device.round()).abs() < TOLERANCE;
-    let whole_multiple = |device: ScaledPixels, texels: DevicePixels| {
-        let device_pixels = device.0.round() as i32;
-        aligned(device.0)
-            && texels.0 > 0
-            && device_pixels >= texels.0
-            && device_pixels % texels.0 == 0
-    };
-    transformation.rotation_scale == TransformationMatrix::unit().rotation_scale
-        && aligned(sprite.origin.x.0 + transformation.translation[0])
-        && aligned(sprite.origin.y.0 + transformation.translation[1])
-        && whole_multiple(sprite.size.width, texels.width)
-        && whole_multiple(sprite.size.height, texels.height)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -9882,7 +9855,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                     .rounded(px(8.))
                     .opacity(0.5)
                     .backdrop_filter(super::Backdrop {
-                        saturate: 0.,
+                        color_filters: vec![crate::ColorFilter::Saturate(0.)],
                         ..Default::default()
                     })
                     .hover(|style| style.invisible()),
@@ -9910,7 +9883,15 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
         assert_eq!(painted.len(), 1);
         assert_eq!(painted[0].corner_radii.top_left, ScaledPixels(8. * scale));
         assert_eq!(painted[0].opacity, 0.5, "faded with the element");
-        assert_eq!(painted[0].saturate, 0.);
+        assert_eq!(
+            (
+                painted[0].filter_count,
+                painted[0].filter_kinds[0][0],
+                painted[0].filter_amounts[0][0]
+            ),
+            (1, 6, 0.),
+            "saturate(0)"
+        );
         // Hovered, the element is hidden, and so is its filter.
         window
             .update(cx, |_, window, cx| {
@@ -9939,7 +9920,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                     .size(px(40.))
                     .opacity(0.5)
                     .backdrop_filter(super::Backdrop {
-                        saturate: 0.,
+                        color_filters: vec![crate::ColorFilter::Saturate(0.)],
                         ..Default::default()
                     })
                     .compositing(crate::Compositing {
@@ -9971,7 +9952,7 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                 assert!(scene.backdrop_filters.is_empty());
                 assert!(group.scene.backdrop_filters.is_empty());
                 let backdrop = group.effects.backdrop.expect("the div's backdrop filter");
-                assert_eq!((backdrop.saturate, backdrop.opacity), (0., 1.));
+                assert_eq!((backdrop.filter_kinds[0][0], backdrop.opacity), (6, 1.));
                 (group.effects.opacity, backdrop.opacity)
             })
             .unwrap()
@@ -10765,53 +10746,6 @@ fn mark_fragment(input: MarkFragment) -> vec4<f32> { return input.color; }",
                 window.invalidator.set_phase(super::DrawPhase::None);
             })
             .unwrap();
-    }
-
-    #[test]
-    fn images_sample_texel_centres_only_on_the_device_pixel_grid() {
-        use super::{TransformationMatrix, snap_bounds_to_device, sprite_samples_texel_centres};
-        use crate::DevicePixels;
-
-        let texels = size(DevicePixels(4), DevicePixels(4));
-        let unit = TransformationMatrix::unit();
-        let translated = |x: f32, y: f32| TransformationMatrix {
-            translation: [x, y],
-            ..TransformationMatrix::unit()
-        };
-        // An image at (x, 10), `side` px square, drawn as a sprite at `scale`.
-        let exact = |x: f32, side: f32, scale: f32, transformation: &TransformationMatrix| {
-            let image = Bounds::new(point(px(x), px(10.)), size(px(side), px(side)));
-            sprite_samples_texel_centres(
-                snap_bounds_to_device(image, scale),
-                texels,
-                transformation,
-            )
-        };
-
-        // A 4-texel image drawn 4 or 8 px wide at 2x: 2 or 4 device pixels per texel.
-        assert!(exact(10., 4., 2., &unit));
-        assert!(exact(10., 8., 2., &unit));
-        assert!(exact(10.5, 4., 2., &unit));
-        assert!(exact(10., 4., 2., &translated(3., 5.)));
-        // At 10.25 logical px, 2x, the sprite snaps to device pixel 20, 8 px wide: exact.
-        assert!(exact(10.25, 4., 2., &unit));
-        // Half a device pixel of translation puts the drawn sprite off the grid, whether or
-        // not the unsnapped origin plus the translation would land on it.
-        assert!(!exact(10.25, 4., 2., &translated(0.5, 0.)));
-        assert!(!exact(10., 4., 2., &translated(0.5, 0.)));
-        assert!(!exact(10., 4., 2., &translated(0., 0.5)));
-        // Drawn sizes that are not a whole multiple of the texels filter.
-        assert!(!exact(10., 3., 2., &unit));
-        assert!(!exact(10.25, 4.5, 2., &unit));
-        assert!(!exact(10., 6., 1., &unit));
-        // Downscales, and rotations or scales, filter.
-        assert!(!exact(10., 1., 2., &unit));
-        assert!(!exact(
-            10.,
-            4.,
-            2.,
-            &TransformationMatrix::unit().scale(size(1.5, 1.5))
-        ));
     }
 
     #[test]
@@ -12985,30 +12919,18 @@ impl Filter {
     }
 }
 
-/// What [`Window::paint_backdrop_filter`] does to the backdrop.
+/// What [`Window::paint_backdrop_filter`] does to the backdrop: a CSS `backdrop-filter`
+/// with the same functions as a group's [`Filter`].
 #[derive(
-    Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 pub struct Backdrop {
     /// The blur's standard deviation (CSS `blur()`); zero for none.
     pub blur_radius: Pixels,
-    /// CSS `saturate()`: 1 leaves colors as they are, 0 is grayscale.
-    pub saturate: f32,
-    /// CSS `brightness()`: a multiplier.
-    pub brightness: f32,
-    /// CSS `contrast()`: 1 leaves colors as they are, 0 is mid gray.
-    pub contrast: f32,
-}
-
-impl Default for Backdrop {
-    fn default() -> Self {
-        Self {
-            blur_radius: Pixels::ZERO,
-            saturate: 1.,
-            brightness: 1.,
-            contrast: 1.,
-        }
-    }
+    /// Applied in order after the blur, as a group's are; only the first
+    /// [`crate::MAX_COLOR_FILTERS`] apply. `opacity()` fades the filtered backdrop over
+    /// what is behind it.
+    pub color_filters: Vec<ColorFilter>,
 }
 
 /// The window-space box covering `bounds` after `transformation` (logical pixels).

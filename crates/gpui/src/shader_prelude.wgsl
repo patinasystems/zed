@@ -1,4 +1,4 @@
-// The prelude of every `gpui::Shader`: its bindings, `ShaderInput`, `backdrop(uv)`
+// The prelude of every `gpui::Shader`: its bindings, `ShaderInput`, `backdrop(uv)`, `texture_input(uv)`
 // and the entry points that call the shader's `shade`.
 
 struct GpuiShaderParams {
@@ -38,6 +38,16 @@ fn backdrop(uv: vec2<f32>) -> vec4<f32> {
     let region = gpui_shader.backdrop_region;
     let coord = (position - region.xy) / region.zw;
     let color = textureSampleLevel(gpui_backdrop_texture, gpui_backdrop_sampler, coord, 0.0);
+    if color.a <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(color.rgb / color.a, color.a);
+}
+
+// The input texture (`ShaderInput::Texture`) at `uv` (0 to 1 across the
+// texture), with straight alpha. Transparent black without one.
+fn texture_input(uv: vec2<f32>) -> vec4<f32> {
+    let color = textureSampleLevel(gpui_backdrop_texture, gpui_backdrop_sampler, uv, 0.0);
     if color.a <= 0.0 {
         return vec4<f32>(0.0);
     }

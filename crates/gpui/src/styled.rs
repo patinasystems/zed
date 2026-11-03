@@ -748,8 +748,8 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Filters what is behind this element (blur, saturate, brightness,
-    /// contrast) before its background paints, like CSS `backdrop-filter`.
+    /// Filters what is behind this element (a blur, then color filters in order)
+    /// before its background paints, like CSS `backdrop-filter`.
     fn backdrop_filter(mut self, backdrop: crate::Backdrop) -> Self {
         self.style().backdrop_filter = Some(backdrop);
         self

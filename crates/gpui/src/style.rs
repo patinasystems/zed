@@ -845,11 +845,14 @@ impl Style {
                     opacity: 1.,
                     filter: compositing.filter.clone(),
                     blend_mode: compositing.blend_mode,
-                    backdrop: self.backdrop_filter.map(|backdrop| crate::GroupBackdrop {
-                        bounds,
-                        corner_radii: quad_radii,
-                        backdrop,
-                    }),
+                    backdrop: self
+                        .backdrop_filter
+                        .clone()
+                        .map(|backdrop| crate::GroupBackdrop {
+                            bounds,
+                            corner_radii: quad_radii,
+                            backdrop,
+                        }),
                 };
                 window.with_compositing_group(&group, |window| {
                     self.paint_box(bounds, quad_radii, false, window, cx, continuation)
@@ -879,7 +882,7 @@ impl Style {
         let corner_radii = quad_radii.circular();
         window.paint_drop_shadows(bounds, quad_radii, &self.box_shadow);
 
-        if backdrop && let Some(backdrop) = self.backdrop_filter {
+        if backdrop && let Some(backdrop) = &self.backdrop_filter {
             window.paint_backdrop_filter(bounds, quad_radii, backdrop);
         }
 

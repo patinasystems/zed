@@ -927,9 +927,8 @@ fragment float4 polychrome_sprite_fragment(
   // atlas neighbours (a scaled-up 1x1 image fades out at its edges instead of filling flat).
   float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
   float2 tile_position = clamp_to_tile(input.tile_position, sprite.tile, atlas_size);
-  // At a whole number of device pixels per texel, sample texel centres: the image's own
-  // hard edges stay hard, as browsers draw images at integer scales.
-  if (sprite.exact_scale != 0) {
+  // Nearest sampling (`image-rendering: pixelated` and `crisp-edges`): read the texel's centre.
+  if (sprite.nearest != 0) {
     tile_position = (floor(tile_position * atlas_size) + 0.5) / atlas_size;
   }
   float4 sample = atlas_texture.sample(atlas_texture_sampler, tile_position);
@@ -2162,6 +2161,8 @@ vertex BackdropCompositeOutput backdrop_composite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+float3 group_color_filter(float3 rgb, uint kind, float amount);
+
 // The filtered backdrop (straight color and alpha) at `position`, and in `coverage`
 // its coverage of the filter's rounded bounds, faded by its opacity. `region` is
 // where the filtered texture sits in the target: origin and size, device pixels.
@@ -2174,15 +2175,11 @@ float4 backdrop_filtered(float2 position, constant BackdropFilter *filter, float
   // Filter straight colors, then weight them by the backdrop's alpha again, so
   // transparent texels stay empty.
   float3 rgb = color.a > 0. ? color.rgb / color.a : float3(0.);
-  // CSS saturate(), brightness(), contrast() (Filter Effects 1), in that order.
-  float s = filter->saturate;
-  float3x3 saturate_matrix = float3x3(
-      float3(0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s),
-      float3(0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s),
-      float3(0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s));
-  rgb = saturate(saturate_matrix * rgb);
-  rgb = saturate(rgb * filter->brightness);
-  rgb = saturate((rgb - 0.5) * filter->contrast + 0.5);
+  // CSS color filter functions (Filter Effects 1) in order, as a group applies them.
+  for (uint i = 0; i < filter->filter_count; i++) {
+    rgb = group_color_filter(rgb, filter->filter_kinds[i / 4][i % 4],
+                             filter->filter_amounts[i / 4][i % 4]);
+  }
   float distance = quad_sdf_xy(position, filter->bounds, filter->corner_radii, filter->corner_radii_y);
   coverage = saturate(0.5 - distance) * filter->opacity;
   return float4(rgb, color.a);
@@ -2376,8 +2373,34 @@ float3 group_blend(float3 b, float3 s, uint mode) {
   }
 }
 
+// The Porter-Duff source and destination factors of `mode` (`BlendMode::porter_duff`)
+// for source alpha `sa` and destination alpha `da`.
+float2 porter_duff_factors(uint mode, float sa, float da) {
+  switch (mode) {
+  case 18:  // source-in
+    return float2(da, 0.);
+  case 19:  // source-out
+    return float2(1. - da, 0.);
+  case 20:  // source-atop
+    return float2(da, 1. - sa);
+  case 21:  // destination-over
+    return float2(1. - da, 1.);
+  case 22:  // destination-in
+    return float2(0., sa);
+  case 23:  // destination-out
+    return float2(0., 1. - sa);
+  case 24:  // destination-atop
+    return float2(1. - da, sa);
+  case 25:  // xor
+    return float2(1. - da, 1. - sa);
+  default:  // copy
+    return float2(1., 0.);
+  }
+}
+
 // Normal and most modes are drawn over the target (premultiplied source over),
-// plus-lighter adds, and plus-darker replaces the target with the whole result.
+// plus-lighter adds, and plus-darker and the Porter-Duff operators replace the
+// target with the whole result.
 fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
                                          constant GroupCompositeParams &params [[buffer(1)]],
                                          texture2d<float> source [[texture(0)]],
@@ -2389,12 +2412,18 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
   float4 color =
       source.sample(linear_sampler, (position - params.source_region.xy) / params.source_region.zw);
   if (params.filter_count > 0) {
-    float3 rgb = color.rgb / max(color.a, 1e-6);
+    float alpha = color.a;
+    float3 rgb = color.rgb / max(alpha, 1e-6);
     for (uint i = 0; i < params.filter_count; i++) {
-      rgb = group_color_filter(rgb, params.filter_kinds[i / 4][i % 4],
-                               params.filter_amounts[i / 4][i % 4]);
+      uint kind = params.filter_kinds[i / 4][i % 4];
+      if (kind == 8) {  // luminance to alpha
+        alpha *= dot(rgb, float3(0.2125, 0.7154, 0.0721));
+        rgb = float3(0.);
+      } else {
+        rgb = group_color_filter(rgb, kind, params.filter_amounts[i / 4][i % 4]);
+      }
     }
-    color = float4(rgb * color.a, color.a);
+    color = float4(rgb * alpha, alpha);
   }
   // The mask (premultiplied, so its luminance is already times its alpha); nothing
   // outside its image.
@@ -2410,6 +2439,11 @@ fragment float4 group_composite_fragment(GroupCompositeInput input [[stage_in]],
   }
   float4 behind = backdrop.sample(linear_sampler, (position - params.backdrop_region.xy) /
                                                       params.backdrop_region.zw);
+  if (mode >= 18) {
+    // Porter-Duff (`BlendMode::porter_duff`), drawn with the replacing pipeline.
+    float2 f = porter_duff_factors(mode, color.a, behind.a);
+    return color * f.x + behind * f.y;
+  }
   if (mode == 17) {
     float alpha = min(1., color.a + behind.a);
     float3 rgb = max(float3(0.), alpha - (behind.a - behind.rgb) - (color.a - color.rgb));

@@ -72,6 +72,9 @@ pub struct Scene {
     pub shaders: Vec<Shader>,
     /// Their uniforms, each draw's at [`ShaderDraw::uniforms`], 16-byte aligned.
     pub shader_uniforms: Vec<u8>,
+    /// The external textures shader draws read ([`ShaderInput::Texture`]), at
+    /// [`ShaderDraw::texture`].
+    pub shader_textures: Vec<ExternalTextureId>,
     /// Groups drawn offscreen and composited as one image ([`Scene::push_group`]).
     pub groups: Vec<CompositedGroup>,
     /// Subtrees painted into external textures, never composited
@@ -108,6 +111,7 @@ impl Scene {
         self.backdrop_filters.clear();
         self.shaders.clear();
         self.shader_uniforms.clear();
+        self.shader_textures.clear();
         self.gradients.clear();
     }
 
@@ -136,7 +140,7 @@ impl Scene {
         &mut self,
         shader: &Shader,
         uniforms: &[u8],
-        reads_backdrop: bool,
+        input: ShaderInput,
         scale_factor: f32,
     ) -> ShaderDraw {
         let index = match self.shaders.iter().position(|known| known.id == shader.id) {
@@ -150,12 +154,20 @@ impl Scene {
         self.shader_uniforms.extend_from_slice(uniforms);
         let padded = self.shader_uniforms.len().next_multiple_of(16);
         self.shader_uniforms.resize(padded, 0);
+        let texture = match input {
+            ShaderInput::Texture(id) => {
+                self.shader_textures.push(id);
+                self.shader_textures.len() as u32
+            }
+            _ => 0,
+        };
         ShaderDraw {
             shader: index as u32 + 1,
             uniforms_start: start as u32,
             uniforms_len: uniforms.len() as u32,
-            reads_backdrop: reads_backdrop.into(),
+            reads_backdrop: (input == ShaderInput::Backdrop).into(),
             scale_factor,
+            texture,
         }
     }
 
@@ -427,7 +439,7 @@ impl Scene {
                         filter.shader = self.add_shader(
                             shader,
                             filter.shader.uniforms(prev_scene),
-                            filter.shader.reads_backdrop(),
+                            filter.shader.input(prev_scene),
                             filter.shader.scale_factor,
                         );
                         self.insert_primitive(filter);
@@ -536,7 +548,7 @@ impl Scene {
                         filter.shader = scene.add_shader(
                             shader,
                             filter.shader.uniforms(self),
-                            filter.shader.reads_backdrop(),
+                            filter.shader.input(self),
                             filter.shader.scale_factor,
                         );
                     }
@@ -1411,8 +1423,8 @@ impl From<Shadow> for Primitive {
 }
 
 /// Filters what is already drawn behind `bounds` (CSS `backdrop-filter`): a gaussian
-/// blur, then saturation, brightness and contrast, drawn back inside `bounds` with
-/// `corner_radii`. Renderers read the target, so everything behind must be drawn
+/// blur, then color filters in order (the same functions as a group's,
+/// [`ColorFilter`]), drawn back inside `bounds` with `corner_radii`. Renderers read the target, so everything behind must be drawn
 /// first; the scene orders it after anything within three blur radii.
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
@@ -1429,12 +1441,11 @@ pub struct BackdropFilter {
     pub corner_radii_y: Corners<ScaledPixels>,
     /// Gaussian standard deviation, in device pixels.
     pub blur_radius: ScaledPixels,
-    /// 1 leaves colors as they are; 0 is grayscale.
-    pub saturate: f32,
-    /// A multiplier.
-    pub brightness: f32,
-    /// 1 leaves colors as they are; 0 is mid gray.
-    pub contrast: f32,
+    /// [`ColorFilter::gpu`] codes, four to a vector, applied in order after the blur
+    /// ([`Self::with_color_filters`]); the first [`Self::filter_count`] apply.
+    pub filter_kinds: [[u32; 4]; 2],
+    pub filter_amounts: [[f32; 4]; 2],
+    pub filter_count: u32,
     /// A custom shader that draws the element's box instead of the filters above
     /// ([`crate::Window::paint_shader`]); [`ShaderDraw::NONE`] for none.
     pub shader: ShaderDraw,
@@ -1451,15 +1462,29 @@ impl Default for BackdropFilter {
             corner_radii: Corners::default(),
             corner_radii_y: Corners::default(),
             blur_radius: ScaledPixels(0.),
-            saturate: 1.,
-            brightness: 1.,
-            contrast: 1.,
+            filter_kinds: [[0; 4]; 2],
+            filter_amounts: [[0.; 4]; 2],
+            filter_count: 0,
             shader: ShaderDraw::NONE,
         }
     }
 }
 
 impl BackdropFilter {
+    /// The filter with `filters` applied in order after its blur: the first
+    /// [`MAX_COLOR_FILTERS`], each clamped as [`ColorFilter::gpu`] says. `opacity()`
+    /// fades the filtered backdrop over what is behind, so it multiplies [`Self::opacity`].
+    pub fn with_color_filters(mut self, filters: &[ColorFilter]) -> Self {
+        let filters = &filters[..filters.len().min(MAX_COLOR_FILTERS)];
+        for filter in filters {
+            if let ColorFilter::Opacity(amount) = filter {
+                self.opacity *= amount.clamp(0., 1.);
+            }
+        }
+        (self.filter_kinds, self.filter_amounts, self.filter_count) = pack_color_filters(filters);
+        self
+    }
+
     /// The same filter moved by `offset` (bounds and content mask).
     pub fn translated(mut self, offset: Point<ScaledPixels>) -> Self {
         self.bounds.origin = self.bounds.origin + offset;
@@ -1554,6 +1579,11 @@ pub enum ShaderInput {
     None,
     /// What is drawn behind the element, through `backdrop(uv)`.
     Backdrop,
+    /// An external texture ([`crate::Window::set_external_texture`], often one a
+    /// subtree painted into with [`crate::Window::paint_to_texture`] this frame),
+    /// through `texture_input(uv)`, `uv` 0 to 1 across the texture. Renderers
+    /// that cannot draw it (DirectX) and a missing texture read transparent black.
+    Texture(ExternalTextureId),
 }
 
 /// A shader draw within a [`BackdropFilter`].
@@ -1570,6 +1600,9 @@ pub struct ShaderDraw {
     pub reads_backdrop: PaddedBool32,
     /// Device pixels per logical pixel, for `ShaderInput`.
     pub scale_factor: f32,
+    /// One more than the index of the texture it reads in [`Scene::shader_textures`]
+    /// ([`ShaderInput::Texture`]); 0 for none.
+    pub texture: u32,
 }
 
 impl ShaderDraw {
@@ -1580,6 +1613,7 @@ impl ShaderDraw {
         uniforms_len: 0,
         reads_backdrop: PaddedBool32(0),
         scale_factor: 1.,
+        texture: 0,
     };
 
     /// The shader this draws, if any.
@@ -1592,6 +1626,23 @@ impl ShaderDraw {
     /// Whether the shader reads the backdrop.
     pub fn reads_backdrop(&self) -> bool {
         self.reads_backdrop.0 != 0
+    }
+
+    /// The external texture the shader reads ([`ShaderInput::Texture`]), if any.
+    pub fn texture(&self, scene: &Scene) -> Option<ExternalTextureId> {
+        (self.texture as usize)
+            .checked_sub(1)
+            .and_then(|index| scene.shader_textures.get(index))
+            .copied()
+    }
+
+    /// What the shader reads, as `paint_shader` was given it.
+    pub fn input(&self, scene: &Scene) -> ShaderInput {
+        match self.texture(scene) {
+            Some(id) => ShaderInput::Texture(id),
+            None if self.reads_backdrop() => ShaderInput::Backdrop,
+            None => ShaderInput::None,
+        }
     }
 
     /// Its uniform bytes in `scene`.
@@ -1630,8 +1681,9 @@ impl From<BackdropFilter> for Primitive {
 }
 
 /// How a group's image blends onto what is behind it: CSS `mix-blend-mode`
-/// (Compositing and Blending Level 1) and the `plus-lighter` and `plus-darker`
-/// compositing operators.
+/// (Compositing and Blending Level 1), the `plus-lighter` and `plus-darker`
+/// compositing operators, and the Porter-Duff operators (CSS `mask-composite`,
+/// Canvas 2D `globalCompositeOperation`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[repr(u32)]
 #[expect(missing_docs)]
@@ -1660,6 +1712,28 @@ pub enum BlendMode {
     /// premultiplied colors, `max(0, a - ((a_b - b) + (a_s - s)))` with alpha
     /// `a = min(1, a_s + a_b)`; for opaque colors `max(0, 1 - ((1 - b) + (1 - s)))`.
     PlusDarker = 17,
+    /// Porter-Duff source-in: the image where something is behind it; nothing else
+    /// remains inside the group's clip (CSS `mask-composite: intersect`).
+    SourceIn = 18,
+    /// Porter-Duff source-out: the image where nothing is behind it; nothing else
+    /// remains inside the group's clip (CSS `mask-composite: subtract`).
+    SourceOut = 19,
+    /// Porter-Duff source-atop: the image where something is behind it, over it.
+    SourceAtop = 20,
+    /// Porter-Duff destination-over: the image behind what is there.
+    DestinationOver = 21,
+    /// Porter-Duff destination-in: what is behind, where the image is; nothing else
+    /// remains inside the group's clip.
+    DestinationIn = 22,
+    /// Porter-Duff destination-out: what is behind, where the image is not.
+    DestinationOut = 23,
+    /// Porter-Duff destination-atop: what is behind over the image, where the image
+    /// is; nothing else remains inside the group's clip.
+    DestinationAtop = 24,
+    /// Porter-Duff xor: each where the other is not (CSS `mask-composite: exclude`).
+    Xor = 25,
+    /// Porter-Duff copy: the image replaces everything inside the group's clip.
+    Copy = 26,
 }
 
 impl BlendMode {
@@ -1667,6 +1741,33 @@ impl BlendMode {
     /// but normal and plus-lighter, which blending hardware draws.
     pub fn reads_backdrop(self) -> bool {
         !matches!(self, BlendMode::Normal | BlendMode::PlusLighter)
+    }
+
+    /// The Porter-Duff factors `(source, destination)` as weights of the source's
+    /// and the destination's alpha: the result is `source * Fa + destination * Fb`
+    /// on premultiplied colors, with `Fa = a.0 + a.1 * dst_alpha` and
+    /// `Fb = b.0 + b.1 * src_alpha`. `None` for the blend modes.
+    pub fn porter_duff(self) -> Option<([f32; 2], [f32; 2])> {
+        Some(match self {
+            BlendMode::SourceIn => ([0., 1.], [0., 0.]),
+            BlendMode::SourceOut => ([1., -1.], [0., 0.]),
+            BlendMode::SourceAtop => ([0., 1.], [1., -1.]),
+            BlendMode::DestinationOver => ([1., -1.], [1., 0.]),
+            BlendMode::DestinationIn => ([0., 0.], [0., 1.]),
+            BlendMode::DestinationOut => ([0., 0.], [1., -1.]),
+            BlendMode::DestinationAtop => ([1., -1.], [0., 1.]),
+            BlendMode::Xor => ([1., -1.], [1., -1.]),
+            BlendMode::Copy => ([1., 0.], [0., 0.]),
+            _ => return None,
+        })
+    }
+
+    /// Whether compositing changes what is behind where the image is transparent:
+    /// Porter-Duff operators whose destination factor is not 1 there. A group with
+    /// one composites over its whole clip ([`GroupEffects::content_mask`]), and does
+    /// even when it draws nothing.
+    pub fn clears_outside(self) -> bool {
+        self.porter_duff().is_some_and(|(_, b)| b[0] != 1.)
     }
 }
 
@@ -1690,11 +1791,16 @@ pub enum ColorFilter {
     Sepia(f32),
     /// `opacity()`: multiplies alpha. A group folds it into its opacity.
     Opacity(f32),
+    /// SVG `feColorMatrix type="luminanceToAlpha"` on a straight color, kept as
+    /// CSS `mask-mode: luminance` wants it: alpha becomes the color's luminance
+    /// (sRGB coefficients 0.2125, 0.7154, 0.0721) times its alpha, and the color
+    /// black. Groups apply it; backdrop filters ignore it.
+    LuminanceToAlpha,
 }
 
 impl ColorFilter {
     /// The code and amount shaders take: 1 brightness, 2 contrast, 3 grayscale,
-    /// 4 hue-rotate (in radians), 5 invert, 6 saturate, 7 sepia. Amounts of
+    /// 4 hue-rotate (in radians), 5 invert, 6 saturate, 7 sepia, 8 luminance to alpha. Amounts of
     /// grayscale, invert and sepia are clamped to 0..1, others to 0 and above.
     pub fn gpu(self) -> (u32, f32) {
         let unit = |amount: f32| amount.clamp(0., 1.);
@@ -1707,14 +1813,29 @@ impl ColorFilter {
             ColorFilter::Invert(amount) => (5, unit(amount)),
             ColorFilter::Saturate(amount) => (6, positive(amount)),
             ColorFilter::Sepia(amount) => (7, unit(amount)),
+            ColorFilter::LuminanceToAlpha => (8, 0.),
             // Folded into the group's opacity; shaders skip code 0.
             ColorFilter::Opacity(amount) => (0, unit(amount)),
         }
     }
 }
 
-/// The most color filters a group applies ([`GroupEffects::color_filters`]).
+/// The most color filters a group or a backdrop filter applies
+/// ([`GroupEffects::color_filters`], [`BackdropFilter::with_color_filters`]).
 pub const MAX_COLOR_FILTERS: usize = 8;
+
+/// `filters` (at most [`MAX_COLOR_FILTERS`]) as shaders take them: [`ColorFilter::gpu`]
+/// codes and amounts, four to a vector, and how many apply.
+fn pack_color_filters(filters: &[ColorFilter]) -> ([[u32; 4]; 2], [[f32; 4]; 2], u32) {
+    let mut kinds = [[0; 4]; 2];
+    let mut amounts = [[0.; 4]; 2];
+    for (i, filter) in filters.iter().take(MAX_COLOR_FILTERS).enumerate() {
+        let (kind, amount) = filter.gpu();
+        kinds[i / 4][i % 4] = kind;
+        amounts[i / 4][i % 4] = amount;
+    }
+    (kinds, amounts, filters.len().min(MAX_COLOR_FILTERS) as u32)
+}
 
 /// How a group's image is composited, in device pixels ([`Scene::push_group`]):
 /// blurred, color filtered in order, faded by `opacity`, then blended with
@@ -1872,14 +1993,8 @@ impl CompositedGroup {
     ) -> GroupCompositeUniforms {
         let rect =
             |b: Bounds<ScaledPixels>| [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0];
-        let filters = self.effects.applied_color_filters();
-        let mut filter_kinds = [[0; 4]; 2];
-        let mut filter_amounts = [[0.; 4]; 2];
-        for (i, filter) in filters.iter().enumerate() {
-            let (kind, amount) = filter.gpu();
-            filter_kinds[i / 4][i % 4] = kind;
-            filter_amounts[i / 4][i % 4] = amount;
-        }
+        let (filter_kinds, filter_amounts, filter_count) =
+            pack_color_filters(self.effects.applied_color_filters());
         GroupCompositeUniforms {
             bounds: rect(self.bounds),
             content_mask: rect(self.effects.content_mask.bounds),
@@ -1890,7 +2005,7 @@ impl CompositedGroup {
             viewport_size: viewport,
             opacity: self.effects.opacity.clamp(0., 1.),
             blend_mode: self.effects.blend_mode as u32,
-            filter_count: filters.len() as u32,
+            filter_count,
             mask_mode: self.mask.as_ref().map_or(0, |mask| mask.mode.gpu()),
             pad: [0; 2],
             mask_region,
@@ -2098,8 +2213,19 @@ impl OpenGroup {
     }
 
     fn close(mut self) -> ClosedGroup {
+        let clears = self.effects.blend_mode.clears_outside();
         if self.effects.opacity <= 0. || self.masked_out {
-            return ClosedGroup::Nothing;
+            if !clears {
+                return ClosedGroup::Nothing;
+            }
+            // What it draws is transparent, but compositing it still clears its clip.
+            self.scene = Scene {
+                in_group: true,
+                ..Scene::default()
+            };
+            self.mask = None;
+            self.masked_out = false;
+            self.effects.opacity = 1.;
         }
         let backdrop = self
             .effects
@@ -2110,8 +2236,15 @@ impl OpenGroup {
             (Some(drawn), Some(backdrop)) => drawn.union(&backdrop),
             (drawn, backdrop) => match drawn.or(backdrop) {
                 Some(drawn) => drawn,
+                None if clears => self.effects.content_mask.bounds,
                 None => return ClosedGroup::Nothing,
             },
+        };
+        // Its image covers its whole clip: compositing changes all of it.
+        let drawn = if clears {
+            self.effects.content_mask.bounds
+        } else {
+            drawn
         };
         if let Some(operations) = self.operations.take() {
             return ClosedGroup::Direct {
@@ -2501,10 +2634,11 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    /// Nonzero for an image drawn at a whole number of device pixels per texel with no
-    /// rotation or scale: the fragment shader samples texel centres, so the image's own hard
-    /// edges stay hard instead of blending into the neighbouring texel's color.
-    pub exact_scale: u32,
+    /// Nonzero samples the nearest texel (the fragment shader reads texel centres) instead of
+    /// filtering between texels: for an image painted with [`crate::TextureSampling::Nearest`]
+    /// (CSS `image-rendering: pixelated` and `crisp-edges`), whose texels stay square at any
+    /// scale.
+    pub nearest: u32,
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
@@ -2942,40 +3076,37 @@ pub mod backdrop_filter_test_scene {
             corner_radii_y: Corners::all(ScaledPixels(10.)),
             blur_radius: ScaledPixels(3.),
             opacity: 1.,
-            saturate: 1.,
-            brightness: 1.,
-            contrast: 1.,
             ..Default::default()
         });
         // Desaturate part of the red band, darken another part, and half-fade a third
         // desaturation (element opacity 0.5).
-        scene.insert_primitive(BackdropFilter {
-            bounds: bounds(4., 48., 16., 12.),
-            content_mask: full,
-            opacity: 1.,
-            saturate: 0.,
-            brightness: 1.,
-            contrast: 1.,
-            ..Default::default()
-        });
-        scene.insert_primitive(BackdropFilter {
-            bounds: bounds(40., 48., 16., 12.),
-            content_mask: full,
-            opacity: 1.,
-            saturate: 1.,
-            brightness: 0.5,
-            contrast: 1.,
-            ..Default::default()
-        });
-        scene.insert_primitive(BackdropFilter {
-            bounds: bounds(24., 48., 12., 12.),
-            content_mask: full,
-            opacity: 0.5,
-            saturate: 0.,
-            brightness: 1.,
-            contrast: 1.,
-            ..Default::default()
-        });
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds: bounds(4., 48., 16., 12.),
+                content_mask: full,
+                opacity: 1.,
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Saturate(0.)]),
+        );
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds: bounds(40., 48., 16., 12.),
+                content_mask: full,
+                opacity: 1.,
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Brightness(0.5)]),
+        );
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds: bounds(24., 48., 12., 12.),
+                content_mask: full,
+                opacity: 0.5,
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Saturate(0.)]),
+        );
         scene.finish();
         let probe = |what, x, y, rgba| Probe { what, x, y, rgba };
         let gray = 128;
@@ -3001,6 +3132,263 @@ pub mod backdrop_filter_test_scene {
             ),
             probe("darkened red", 48, 54, [128, 0, 0, 255]),
         ];
+        (scene, probes)
+    }
+}
+
+/// Backdrop filters with color filter chains, for renderer tests: each cell is a solid
+/// color under a backdrop filter whose chain (the blend scene's group chains, then
+/// `opacity()` over an inverted cell) must match the CPU reference, as a group's does.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod backdrop_chain_test_scene {
+    use super::*;
+    use crate::blend_mode_test_scene::{chains, color_filters_reference};
+    pub use crate::retained_shapes_test_scene::{Probe, check};
+    use crate::{Rgba, size};
+
+    /// Five cells of 16 x 16 device pixels in a row.
+    pub const SIZE: (i32, i32) = (80, 16);
+
+    /// The chains, then `invert(1) opacity(0.5)`: half the inverted color over the color.
+    pub fn cells() -> Vec<([f32; 3], Vec<ColorFilter>)> {
+        let mut cells: Vec<_> = chains().into_iter().collect();
+        cells.push((
+            [0.9, 0.2, 0.4],
+            vec![ColorFilter::Invert(1.), ColorFilter::Opacity(0.5)],
+        ));
+        cells
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        let mut probes = Vec::new();
+        for (column, (rgb, filters)) in cells().into_iter().enumerate() {
+            let cell = Bounds::new(
+                point(ScaledPixels(16. * column as f32), ScaledPixels(0.)),
+                size(ScaledPixels(16.), ScaledPixels(16.)),
+            );
+            let background: Hsla = Rgba {
+                r: rgb[0],
+                g: rgb[1],
+                b: rgb[2],
+                a: 1.,
+            }
+            .into();
+            scene.insert_primitive(Quad {
+                bounds: cell,
+                content_mask: full,
+                background: background.into(),
+                ..Default::default()
+            });
+            scene.insert_primitive(
+                BackdropFilter {
+                    bounds: cell,
+                    content_mask: full,
+                    ..Default::default()
+                }
+                .with_color_filters(&filters),
+            );
+            let fade: f32 = filters
+                .iter()
+                .map(|f| match f {
+                    ColorFilter::Opacity(a) => a.clamp(0., 1.),
+                    _ => 1.,
+                })
+                .product();
+            let filtered = color_filters_reference(rgb, &filters);
+            let expected: [f32; 3] =
+                std::array::from_fn(|i| filtered[i] * fade + rgb[i] * (1. - fade));
+            probes.push(Probe {
+                what: "backdrop filter chain cell",
+                x: 16 * column as u32 + 8,
+                y: 8,
+                rgba: [expected[0], expected[1], expected[2], 1.]
+                    .map(|v| (v.clamp(0., 1.) * 255.).round() as u8),
+            });
+        }
+        scene.finish();
+        (scene, probes)
+    }
+}
+
+/// Porter-Duff groups and luminance-to-alpha filters, for renderer tests. Each cell is
+/// an isolated group clipped to the cell over a white page: a backdrop over the whole
+/// cell, then a group with the operator whose source covers the cell's left half. The
+/// left half shows the operator on both; the right half shows it on the backdrop alone
+/// (operators that clear outside their image clear it there). Below: groups filtered
+/// to luminance as alpha, and source-in groups that draw nothing (the cell clears).
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod porter_duff_test_scene {
+    use super::*;
+    use crate::blend_mode_test_scene::PAIRS;
+    pub use crate::retained_shapes_test_scene::{Probe, check};
+    use crate::{Rgba, size};
+
+    /// Four 16 x 4 cells a row: the nine operators, then luminance, then empty groups.
+    pub const SIZE: (i32, i32) = (64, 44);
+
+    /// Every Porter-Duff operator, one row each.
+    pub const MODES: [BlendMode; 9] = [
+        BlendMode::SourceIn,
+        BlendMode::SourceOut,
+        BlendMode::SourceAtop,
+        BlendMode::DestinationOver,
+        BlendMode::DestinationIn,
+        BlendMode::DestinationOut,
+        BlendMode::DestinationAtop,
+        BlendMode::Xor,
+        BlendMode::Copy,
+    ];
+
+    /// Straight colors filtered to luminance as alpha, one cell each.
+    pub const LUMINANCE: [[f32; 4]; 4] = [
+        [0.3, 0.5, 0.7, 1.],
+        [1., 1., 1., 1.],
+        [0.9, 0.2, 0.4, 0.5],
+        [0.1, 0.8, 0.2, 1.],
+    ];
+
+    /// The premultiplied result of `mode` with straight `source` over straight
+    /// `backdrop`.
+    pub fn reference(mode: BlendMode, backdrop: [f32; 4], source: [f32; 4]) -> [f32; 4] {
+        let (a, b) = mode.porter_duff().expect("a Porter-Duff operator");
+        let fa = a[0] + a[1] * backdrop[3];
+        let fb = b[0] + b[1] * source[3];
+        let premultiplied = |c: [f32; 4]| [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]];
+        let (s, d) = (premultiplied(source), premultiplied(backdrop));
+        std::array::from_fn(|i| s[i] * fa + d[i] * fb)
+    }
+
+    /// The premultiplied result of [`ColorFilter::LuminanceToAlpha`] on straight `color`:
+    /// black, at its luminance times its alpha.
+    pub fn luminance_to_alpha(color: [f32; 4]) -> [f32; 4] {
+        [0., 0., 0., (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3]]
+    }
+
+    fn rgba(c: [f32; 4]) -> Hsla {
+        Rgba {
+            r: c[0],
+            g: c[1],
+            b: c[2],
+            a: c[3],
+        }
+        .into()
+    }
+
+    /// Premultiplied `c` over white, as a probe color.
+    fn over_white(c: [f32; 4]) -> [u8; 4] {
+        [c[0] + 1. - c[3], c[1] + 1. - c[3], c[2] + 1. - c[3], 1.]
+            .map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+    }
+
+    fn cell(column: usize, row: usize) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(16. * column as f32), ScaledPixels(4. * row as f32)),
+            size(ScaledPixels(16.), ScaledPixels(4.)),
+        )
+    }
+
+    /// The scene and the probes every renderer must hit.
+    pub fn scene() -> (Scene, Vec<Probe>) {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: rgba([1.; 4]).into(),
+            ..Default::default()
+        });
+        let mut probes = Vec::new();
+        let quad = |bounds, mask, color| Quad {
+            bounds,
+            content_mask: mask,
+            background: rgba(color).into(),
+            ..Default::default()
+        };
+        for (row, mode) in MODES.into_iter().enumerate() {
+            for (column, (backdrop, source)) in PAIRS.into_iter().enumerate() {
+                let bounds = cell(column, row);
+                let clip = ContentMask::from(bounds);
+                let left = Bounds::new(bounds.origin, size(ScaledPixels(8.), ScaledPixels(4.)));
+                scene.push_group(GroupEffects {
+                    content_mask: clip,
+                    ..GroupEffects::default()
+                });
+                scene.insert_primitive(quad(bounds, clip, backdrop));
+                scene.push_group(GroupEffects {
+                    blend_mode: mode,
+                    content_mask: clip,
+                    ..GroupEffects::default()
+                });
+                scene.insert_primitive(quad(left, clip, source));
+                scene.pop_group();
+                scene.pop_group();
+                for (x, source) in [(4, source), (12, [0.; 4])] {
+                    probes.push(Probe {
+                        what: "porter-duff cell",
+                        x: 16 * column as u32 + x,
+                        y: 4 * row as u32 + 2,
+                        rgba: over_white(reference(mode, backdrop, source)),
+                    });
+                }
+            }
+        }
+        let row = MODES.len();
+        for (column, color) in LUMINANCE.into_iter().enumerate() {
+            let bounds = cell(column, row);
+            scene.push_group(GroupEffects {
+                color_filters: [ColorFilter::LuminanceToAlpha].into_iter().collect(),
+                content_mask: full,
+                ..GroupEffects::default()
+            });
+            scene.insert_primitive(quad(bounds, full, color));
+            scene.pop_group();
+            probes.push(Probe {
+                what: "luminance to alpha cell",
+                x: 16 * column as u32 + 8,
+                y: 4 * row as u32 + 2,
+                rgba: over_white(luminance_to_alpha(color)),
+            });
+        }
+        // Source-in groups that draw nothing, or only transparently: the cell clears.
+        let row = row + 1;
+        for (column, (backdrop, _)) in PAIRS.into_iter().enumerate() {
+            let bounds = cell(column, row);
+            let clip = ContentMask::from(bounds);
+            scene.push_group(GroupEffects {
+                content_mask: clip,
+                ..GroupEffects::default()
+            });
+            scene.insert_primitive(quad(bounds, clip, backdrop));
+            scene.push_group(GroupEffects {
+                blend_mode: BlendMode::SourceIn,
+                opacity: if column % 2 == 0 { 1. } else { 0. },
+                content_mask: clip,
+                ..GroupEffects::default()
+            });
+            if column % 2 == 1 {
+                scene.insert_primitive(quad(bounds, clip, [0., 0., 1., 1.]));
+            }
+            scene.pop_group();
+            scene.pop_group();
+            probes.push(Probe {
+                what: "empty source-in cell",
+                x: 16 * column as u32 + 8,
+                y: 4 * row as u32 + 2,
+                rgba: [255; 4],
+            });
+        }
+        scene.finish();
         (scene, probes)
     }
 }
@@ -3182,12 +3570,14 @@ pub mod compositing_group_test_scene {
         quad(&mut scene, 34., 2., 28., 28., red);
         scene.push_group(group(0.5));
         quad(&mut scene, 36., 4., 12., 12., green);
-        scene.insert_primitive(BackdropFilter {
-            bounds: bounds(36., 4., 24., 12.),
-            content_mask: full(),
-            brightness: 0.,
-            ..Default::default()
-        });
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds: bounds(36., 4., 24., 12.),
+                content_mask: full(),
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Brightness(0.)]),
+        );
         scene.pop_group();
 
         // Nested: a half-opaque group of green and blue squares over a red one, all in
@@ -3225,12 +3615,14 @@ pub mod compositing_group_test_scene {
         quad(&mut scene, 50., 50., 12., 12., red);
         scene.push_group(GroupEffects {
             color_filters: [ColorFilter::Invert(1.)].into_iter().collect(),
-            backdrop: Some(BackdropFilter {
-                bounds: bounds(52., 52., 8., 8.),
-                content_mask: full(),
-                brightness: 0.5,
-                ..Default::default()
-            }),
+            backdrop: Some(
+                BackdropFilter {
+                    bounds: bounds(52., 52., 8., 8.),
+                    content_mask: full(),
+                    ..Default::default()
+                }
+                .with_color_filters(&[ColorFilter::Brightness(0.5)]),
+            ),
             ..group(1.)
         });
         scene.pop_group();
@@ -4082,7 +4474,7 @@ pub mod elliptical_image_test_scene {
         let mut scene = Scene::default();
         scene.insert_primitive(PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile,
             grayscale: false.into(),
             opacity: 1.,
@@ -4104,6 +4496,66 @@ pub mod elliptical_image_test_scene {
         assert!(!at(10, 10), "box corner {:?}", pixel(10, 10));
         assert!(!at(24, 9), "above the elliptical arc {:?}", pixel(24, 9));
         assert!(at(12, 26), "left tip {:?}", pixel(12, 26));
+    }
+}
+
+/// A 2x1 image (red, blue) stretched 2.5x by nearest and by linear sampling, for
+/// `image-rendering: pixelated` against `auto`.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[doc(hidden)]
+pub mod image_sampling_test_scene {
+    use super::*;
+    use crate::size;
+
+    /// The scene's size in device pixels.
+    pub const SIZE: (i32, i32) = (16, 12);
+
+    /// The image's pixels, BGRA: red, then blue.
+    pub const PIXELS: [u8; 8] = [0, 0, 255, 255, 255, 0, 0, 255];
+
+    /// The image's size in texels.
+    pub const IMAGE_SIZE: (i32, i32) = (2, 1);
+
+    /// `tile` (the image of [`PIXELS`]) at (1, 1), 5 x 10: 2.5 device pixels per texel across.
+    /// Row 1 draws it with `nearest` 0 (linear), row 6 with 1 (nearest).
+    pub fn scene(tile: AtlasTile) -> Scene {
+        let full = ContentMask::from(Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
+        ));
+        let mut scene = Scene::default();
+        for (nearest, y) in [(0, 1.), (1, 6.)] {
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                nearest,
+                tile,
+                grayscale: false.into(),
+                opacity: 1.,
+                bounds: Bounds::new(point(ScaledPixels(1.), ScaledPixels(y)), size(ScaledPixels(5.), ScaledPixels(5.))),
+                content_mask: full,
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Linear: the device pixel across the texel boundary (x 3, centre 3.5, between the texel
+    /// centres at 1.25 and 3.75 device pixels from the left edge) mixes red and blue. Nearest:
+    /// every pixel is one texel's color, red up to x 3.5 and blue after.
+    pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
+        let mixed = |p: [u8; 4]| p[0] > 40 && p[2] > 40;
+        let linear = pixel(3, 3);
+        assert!(mixed(linear), "linear blends across the texel boundary: {linear:?}");
+        for x in 1..6 {
+            let p = pixel(x, 8);
+            assert!(!mixed(p) && p[3] >= 254, "nearest pixel ({x}, 8) is one opaque texel: {p:?}");
+            if x != 3 {
+                assert_eq!(p[0] > 200, x < 3, "nearest pixel ({x}, 8) is red left of x 3, blue right: {p:?}");
+            }
+        }
     }
 }
 
@@ -4132,19 +4584,20 @@ pub mod elliptical_backdrop_test_scene {
             background: red.into(),
             ..Default::default()
         });
-        scene.insert_primitive(BackdropFilter {
-            bounds,
-            content_mask: full,
-            corner_radii: Corners::all(ScaledPixels(32.)),
-            corner_radii_y: Corners::all(ScaledPixels(18.)),
-            blur_radius: ScaledPixels(0.),
-            opacity: 1.,
-            saturate: 1.,
-            brightness: 1.,
-            contrast: 0.,
-            order: 0,
-            shader: ShaderDraw::NONE,
-        });
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds,
+                content_mask: full,
+                corner_radii: Corners::all(ScaledPixels(32.)),
+                corner_radii_y: Corners::all(ScaledPixels(18.)),
+                blur_radius: ScaledPixels(0.),
+                opacity: 1.,
+                order: 0,
+                shader: ShaderDraw::NONE,
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Contrast(0.)]),
+        );
         scene.finish();
         scene
     }
@@ -4185,7 +4638,7 @@ pub mod elliptical_shader_test_scene {
             ..Default::default()
         });
         let source = "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
-        let shader = scene.add_shader(&Shader::new(source), &[], false, 1.);
+        let shader = scene.add_shader(&Shader::new(source), &[], ShaderInput::None, 1.);
         scene.insert_primitive(BackdropFilter {
             bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
             content_mask: full,
@@ -4792,7 +5245,7 @@ mod tests {
     ) -> PolychromeSprite {
         PolychromeSprite {
             order: 0,
-            exact_scale: 0,
+            nearest: 0,
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,
@@ -4888,8 +5341,8 @@ mod tests {
         let mut scene = Scene::default();
         let shader =
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
-        let a = scene.add_shader(&shader, &[1, 2, 3, 4, 5], true, 2.);
-        let b = scene.add_shader(&shader, &[6; 8], false, 2.);
+        let a = scene.add_shader(&shader, &[1, 2, 3, 4, 5], ShaderInput::Backdrop, 2.);
+        let b = scene.add_shader(&shader, &[6; 8], ShaderInput::None, 2.);
         assert_eq!(scene.shaders.len(), 1, "one source per frame");
         assert_eq!(a.shader(&scene), Some(&shader));
         assert_eq!(a.uniforms(&scene), &[1, 2, 3, 4, 5]);
@@ -4908,8 +5361,8 @@ mod tests {
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0); }");
         let shader =
             Shader::new("fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(1.0); }");
-        previous.add_shader(&other, &[9; 32], false, 1.);
-        let draw = previous.add_shader(&shader, &[1, 2, 3, 4], true, 2.);
+        previous.add_shader(&other, &[9; 32], ShaderInput::None, 1.);
+        let draw = previous.add_shader(&shader, &[1, 2, 3, 4], ShaderInput::Backdrop, 2.);
         previous.insert_primitive(BackdropFilter {
             bounds: scaled_bounds(0., 0., 10., 10.),
             content_mask: ContentMask::from(scaled_bounds(0., 0., 10., 10.)),
@@ -4923,6 +5376,31 @@ mod tests {
         assert_eq!(replayed.uniforms(&next), &[1, 2, 3, 4]);
         assert!(replayed.reads_backdrop());
         assert_eq!(replayed.scale_factor, 2.);
+    }
+
+    #[test]
+    fn texture_inputs_are_kept_and_replayed() {
+        let mut previous = Scene::default();
+        let shader = Shader::new(
+            "fn shade(input: ShaderInput) -> vec4<f32> { return texture_input(input.uv); }",
+        );
+        let id = ExternalTextureId(0x3d);
+        let draw = previous.add_shader(&shader, &[], ShaderInput::Texture(id), 1.);
+        assert_eq!(draw.texture(&previous), Some(id));
+        assert_eq!(draw.input(&previous), ShaderInput::Texture(id));
+        assert!(!draw.reads_backdrop());
+        assert_eq!(ShaderDraw::NONE.texture(&previous), None);
+        previous.insert_primitive(BackdropFilter {
+            bounds: scaled_bounds(0., 0., 10., 10.),
+            content_mask: ContentMask::from(scaled_bounds(0., 0., 10., 10.)),
+            shader: draw,
+            ..Default::default()
+        });
+        let mut next = Scene::default();
+        next.replay(0..previous.paint_operations.len(), &previous);
+        assert_eq!(next.backdrop_filters[0].shader.texture(&next), Some(id));
+        previous.clear();
+        assert!(previous.shader_textures.is_empty());
     }
 
     #[test]
@@ -4943,7 +5421,7 @@ mod tests {
         assert!(scene.quads[0].order < filter, "{:?}", scene.quads);
         assert!(filter < scene.quads[1].order, "{:?}", scene.quads);
         assert_eq!(BackdropFilter::default().opacity, 1.);
-        assert_eq!(BackdropFilter::default().brightness, 1.);
+        assert_eq!(BackdropFilter::default().filter_count, 0);
     }
 
     #[test]
@@ -5115,12 +5593,14 @@ mod tests {
     fn a_translucent_group_is_the_backdrop_root_of_its_filters() {
         let mut scene = Scene::default();
         scene.push_group(effects(0.5));
-        scene.insert_primitive(BackdropFilter {
-            bounds: scaled_bounds(0., 0., 10., 10.),
-            content_mask: effects(1.).content_mask,
-            saturate: 0.,
-            ..Default::default()
-        });
+        scene.insert_primitive(
+            BackdropFilter {
+                bounds: scaled_bounds(0., 0., 10., 10.),
+                content_mask: effects(1.).content_mask,
+                ..Default::default()
+            }
+            .with_color_filters(&[ColorFilter::Saturate(0.)]),
+        );
         scene.pop_group();
         scene.finish();
         assert_eq!(scene.groups.len(), 1);
@@ -5235,6 +5715,36 @@ mod tests {
             assert_eq!(scene.quads.len(), 1);
             assert_eq!(scene.quads[0].background.solid.a, 0.5);
         }
+    }
+
+    #[test]
+    fn porter_duff_operators_match_their_table() {
+        use porter_duff_test_scene::{luminance_to_alpha, reference};
+        // A half-transparent red source over a half-transparent blue backdrop.
+        let (d, s) = ([0., 0., 1., 0.5], [1., 0., 0., 0.5]);
+        let close = |a: [f32; 4], e: [f32; 4]| a.iter().zip(e).all(|(a, e)| (a - e).abs() < 1e-5);
+        let cases = [
+            (BlendMode::SourceIn, [0.25, 0., 0., 0.25], true),
+            (BlendMode::SourceOut, [0.25, 0., 0., 0.25], true),
+            (BlendMode::SourceAtop, [0.25, 0., 0.25, 0.5], false),
+            (BlendMode::DestinationOver, [0.25, 0., 0.5, 0.75], false),
+            (BlendMode::DestinationIn, [0., 0., 0.25, 0.25], true),
+            (BlendMode::DestinationOut, [0., 0., 0.25, 0.25], false),
+            (BlendMode::DestinationAtop, [0.25, 0., 0.25, 0.5], true),
+            (BlendMode::Xor, [0.25, 0., 0.25, 0.5], false),
+            (BlendMode::Copy, [0.5, 0., 0., 0.5], true),
+        ];
+        for (mode, expected, clears) in cases {
+            assert!(close(reference(mode, d, s), expected), "{mode:?}");
+            assert_eq!(mode.clears_outside(), clears, "{mode:?}");
+        }
+        assert_eq!(BlendMode::Normal.porter_duff(), None);
+        assert!(!BlendMode::Multiply.clears_outside());
+
+        assert_eq!(ColorFilter::LuminanceToAlpha.gpu(), (8, 0.));
+        assert!(close(luminance_to_alpha([1., 1., 1., 1.]), [0., 0., 0., 1.]));
+        assert!(close(luminance_to_alpha([0., 1., 0., 0.5]), [0., 0., 0., 0.3577]));
+        assert!(close(luminance_to_alpha([1., 0., 0., 1.]), [0., 0., 0., 0.2125]));
     }
 
     #[test]
@@ -5640,7 +6150,8 @@ fn shade(input: ShaderInput) -> vec4<f32> {
         let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
         // Scale factor 2: the gradient's 8 logical pixels are 16 device pixels.
-        let shader = scene.add_shader(&Shader::new(source), &bytes, reads_backdrop, 2.);
+        let input = if reads_backdrop { ShaderInput::Backdrop } else { ShaderInput::None };
+        let shader = scene.add_shader(&Shader::new(source), &bytes, input, 2.);
         scene.insert_primitive(BackdropFilter {
             bounds: at,
             content_mask: full,

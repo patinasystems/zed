@@ -58,13 +58,12 @@ struct CompositeParams {
     corner_radii_y: vec4<f32>,
     // Where the filtered texture sits in the target: origin and size.
     region: vec4<f32>,
+    // `ColorFilter::gpu` codes, four to a vector, applied in order; `filter_count` apply.
+    filter_kinds: array<vec4<u32>, 2>,
+    filter_amounts: array<vec4<f32>, 2>,
     viewport_size: vec2<f32>,
-    saturate: f32,
-    brightness: f32,
-    contrast: f32,
     opacity: f32,
-    pad1: f32,
-    pad2: f32,
+    filter_count: u32,
 }
 
 @group(1) @binding(0) var<uniform> composite: CompositeParams;
@@ -129,16 +128,10 @@ fn backdrop_filtered(position: vec2<f32>) -> Filtered {
     // Filter straight colors, then weight them by the backdrop's alpha again, so
     // transparent texels stay empty.
     var rgb = select(vec3<f32>(0.0), color.rgb / max(color.a, 1e-6), color.a > 0.0);
-    // CSS saturate(), brightness(), contrast() (Filter Effects 1), in that order.
-    let s = composite.saturate;
-    let saturate_matrix = mat3x3<f32>(
-        vec3<f32>(0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s),
-        vec3<f32>(0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s),
-        vec3<f32>(0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s),
-    );
-    rgb = saturate(saturate_matrix * rgb);
-    rgb = saturate(rgb * composite.brightness);
-    rgb = saturate((rgb - 0.5) * composite.contrast + 0.5);
+    // CSS color filter functions (Filter Effects 1) in order, as a group applies them.
+    for (var i = 0u; i < composite.filter_count; i += 1u) {
+        rgb = group_color_filter(rgb, composite.filter_kinds[i / 4u][i % 4u], composite.filter_amounts[i / 4u][i % 4u]);
+    }
     // Rounded-rectangle coverage.
     let half_size = composite.bounds.zw / 2.0;
     let center_to_point = position - (composite.bounds.xy + half_size);
@@ -400,8 +393,25 @@ fn group_blend(b: vec3<f32>, s: vec3<f32>, mode: u32) -> vec3<f32> {
     }
 }
 
+// The Porter-Duff source and destination factors of `mode` (`BlendMode::porter_duff`)
+// for source alpha `sa` and destination alpha `da`.
+fn porter_duff_factors(mode: u32, sa: f32, da: f32) -> vec2<f32> {
+    switch mode {
+        case 18u: { return vec2<f32>(da, 0.0); }
+        case 19u: { return vec2<f32>(1.0 - da, 0.0); }
+        case 20u: { return vec2<f32>(da, 1.0 - sa); }
+        case 21u: { return vec2<f32>(1.0 - da, 1.0); }
+        case 22u: { return vec2<f32>(0.0, sa); }
+        case 23u: { return vec2<f32>(0.0, 1.0 - sa); }
+        case 24u: { return vec2<f32>(1.0 - da, sa); }
+        case 25u: { return vec2<f32>(1.0 - da, 1.0 - sa); }
+        default: { return vec2<f32>(1.0, 0.0); }
+    }
+}
+
 // Normal and most modes are drawn over the target (premultiplied source over),
-// plus-lighter adds, and plus-darker replaces the target with the whole result.
+// plus-lighter adds, and plus-darker and the Porter-Duff operators replace the
+// target with the whole result.
 @fragment
 fn fs_group_composite(input: GroupVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
@@ -411,15 +421,19 @@ fn fs_group_composite(input: GroupVarying) -> @location(0) vec4<f32> {
     let source_uv = (position - group_params.source_region.xy) / group_params.source_region.zw;
     var color = textureSampleLevel(t_source, s_source, source_uv, 0.0);
     if (group_params.filter_count > 0u) {
-        var rgb = color.rgb / max(color.a, 1e-6);
+        var alpha = color.a;
+        var rgb = color.rgb / max(alpha, 1e-6);
         for (var i = 0u; i < group_params.filter_count; i += 1u) {
-            rgb = group_color_filter(
-                rgb,
-                group_params.filter_kinds[i / 4u][i % 4u],
-                group_params.filter_amounts[i / 4u][i % 4u],
-            );
+            let kind = group_params.filter_kinds[i / 4u][i % 4u];
+            if (kind == 8u) {
+                // Luminance to alpha.
+                alpha *= dot(rgb, vec3<f32>(0.2125, 0.7154, 0.0721));
+                rgb = vec3<f32>(0.0);
+            } else {
+                rgb = group_color_filter(rgb, kind, group_params.filter_amounts[i / 4u][i % 4u]);
+            }
         }
-        color = vec4<f32>(rgb * color.a, color.a);
+        color = vec4<f32>(rgb * alpha, alpha);
     }
     // The mask (premultiplied, so its luminance is already times its alpha); nothing
     // outside its image. Sampled outside the branch: uniform control flow.
@@ -440,6 +454,11 @@ fn fs_group_composite(input: GroupVarying) -> @location(0) vec4<f32> {
     }
     let backdrop_uv = (position - group_params.backdrop_region.xy) / group_params.backdrop_region.zw;
     let backdrop = textureSampleLevel(t_group_backdrop, s_group_backdrop, backdrop_uv, 0.0);
+    if (mode >= 18u) {
+        // Porter-Duff (`BlendMode::porter_duff`), drawn with the replacing pipeline.
+        let f = porter_duff_factors(mode, color.a, backdrop.a);
+        return color * f.x + backdrop * f.y;
+    }
     if (mode == 17u) {
         let alpha = min(1.0, color.a + backdrop.a);
         let rgb = max(vec3<f32>(0.0), alpha - (backdrop.a - backdrop.rgb) - (color.a - color.rgb));
