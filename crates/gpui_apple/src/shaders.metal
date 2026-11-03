@@ -2663,7 +2663,7 @@ PolychromeSprite load_polychrome_sprite(constant PolychromeSpriteRecord *sprites
                                         constant float4 *tables, uint id) {
   PolychromeSpriteRecord record = sprites[id];
   PolychromeSprite sprite = {};
-  sprite.exact_scale = record.info & 1u;
+  sprite.nearest = record.info & 1u;
   sprite.tile.bounds = record.tile_bounds;
   sprite.grayscale = (record.info >> 1) & 1u;
   sprite.opacity = record.opacity;

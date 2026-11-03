@@ -2420,7 +2420,7 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     let record = load_poly_sprite_record(instance_id);
     var sprite: PolychromeSprite;
-    sprite.exact_scale = record.info & 1u;
+    sprite.nearest = record.info & 1u;
     sprite.tile.bounds = record.tile_bounds;
     sprite.grayscale = (record.info >> 1u) & 1u;
     sprite.opacity = record.opacity;

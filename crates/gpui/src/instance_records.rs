@@ -123,7 +123,7 @@ pub struct PolychromeSpriteRecord {
     pub opacity: f32,
     pub content_mask: u32,
     pub transformation: u32,
-    /// Bit 0: [`PolychromeSprite::exact_scale`]. Bit 1: grayscale. Bits 2 and up: the texel of
+    /// Bit 0: [`PolychromeSprite::nearest`]. Bit 1: grayscale. Bits 2 and up: the texel of
     /// the vertical radii, or 0 when the corners are circular.
     pub info: u32,
 }
@@ -526,7 +526,7 @@ impl InstanceTables {
             transformation,
             info: aux << 2
                 | u32::from(bool::from(sprite.grayscale)) << 1
-                | u32::from(sprite.exact_scale != 0),
+                | u32::from(sprite.nearest != 0),
         }
     }
 
@@ -755,7 +755,7 @@ mod tests {
 
         let mut sprite = tables.polychrome_sprite(&PolychromeSprite {
             order: 0,
-            exact_scale: 1,
+            nearest: 1,
             tile: AtlasTile {
                 texture_id: AtlasTextureId {
                     index: 0,
