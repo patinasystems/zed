@@ -466,9 +466,12 @@ impl WgpuAtlasTextures {
             Source::HTMLCanvasElement(c.clone())
         } else if let Some(b) = source.downcast_ref::<web_sys::ImageBitmap>() {
             Source::ImageBitmap(b.clone())
+        } else if let Some(v) = source.downcast_ref::<web_sys::HtmlVideoElement>() {
+            // The frame the video shows now: the browser's decoded frame, copied on the GPU.
+            Source::HTMLVideoElement(v.clone())
         } else {
             anyhow::bail!(
-                "an external texture copies from an OffscreenCanvas, HtmlCanvasElement or ImageBitmap"
+                "an external texture copies from an OffscreenCanvas, HtmlCanvasElement, ImageBitmap or HtmlVideoElement"
             );
         };
         let size = texture.texture.size();
