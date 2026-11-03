@@ -65,9 +65,14 @@ impl Default for IosPlatform {
 
 impl IosPlatform {
     pub fn new() -> Self {
-        let dispatcher = Arc::new(AppleDispatcher::new());
+        Self::with_text_system(Arc::new(gpui_apple::AppleTextSystem::new()))
+    }
 
-        let text_system: Arc<dyn PlatformTextSystem> = Arc::new(gpui_apple::AppleTextSystem::new());
+    /// A platform whose text (fonts, line layout, glyph rasters) is `text_system`'s: an
+    /// application that lays its text out itself gives GPUI the same layout. [`Self::new`]
+    /// uses Core Text's.
+    pub fn with_text_system(text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        let dispatcher = Arc::new(AppleDispatcher::new());
 
         let state = Rc::new(IosPlatformState {
             application: IosApplicationState::default(),

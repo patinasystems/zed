@@ -214,14 +214,11 @@ fn native_activation_policy(policy: ActivationPolicy) -> NSApplicationActivation
 
 impl MacPlatform {
     pub fn new(headless: bool) -> Self {
-        let marker = main_thread_marker().expect("Mac platform not created on main thread");
-        let dispatcher = Arc::new(AppleDispatcher::new());
-
         #[cfg(feature = "font-kit")]
-        let text_system = Arc::new(gpui_apple::AppleTextSystem::new());
+        let text_system: Arc<dyn PlatformTextSystem> = Arc::new(gpui_apple::AppleTextSystem::new());
 
         #[cfg(not(feature = "font-kit"))]
-        let text_system = {
+        let text_system: Arc<dyn PlatformTextSystem> = {
             if !headless {
                 log::warn!(
                     "gpui_macos was compiled without the `font-kit` feature, so no text will be rendered."
@@ -229,6 +226,16 @@ impl MacPlatform {
             }
             Arc::new(gpui::NoopTextSystem::new())
         };
+
+        Self::with_text_system(headless, text_system)
+    }
+
+    /// A platform whose text (fonts, line layout, glyph rasters) is `text_system`'s: an
+    /// application that lays its text out itself gives GPUI the same layout. [`Self::new`]
+    /// uses Core Text's (`font-kit`).
+    pub fn with_text_system(headless: bool, text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        let marker = main_thread_marker().expect("Mac platform not created on main thread");
+        let dispatcher = Arc::new(AppleDispatcher::new());
 
         let keyboard_layout = MacKeyboardLayout::new();
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
