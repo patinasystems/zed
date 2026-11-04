@@ -1873,6 +1873,9 @@ constant uint RETAINED_ARC = 3u;      // quadratic (0,0)-(width/2,height)-(width
 constant uint RETAINED_TRIANGLE = 4u; // (0,0)-(width,height/2)-(0,height)
 constant uint RETAINED_TEXT_BAR = 5u; // a text line at low zoom; drawn inside greek_band
 constant uint RETAINED_SOLID = 255u; // level of detail: a flat quad
+constant uint RETAINED_RECT_CSS = 254u;    // a RECT flagged CSS_STROKE
+constant uint RETAINED_ELLIPSE_CSS = 253u; // an ELLIPSE flagged CSS_STROKE
+constant uint RETAINED_CSS_STROKE = 0x800u;
 
 struct RetainedShapeVarying {
   float4 position [[position]];
@@ -1958,6 +1961,9 @@ vertex RetainedShapeVarying retained_shape_vertex(
   } else {
     // Room for the stroke and one pixel of antialiasing.
     pad = float2(half_stroke) + float2(1.0 / sx, 1.0 / sy);
+    if ((s.kind & RETAINED_CSS_STROKE) != 0u) {
+      kind = kind == RETAINED_RECT ? RETAINED_RECT_CSS : kind == RETAINED_ELLIPSE ? RETAINED_ELLIPSE_CSS : kind;
+    }
   }
   float2 local = mix(lo - pad, hi + pad, unit);
   float2 device_px = origin + col_x * local.x + col_y * local.y;
@@ -2085,8 +2091,10 @@ float retained_clip_coverage(float2 pos, constant RetainedShapesUniforms *u) {
   return coverage;
 }
 
-// Coverage of fill and stroke for a closed outline at signed distance `d_px`.
-float4 retained_fill_and_stroke(float d_px, float half_stroke, float px_per_unit,
+// Coverage of fill and stroke for a closed outline at signed distance `d_px`, whose stroke band
+// is at signed distance `band_px` (`abs(d_px)` less the half stroke, except where a square
+// corner keeps its stroke square).
+float4 retained_fill_and_stroke(float d_px, float band_px, float half_stroke, float px_per_unit,
                                 float4 fill, float4 stroke) {
   float fill_cov = clamp(0.5 - d_px, 0.0, 1.0);
   float stroke_cov = 0.0;
@@ -2094,7 +2102,7 @@ float4 retained_fill_and_stroke(float d_px, float half_stroke, float px_per_unit
     float half_stroke_px = half_stroke * px_per_unit;
     // Hairlines keep one pixel of width and fade by their width.
     float w = max(half_stroke_px, 0.5);
-    stroke_cov = clamp(w + 0.5 - abs(d_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
+    stroke_cov = clamp(w + 0.5 - (band_px + half_stroke_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
   }
   float fa = fill.a * fill_cov;
   float sa = stroke.a * stroke_cov;
@@ -2122,7 +2130,7 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   float2 half_size = in.size * 0.5;
   float2 p = in.local - half_size;
   float d;
-  if (in.kind == RETAINED_ELLIPSE) {
+  if (in.kind == RETAINED_ELLIPSE || in.kind == RETAINED_ELLIPSE_CSS) {
     d = retained_ellipse_sdf(p, half_size);
   } else if (in.kind == RETAINED_SEGMENT) {
     d = retained_segment_distance(in.local, in.size.x);
@@ -2135,8 +2143,26 @@ fragment float4 retained_shape_fragment(RetainedShapeVarying in [[stage_in]],
   } else {
     d = retained_rect_sdf(p, half_size, in.corner_radii);
   }
-  float4 color = retained_fill_and_stroke(d * in.px_per_unit, in.half_stroke, in.px_per_unit,
-                                          in.fill, in.stroke);
+  float band = abs(d) - in.half_stroke;
+  if (in.kind == RETAINED_RECT_CSS && in.half_stroke > 0.0) {
+    // The band between the outline grown and shrunk by the half stroke. A rounded corner's
+    // radius grows and shrinks with it (the same band as `abs(d)`); a square corner stays
+    // square outside (a miter join, as CSS borders and SVG rects draw it).
+    float hs = in.half_stroke;
+    float4 r = in.corner_radii;
+    float4 outer_radii = select(float4(0.0), r + hs, r > 0.0);
+    float outer = retained_rect_sdf(p, half_size + hs, outer_radii);
+    float inner = retained_rect_sdf(p, half_size - hs, max(r - hs, float4(0.0)));
+    band = max(outer, -inner);
+  } else if (in.kind == RETAINED_ELLIPSE_CSS && in.half_stroke > 0.0) {
+    // Between the ellipses with radii grown and shrunk by the half stroke (a CSS border on
+    // elliptical corners), not the offset of the center line, which is no ellipse.
+    float outer = retained_ellipse_sdf(p, half_size + in.half_stroke);
+    float inner = retained_ellipse_sdf(p, half_size - in.half_stroke);
+    band = max(outer, -inner);
+  }
+  float4 color = retained_fill_and_stroke(d * in.px_per_unit, band * in.px_per_unit, in.half_stroke,
+                                          in.px_per_unit, in.fill, in.stroke);
   if (color.a <= 0.0) {
     discard_fragment();
   }

@@ -73,6 +73,13 @@ impl ShapeInstance {
     pub const TEXT_BAR: u32 = 5;
     /// Not drawn; keeps its slot so ranges stay stable.
     pub const HIDDEN: u32 = 1 << 8;
+    /// The stroke is the band between the outline grown and shrunk by half the
+    /// stroke width, as CSS draws borders: a `RECT`'s square corner (radius 0)
+    /// stays square on its outside (a miter join) and its rounded corners grow
+    /// and shrink their radii; an `ELLIPSE`'s edges are the ellipses with radii
+    /// grown and shrunk. Without it the stroke is the band within half the
+    /// stroke width of the outline, which rounds every corner's outside.
+    pub const CSS_STROKE: u32 = 1 << 11;
     /// Drawn through the paint's layer transformation (for example a live drag).
     pub const LAYER_1: u32 = 1 << 16;
 

@@ -1904,12 +1904,16 @@ struct RetainedShapesUniforms {
 // pipelines; no entry point uses both.
 @group(2) @binding(0) var<uniform> retained_uniforms: RetainedShapesUniforms;
 
+const RETAINED_RECT: u32 = 0u;
 const RETAINED_ELLIPSE: u32 = 1u;
 const RETAINED_SEGMENT: u32 = 2u;  // (0,0)-(width,0), stroked
 const RETAINED_ARC: u32 = 3u;      // quadratic (0,0)-(width/2,height)-(width,0), stroked
 const RETAINED_TRIANGLE: u32 = 4u; // (0,0)-(width,height/2)-(0,height)
 const RETAINED_TEXT_BAR: u32 = 5u; // a text line at low zoom; drawn inside greek_band
 const RETAINED_SOLID: u32 = 255u;
+const RETAINED_RECT_CSS: u32 = 254u;    // a RECT flagged CSS_STROKE
+const RETAINED_ELLIPSE_CSS: u32 = 253u; // an ELLIPSE flagged CSS_STROKE
+const RETAINED_CSS_STROKE: u32 = 0x800u;
 
 struct RetainedShapeVarying {
     @builtin(position) position: vec4<f32>,
@@ -1992,6 +1996,13 @@ fn vs_retained_shape(@builtin(vertex_index) vertex_id: u32, @builtin(instance_in
     } else {
         // Room for the stroke and one pixel of antialiasing.
         pad = vec2<f32>(half_stroke) + vec2<f32>(1.0 / sx, 1.0 / sy);
+        if (s.kind & RETAINED_CSS_STROKE) != 0u {
+            if kind == RETAINED_RECT {
+                kind = RETAINED_RECT_CSS;
+            } else if kind == RETAINED_ELLIPSE {
+                kind = RETAINED_ELLIPSE_CSS;
+            }
+        }
     }
     let local = mix(lo - pad, hi + pad, unit);
     let device_px = origin + col_x * local.x + col_y * local.y;
@@ -2123,15 +2134,17 @@ fn retained_clip_coverage(pos: vec2<f32>) -> f32 {
     return coverage;
 }
 
-// Coverage of fill and stroke for a closed outline at signed distance `d_px`.
-fn retained_fill_and_stroke(d_px: f32, half_stroke: f32, px_per_unit: f32, fill: vec4<f32>, stroke: vec4<f32>) -> vec4<f32> {
+// Coverage of fill and stroke for a closed outline at signed distance `d_px`, whose stroke band
+// is at signed distance `band_px` (`abs(d_px)` less the half stroke, except where a square
+// corner keeps its stroke square).
+fn retained_fill_and_stroke(d_px: f32, band_px: f32, half_stroke: f32, px_per_unit: f32, fill: vec4<f32>, stroke: vec4<f32>) -> vec4<f32> {
     let fill_cov = clamp(0.5 - d_px, 0.0, 1.0);
     var stroke_cov = 0.0;
     if half_stroke > 0.0 {
         let half_stroke_px = half_stroke * px_per_unit;
         // Hairlines keep one pixel of width and fade by their width.
         let w = max(half_stroke_px, 0.5);
-        stroke_cov = clamp(w + 0.5 - abs(d_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
+        stroke_cov = clamp(w + 0.5 - (band_px + half_stroke_px), 0.0, 1.0) * min(half_stroke_px * 2.0, 1.0);
     }
     let fa = fill.a * fill_cov;
     let sa = stroke.a * stroke_cov;
@@ -2159,7 +2172,7 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     let half_size = input.size * 0.5;
     let p = input.local - half_size;
     var d: f32;
-    if input.kind == RETAINED_ELLIPSE {
+    if input.kind == RETAINED_ELLIPSE || input.kind == RETAINED_ELLIPSE_CSS {
         d = retained_ellipse_sdf(p, half_size);
     } else if input.kind == RETAINED_SEGMENT {
         d = retained_segment_distance(input.local, input.size.x);
@@ -2170,7 +2183,25 @@ fn fs_retained_shape(input: RetainedShapeVarying) -> @location(0) vec4<f32> {
     } else {
         d = retained_rect_sdf(p, half_size, input.corner_radii);
     }
-    let color = retained_fill_and_stroke(d * input.px_per_unit, input.half_stroke, input.px_per_unit, input.fill, input.stroke);
+    var band = abs(d) - input.half_stroke;
+    if input.kind == RETAINED_RECT_CSS && input.half_stroke > 0.0 {
+        // The band between the outline grown and shrunk by the half stroke. A rounded corner's
+        // radius grows and shrinks with it (the same band as `abs(d)`); a square corner stays
+        // square outside (a miter join, as CSS borders and SVG rects draw it).
+        let hs = input.half_stroke;
+        let r = input.corner_radii;
+        let outer_radii = select(vec4<f32>(0.0), r + hs, r > vec4<f32>(0.0));
+        let outer = retained_rect_sdf(p, half_size + hs, outer_radii);
+        let inner = retained_rect_sdf(p, half_size - hs, max(r - hs, vec4<f32>(0.0)));
+        band = max(outer, -inner);
+    } else if input.kind == RETAINED_ELLIPSE_CSS && input.half_stroke > 0.0 {
+        // Between the ellipses with radii grown and shrunk by the half stroke (a CSS border on
+        // elliptical corners), not the offset of the center line, which is no ellipse.
+        let outer = retained_ellipse_sdf(p, half_size + input.half_stroke);
+        let inner = retained_ellipse_sdf(p, half_size - input.half_stroke);
+        band = max(outer, -inner);
+    }
+    let color = retained_fill_and_stroke(d * input.px_per_unit, band * input.px_per_unit, input.half_stroke, input.px_per_unit, input.fill, input.stroke);
     if color.a <= 0.0 {
         discard;
     }
