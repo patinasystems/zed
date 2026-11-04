@@ -17,8 +17,6 @@ pub mod thermal;
 #[cfg(feature = "font-kit")]
 mod font_names;
 #[cfg(feature = "font-kit")]
-mod font_names;
-#[cfg(feature = "font-kit")]
 mod open_type;
 #[cfg(feature = "font-kit")]
 mod text_system;

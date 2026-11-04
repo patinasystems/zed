@@ -32,30 +32,24 @@ impl FontNames {
             if !seen.insert(path.clone()) {
                 continue;
             }
+            if sfnt_names(&path, &mut scratch).is_none() {
+                scratch = faces(&path);
+            }
+            if scratch.is_empty() {
+                continue;
+            }
             let file = this.paths.len() as u32;
-            let mut pushed = false;
-            let mut push = |name: &str, this: &mut Self| {
+            for name in &scratch {
                 this.names.push_str(name);
                 this.ends.push(this.names.len() as u32);
                 this.file.push(file);
-                pushed = true;
-            };
-            if sfnt_names(&path, &mut scratch).is_some() {
-                for name in scratch.iter() {
-                    push(name, &mut this);
-                }
-            } else {
-                for name in faces(&path) {
-                    push(&name, &mut this);
-                }
             }
-            if pushed {
-                this.paths.push(path);
-            }
+            this.paths.push(path);
         }
-        this.order = (0..this.ends.len() as u32).collect();
+        let mut order: Vec<u32> = (0..this.ends.len() as u32).collect();
         // Stable: among equal names, the earlier file stays first.
-        this.order.sort_by(|&a, &b| this.name(a).cmp(this.name(b)));
+        order.sort_by(|&a, &b| this.name(a).cmp(this.name(b)));
+        this.order = order;
         this
     }
 
