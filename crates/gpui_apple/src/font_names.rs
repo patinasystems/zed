@@ -79,7 +79,14 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
+/// The most a table read takes: real `name` and `fvar` tables are kilobytes, and a malformed
+/// length must not allocate more (the file then goes through Core Text).
+const MAX_READ: usize = 1 << 20;
+
 fn read(file: &File, at: u64, len: usize) -> Option<Vec<u8>> {
+    if len > MAX_READ {
+        return None;
+    }
     let mut buf = vec![0; len];
     file.read_exact_at(&mut buf, at).ok()?;
     Some(buf)
