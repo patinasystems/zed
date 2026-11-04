@@ -73,6 +73,10 @@ struct AppleTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
+    /// Bit `i` set: `fonts[i]` has an optical size axis (`opsz`). Read once when the font is
+    /// loaded: asking Core Text (`CTFontCopyVariationAxes`) copies the font's localized names,
+    /// milliseconds per call, which a glyph raster at each new size paid twice.
+    opsz: Vec<u64>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
@@ -95,6 +99,7 @@ impl AppleTextSystem {
             memory_source: MemSource::empty(),
             system_source: SystemSource::new(),
             fonts: Vec::new(),
+            opsz: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
@@ -470,6 +475,23 @@ fn font_smoothing_allowed_by_user() -> bool {
 }
 
 impl AppleTextSystemState {
+    /// Adds `font` as the next `FontId`, noting whether it has an optical size axis.
+    fn push_font(&mut self, font: FontKitFont) {
+        let i = self.fonts.len();
+        if i % 64 == 0 {
+            self.opsz.push(0);
+        }
+        if has_opsz(&font.native_font()) {
+            self.opsz[i / 64] |= 1 << (i % 64);
+        }
+        self.fonts.push(font);
+    }
+
+    /// Whether font `font_id` has an optical size axis (read when it was loaded).
+    fn opsz(&self, font_id: FontId) -> bool {
+        self.opsz[font_id.0 / 64] & (1 << (font_id.0 % 64)) != 0
+    }
+
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         let fonts = fonts
             .into_iter()
@@ -594,7 +616,7 @@ impl AppleTextSystemState {
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
-            self.fonts.push(font);
+            self.push_font(font);
         }
         Ok(font_ids)
     }
@@ -613,11 +635,10 @@ impl AppleTextSystemState {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<Option<Size<f32>>> {
-        let font = &self.fonts[font_id.0];
-        if !has_opsz(&font.native_font()) {
+        if !self.opsz(font_id) {
             return Ok(None);
         }
-        let font = font_at_size(font, f32::from(font_size));
+        let font = font_at_size(&self.fonts[font_id.0], true, f32::from(font_size));
         let glyph = glyph_id.0 as CGGlyph;
         let mut advance = core_graphics::geometry::CGSize::new(0., 0.);
         unsafe { font.get_advances_for_glyphs(kCTFontOrientationDefault, &glyph, &mut advance, 1) };
@@ -643,7 +664,7 @@ impl AppleTextSystemState {
                 .insert(postscript_name.to_string(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name.to_string());
-            self.fonts.push(font);
+            self.push_font(font);
             return Some(font_id);
         }
         // Core Text opens the system UI fonts (their names start with a period) only through
@@ -722,10 +743,9 @@ impl AppleTextSystemState {
         self.font_ids_by_postscript_name.insert(key, font_id);
         self.postscript_names_by_font_id
             .insert(font_id, postscript_name.to_string());
-        self.fonts
-            .push(font_kit::font::Font::from_core_graphics_font(
-                instance.copy_to_CGFont(),
-            ));
+        self.push_font(font_kit::font::Font::from_core_graphics_font(
+            instance.copy_to_CGFont(),
+        ));
         font_id
     }
 
@@ -739,10 +759,9 @@ impl AppleTextSystemState {
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
-            self.fonts
-                .push(font_kit::font::Font::from_core_graphics_font(
-                    requested_font.copy_to_CGFont(),
-                ));
+            self.push_font(font_kit::font::Font::from_core_graphics_font(
+                requested_font.copy_to_CGFont(),
+            ));
             font_id
         }
     }
@@ -759,7 +778,11 @@ impl AppleTextSystemState {
         // Measure the glyph with a font at the size `rasterize_glyph` draws it at. Fonts with
         // optical sizes, such as the system font, change their outlines with the point size, so
         // bounds measured at another size and scaled can be too small and clip the glyph.
-        let font = font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size));
+        let font = font_at_size(
+            &self.fonts[params.font_id.0],
+            self.opsz(params.font_id),
+            f32::from(params.font_size),
+        );
         let rect = font.get_bounding_rects_for_glyphs(
             kCTFontOrientationDefault,
             &[params.glyph_id.0 as CGGlyph],
@@ -857,7 +880,12 @@ impl AppleTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            font_at_size(&self.fonts[params.font_id.0], f32::from(params.font_size)).draw_glyphs(
+            font_at_size(
+                &self.fonts[params.font_id.0],
+                self.opsz(params.font_id),
+                f32::from(params.font_size),
+            )
+            .draw_glyphs(
                 &[params.glyph_id.0 as CGGlyph],
                 &[CGPoint::new(
                     (subpixel_shift.x / params.scale_factor) as CGFloat,
@@ -915,7 +943,7 @@ impl AppleTextSystemState {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font_at_size(font, font_size.into()),
+                        &font_at_size(font, self.opsz(run.font_id), font_size.into()),
                     );
                 }
                 break_ligature = !break_ligature;
@@ -1067,9 +1095,11 @@ fn has_opsz(font: &CTFont) -> bool {
 /// keeps the face and its optical size. Copying the font's whole descriptor with an `opsz`
 /// variation instead resolves the descriptor again, and a named instance can come back as
 /// another face whose glyph ids differ, so bold text drew the wrong glyphs.
-fn font_at_size(font: &FontKitFont, size: f32) -> CTFont {
+///
+/// `opsz`: whether the font has an optical size axis ([`has_opsz`], read once per font).
+fn font_at_size(font: &FontKitFont, opsz: bool, size: f32) -> CTFont {
     let native = font.native_font();
-    if !has_opsz(&native) {
+    if !opsz {
         return native.clone_with_font_size(size as CGFloat);
     }
     let sized = core_text::font::new_from_CGFont(&native.copy_to_CGFont(), size as f64);
@@ -1801,7 +1831,7 @@ mod tests {
             );
             let stem = own.split('-').next().unwrap().to_string();
             for size in [12., 28., 72.] {
-                let sized = super::font_at_size(face, size);
+                let sized = super::font_at_size(face, true, size);
                 let name = sized.postscript_name();
                 assert!(name.starts_with(&stem), "{own} at {size}pt is {name}");
                 for c in "AÒs".chars() {
