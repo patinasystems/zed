@@ -58,7 +58,7 @@ fuzzy_nucleo.workspace = true
 git.workspace = true
 git_hosting_providers.workspace = true
 globset.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["svg"] }
 http_client = { workspace = true, features = ["github-download"] }
 image.workspace = true
 indexmap.workspace = true

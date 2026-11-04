@@ -3736,6 +3736,7 @@ mod image_tests {
         assert_eq!(&bytes[(16 * 32 - 1) * 4..], &[0, 0, 0, 255]);
     }
 
+    #[cfg(feature = "svg")]
     #[test]
     fn test_svg_image_to_image_data_converts_to_bgra() {
         let image = Image::from_bytes(

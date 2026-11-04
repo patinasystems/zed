@@ -16,7 +16,7 @@ doctest = false
 [dependencies]
 multi_buffer.workspace = true
 file_icons.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["svg"] }
 language.workspace = true
 project.workspace = true
 ui.workspace = true

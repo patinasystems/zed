@@ -22,7 +22,7 @@ test-support = [
 anyhow.workspace = true
 base64.workspace = true
 collections.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["svg"] }
 html5ever.workspace = true
 language.workspace = true
 linkify.workspace = true
