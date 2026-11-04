@@ -54,6 +54,7 @@ use {
     std::sync::OnceLock,
 };
 
+use crate::font_names::FontNames;
 use crate::open_type::apply_features_and_fallbacks;
 
 #[allow(non_upper_case_globals)]
@@ -83,13 +84,13 @@ struct AppleTextSystemState {
     postscript_names_by_font_id: HashMap<FontId, String>,
     /// The faces in the system UI font's own files, read on the first lookup Core Text cannot
     /// answer by name.
-    system_ui_own_files: Option<HashMap<String, std::path::PathBuf>>,
+    system_ui_own_files: Option<FontNames>,
     /// The PostScript names in the system UI font's files and its cascade's, with their file,
     /// read on the first lookup the UI font's own files cannot answer.
-    system_ui_font_files: Option<HashMap<String, std::path::PathBuf>>,
+    system_ui_font_files: Option<FontNames>,
     /// The same for every font file Core Text makes available, read on the first lookup the
     /// UI fonts cannot answer.
-    available_font_files: Option<HashMap<String, std::path::PathBuf>>,
+    available_font_files: Option<FontNames>,
 }
 
 impl AppleTextSystem {
@@ -335,7 +336,7 @@ fn file_descriptors(path: &std::path::Path) -> Vec<CTFontDescriptor> {
 }
 
 /// Every PostScript name in the system UI font's own file, with the file.
-fn system_ui_own_files() -> HashMap<String, std::path::PathBuf> {
+fn system_ui_own_files() -> FontNames {
     let ui = core_text::font::new_ui_font_for_language(
         core_text::font::kCTFontSystemFontType,
         12.,
@@ -346,7 +347,7 @@ fn system_ui_own_files() -> HashMap<String, std::path::PathBuf> {
 
 /// Every PostScript name in the files of the system UI font and of the fonts its cascade lists
 /// for the languages with their own fallbacks (CJK), with the file it is in.
-fn system_ui_font_files() -> HashMap<String, std::path::PathBuf> {
+fn system_ui_font_files() -> FontNames {
     let ui = core_text::font::new_ui_font_for_language(
         core_text::font::kCTFontSystemFontType,
         12.,
@@ -378,7 +379,7 @@ fn system_ui_font_files() -> HashMap<String, std::path::PathBuf> {
 
 /// Every PostScript name in the font files Core Text makes available and in the system font
 /// directory (which also holds the hidden system fonts, such as SF Mono), with its file.
-fn available_font_files() -> HashMap<String, std::path::PathBuf> {
+fn available_font_files() -> FontNames {
     let mut paths = system_font_files();
     paths.extend(available_font_paths());
     names_in_files(paths)
@@ -426,20 +427,18 @@ fn available_font_paths() -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-fn names_in_files(paths: Vec<std::path::PathBuf>) -> HashMap<String, std::path::PathBuf> {
-    let mut names = HashMap::default();
-    let mut seen = HashSet::default();
-    for path in paths {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        for descriptor in file_descriptors(&path) {
-            names
-                .entry(descriptor.font_name())
-                .or_insert_with(|| path.clone());
-        }
-    }
-    names
+/// The PostScript names in `paths`, read from the files' tables; Core Text opens only the
+/// files those cannot name.
+fn names_in_files(paths: Vec<std::path::PathBuf>) -> FontNames {
+    FontNames::index(paths, core_text_names)
+}
+
+/// The PostScript names of the faces Core Text reads in the file at `path`.
+fn core_text_names(path: &std::path::Path) -> Vec<String> {
+    file_descriptors(path)
+        .iter()
+        .map(|descriptor| descriptor.font_name())
+        .collect()
 }
 
 /// The face named `postscript_name` in the font file at `path`.
@@ -684,13 +683,13 @@ impl AppleTextSystemState {
             .system_ui_own_files
             .get_or_insert_with(system_ui_own_files)
             .get(postscript_name)
-            .cloned();
+            .map(std::path::Path::to_path_buf);
         if path.is_none() {
             path = self
                 .system_ui_font_files
                 .get_or_insert_with(system_ui_font_files)
                 .get(postscript_name)
-                .cloned();
+                .map(std::path::Path::to_path_buf);
         }
         if path.is_none() {
             // Other hidden system fonts (`.SFNSMono-Regular`, the system monospaced font):
@@ -699,7 +698,7 @@ impl AppleTextSystemState {
                 .available_font_files
                 .get_or_insert_with(available_font_files)
                 .get(postscript_name)
-                .cloned();
+                .map(std::path::Path::to_path_buf);
         }
         let font = font_from_file(&path?, postscript_name)?;
         Some(self.id_for_native_font(font))
@@ -1330,6 +1329,92 @@ mod tests {
             fonts
                 .font_id_for_postscript_name_with_variations("NoSuchFont-Regular", &[(wght, 500.)])
                 .is_none()
+        );
+    }
+
+    /// The names read from each font file's tables are the names Core Text reads in it.
+    #[test]
+    fn test_table_names_match_core_text() {
+        let mut paths = super::system_font_files();
+        paths.extend(super::available_font_paths());
+        paths.sort();
+        paths.dedup();
+        let (mut read, mut fallback, mut mismatched) = (0, 0, Vec::new());
+        let mut names = Vec::new();
+        for path in &paths {
+            if crate::font_names::sfnt_names(path, &mut names).is_none() {
+                fallback += 1;
+                continue;
+            }
+            read += 1;
+            let mut ours = names.clone();
+            ours.sort();
+            let mut theirs = super::core_text_names(path);
+            theirs.sort();
+            theirs.dedup();
+            if ours != theirs {
+                mismatched.push(format!(
+                    "{}: tables {ours:?}, Core Text {theirs:?}",
+                    path.display()
+                ));
+            }
+        }
+        eprintln!(
+            "table names: {read} files read, {fallback} through Core Text, {} mismatched",
+            mismatched.len()
+        );
+        assert!(mismatched.is_empty(), "{}", mismatched.join("\n"));
+        assert!(read > fallback);
+    }
+
+    /// Time and memory to index every available font file's names: from the tables, or
+    /// (`FONT_NAMES_CORE_TEXT=1`) as before, every file through Core Text.
+    #[test]
+    #[ignore]
+    fn probe_index_every_font_file() {
+        fn vm() -> mach2::task_info::task_vm_info {
+            let mut info = mach2::task_info::task_vm_info::default();
+            let mut count = (std::mem::size_of_val(&info) / 4) as u32;
+            unsafe {
+                mach2::task::task_info(
+                    mach2::traps::mach_task_self(),
+                    mach2::task_info::TASK_VM_INFO,
+                    &mut info as *mut _ as *mut i32,
+                    &mut count,
+                )
+            };
+            info
+        }
+        let mb = |a: u64, b: u64| (b as f64 - a as f64) / 1e6;
+        let core_text = std::env::var_os("FONT_NAMES_CORE_TEXT").is_some();
+        let before = vm();
+        let start = std::time::Instant::now();
+        let names = if core_text {
+            let mut paths = super::system_font_files();
+            paths.extend(super::available_font_paths());
+            let mut names = std::collections::HashMap::new();
+            for path in paths {
+                for name in super::core_text_names(&path) {
+                    names.entry(name).or_insert_with(|| path.clone());
+                }
+            }
+            names.len()
+        } else {
+            super::available_font_files().len()
+        };
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        let after = vm();
+        let (bv, av) = (before.virtual_size, after.virtual_size);
+        let (be, ae) = (before.external, after.external);
+        let (bi, ai) = (before.internal, after.internal);
+        let (bf, af) = (before.phys_footprint, after.phys_footprint);
+        eprintln!(
+            "PROBE {}: {names} names in {ms:.1} ms; virtual {:+.1} MB, file-backed resident {:+.1} MB, internal {:+.1} MB, footprint {:+.1} MB",
+            if core_text { "core text" } else { "tables" },
+            mb(bv, av),
+            mb(be, ae),
+            mb(bi, ai),
+            mb(bf, af),
         );
     }
 
