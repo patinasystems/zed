@@ -15,6 +15,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -616,7 +617,7 @@ impl Scene {
         for path in &mut self.paths {
             bounds(&mut path.bounds);
             mask(&mut path.content_mask);
-            for vertex in &mut path.vertices {
+            for vertex in Arc::make_mut(&mut path.vertices) {
                 vertex.xy_position = vertex.xy_position + offset;
                 mask(&mut vertex.content_mask);
             }
@@ -2699,7 +2700,9 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub order: DrawOrder,
     pub bounds: Bounds<P>,
     pub content_mask: ContentMask<P>,
-    pub vertices: Vec<PathVertex<P>>,
+    /// Shared: a cached view's paint replays its paths into the next frame's scene without
+    /// copying their vertices.
+    pub vertices: Arc<Vec<PathVertex<P>>>,
     pub color: Background,
     start: Point<P>,
     current: Point<P>,
@@ -2712,7 +2715,7 @@ impl Path<Pixels> {
         Self {
             id: PathId(0),
             order: DrawOrder::default(),
-            vertices: Vec::new(),
+            vertices: Arc::default(),
             start,
             current: start,
             bounds: Bounds {
@@ -2732,11 +2735,12 @@ impl Path<Pixels> {
             order: self.order,
             bounds: self.bounds.scale(factor),
             content_mask: self.content_mask.scale(factor),
-            vertices: self
-                .vertices
-                .iter()
-                .map(|vertex| vertex.scale(factor))
-                .collect(),
+            vertices: Arc::new(
+                self.vertices
+                    .iter()
+                    .map(|vertex| vertex.scale(factor))
+                    .collect(),
+            ),
             start: self.start.map(|start| start.scale(factor)),
             current: self.current.scale(factor),
             contour_count: self.contour_count,
@@ -2801,17 +2805,18 @@ impl Path<Pixels> {
                 size: Default::default(),
             });
 
-        self.vertices.push(PathVertex {
+        let vertices = Arc::make_mut(&mut self.vertices);
+        vertices.push(PathVertex {
             xy_position: xy.0,
             st_position: st.0,
             content_mask: Default::default(),
         });
-        self.vertices.push(PathVertex {
+        vertices.push(PathVertex {
             xy_position: xy.1,
             st_position: st.1,
             content_mask: Default::default(),
         });
-        self.vertices.push(PathVertex {
+        vertices.push(PathVertex {
             xy_position: xy.2,
             st_position: st.2,
             content_mask: Default::default(),
@@ -2827,7 +2832,7 @@ impl Path<ScaledPixels> {
             return;
         }
         let apply = |p: Point<ScaledPixels>| transformation.apply_scaled(p);
-        for vertex in &mut self.vertices {
+        for vertex in Arc::make_mut(&mut self.vertices) {
             vertex.xy_position = apply(vertex.xy_position);
         }
         self.start = apply(self.start);
@@ -3273,7 +3278,12 @@ pub mod porter_duff_test_scene {
     /// The premultiplied result of [`ColorFilter::LuminanceToAlpha`] on straight `color`:
     /// black, at its luminance times its alpha.
     pub fn luminance_to_alpha(color: [f32; 4]) -> [f32; 4] {
-        [0., 0., 0., (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3]]
+        [
+            0.,
+            0.,
+            0.,
+            (0.2125 * color[0] + 0.7154 * color[1] + 0.0721 * color[2]) * color[3],
+        ]
     }
 
     fn rgba(c: [f32; 4]) -> Hsla {
@@ -3294,7 +3304,10 @@ pub mod porter_duff_test_scene {
 
     fn cell(column: usize, row: usize) -> Bounds<ScaledPixels> {
         Bounds::new(
-            point(ScaledPixels(16. * column as f32), ScaledPixels(4. * row as f32)),
+            point(
+                ScaledPixels(16. * column as f32),
+                ScaledPixels(4. * row as f32),
+            ),
             size(ScaledPixels(16.), ScaledPixels(4.)),
         )
     }
@@ -4309,7 +4322,8 @@ pub mod elliptical_corner_test_scene {
             let cx = if right { w - inset - rx } else { inset + rx };
             let cy = if bottom { h - inset - ry } else { inset + ry };
             let (dx, dy) = (x - cx, y - cy);
-            let in_box = (right && dx > 0. || !right && dx < 0.) && (bottom && dy > 0. || !bottom && dy < 0.);
+            let in_box = (right && dx > 0. || !right && dx < 0.)
+                && (bottom && dy > 0. || !bottom && dy < 0.);
             if !in_box || rx == 0. || ry == 0. {
                 return true;
             }
@@ -4435,7 +4449,15 @@ pub mod elliptical_dashes_test_scene {
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
         ));
-        let color = |v: f32| -> Hsla { Rgba { r: v, g: v, b: v, a: 1. }.into() };
+        let color = |v: f32| -> Hsla {
+            Rgba {
+                r: v,
+                g: v,
+                b: v,
+                a: 1.,
+            }
+            .into()
+        };
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds: full.bounds,
@@ -4445,14 +4467,22 @@ pub mod elliptical_dashes_test_scene {
         });
         let b = ScaledPixels(3.);
         scene.insert_primitive(Quad {
-            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            bounds: Bounds::new(
+                point(ScaledPixels(8.), ScaledPixels(8.)),
+                size(ScaledPixels(64.), ScaledPixels(36.)),
+            ),
             content_mask: full,
             background: color(1.).into(),
             border_color: color(0.),
             border_style: BorderStyle::Dashed,
             corner_radii: Corners::all(ScaledPixels(32.)),
             corner_radii_y: Corners::all(ScaledPixels(18.)),
-            border_widths: Edges { top: b, right: b, bottom: b, left: b },
+            border_widths: Edges {
+                top: b,
+                right: b,
+                bottom: b,
+                left: b,
+            },
             ..Default::default()
         });
         scene.finish();
@@ -4493,12 +4523,39 @@ pub mod rounded_dashes_test_scene {
     pub const SIZE: (i32, i32) = (240, 240);
 
     /// Each box: its bounds `[x, y, w, h]` and corner radius.
-    const BOXES: [([f32; 4], f32); 2] = [([10., 10., 100., 100.], 50.), ([10., 120., 200., 100.], 20.)];
+    const BOXES: [([f32; 4], f32); 2] = [
+        ([10., 10., 100., 100.], 50.),
+        ([10., 120., 200., 100.], 20.),
+    ];
 
     /// Positions along each box's outer edge at the middle of a WebKit dash (`true`) or gap.
     const EXPECTED: [&[(f32, bool)]; 2] = [
-        &[(6., false), (18., true), (30., false), (42., true), (54., false), (66., true), (162., true), (174., false), (306., true)],
-        &[(2., false), (6., false), (18.2, true), (30.7, false), (43., true), (55.5, false), (67.7, true), (80., false), (92.2, true), (104.4, false), (264., true), (276., false), (532.8, true)],
+        &[
+            (6., false),
+            (18., true),
+            (30., false),
+            (42., true),
+            (54., false),
+            (66., true),
+            (162., true),
+            (174., false),
+            (306., true),
+        ],
+        &[
+            (2., false),
+            (6., false),
+            (18.2, true),
+            (30.7, false),
+            (43., true),
+            (55.5, false),
+            (67.7, true),
+            (80., false),
+            (92.2, true),
+            (104.4, false),
+            (264., true),
+            (276., false),
+            (532.8, true),
+        ],
     ];
 
     pub fn scene() -> Scene {
@@ -4506,20 +4563,41 @@ pub mod rounded_dashes_test_scene {
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
         ));
-        let color = |v: f32| -> Hsla { Rgba { r: v, g: v, b: v, a: 1. }.into() };
+        let color = |v: f32| -> Hsla {
+            Rgba {
+                r: v,
+                g: v,
+                b: v,
+                a: 1.,
+            }
+            .into()
+        };
         let mut scene = Scene::default();
-        scene.insert_primitive(Quad { bounds: full.bounds, content_mask: full, background: color(1.).into(), ..Default::default() });
+        scene.insert_primitive(Quad {
+            bounds: full.bounds,
+            content_mask: full,
+            background: color(1.).into(),
+            ..Default::default()
+        });
         let b = ScaledPixels(4.);
         for ([x, y, w, h], r) in BOXES {
             scene.insert_primitive(Quad {
-                bounds: Bounds::new(point(ScaledPixels(x), ScaledPixels(y)), size(ScaledPixels(w), ScaledPixels(h))),
+                bounds: Bounds::new(
+                    point(ScaledPixels(x), ScaledPixels(y)),
+                    size(ScaledPixels(w), ScaledPixels(h)),
+                ),
                 content_mask: full,
                 background: color(1.).into(),
                 border_color: color(0.),
                 border_style: BorderStyle::Dashed,
                 corner_radii: Corners::all(ScaledPixels(r)),
                 corner_radii_y: Corners::all(ScaledPixels(r)),
-                border_widths: Edges { top: b, right: b, bottom: b, left: b },
+                border_widths: Edges {
+                    top: b,
+                    right: b,
+                    bottom: b,
+                    left: b,
+                },
                 ..Default::default()
             });
         }
@@ -4565,7 +4643,10 @@ pub mod rounded_dashes_test_scene {
                 let (px, py) = (p[0] + n[0] * 2., p[1] + n[1] * 2.);
                 let v = pixel(px as u32, py as u32)[0];
                 if (dash && v > 80) || (!dash && v < 180) {
-                    misses.push(format!("box {rect:?} at {s} ({px:.1}, {py:.1}): expected {}, red {v}", if dash { "a dash" } else { "a gap" }));
+                    misses.push(format!(
+                        "box {rect:?} at {s} ({px:.1}, {py:.1}): expected {}, red {v}",
+                        if dash { "a dash" } else { "a gap" }
+                    ));
                 }
             }
         }
@@ -4595,8 +4676,20 @@ pub mod elliptical_shadow_test_scene {
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
         ));
-        let white: Hsla = Rgba { r: 1., g: 1., b: 1., a: 1. }.into();
-        let black: Hsla = Rgba { r: 0., g: 0., b: 0., a: 1. }.into();
+        let white: Hsla = Rgba {
+            r: 1.,
+            g: 1.,
+            b: 1.,
+            a: 1.,
+        }
+        .into();
+        let black: Hsla = Rgba {
+            r: 0.,
+            g: 0.,
+            b: 0.,
+            a: 1.,
+        }
+        .into();
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds: full.bounds,
@@ -4605,8 +4698,14 @@ pub mod elliptical_shadow_test_scene {
             ..Default::default()
         });
         for (y, blur) in [(8., 0.), (56., 4.)] {
-            let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(y)), size(ScaledPixels(64.), ScaledPixels(36.)));
-            let element_bounds = Bounds::new(point(ScaledPixels(8. + ELEMENT_OFFSET), ScaledPixels(y)), bounds.size);
+            let bounds = Bounds::new(
+                point(ScaledPixels(8.), ScaledPixels(y)),
+                size(ScaledPixels(64.), ScaledPixels(36.)),
+            );
+            let element_bounds = Bounds::new(
+                point(ScaledPixels(8. + ELEMENT_OFFSET), ScaledPixels(y)),
+                bounds.size,
+            );
             scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: ScaledPixels(blur),
@@ -4631,25 +4730,60 @@ pub mod elliptical_shadow_test_scene {
     /// of radius 18 would cover them), and the blurred oval's corner is lighter than its edge midpoint.
     pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
         let at = |x: u32, y: u32| pixel(x, y)[0] as i32;
-        assert!(at(40, 26) < 20, "the oval's center is shadowed: {}", at(40, 26));
-        assert!(at(10, 10) > 235, "the oval's box corner stays clear: {}", at(10, 10));
+        assert!(
+            at(40, 26) < 20,
+            "the oval's center is shadowed: {}",
+            at(40, 26)
+        );
+        assert!(
+            at(10, 10) > 235,
+            "the oval's box corner stays clear: {}",
+            at(10, 10)
+        );
         // Where a circle of the smaller radius (18) would still shadow: (24, 9) is above the oval's
         // arc there (y = 10.4 at x = 24) and inside that circle's.
-        assert!(at(24, 9) > 200, "the arc is elliptical, not the smaller circle: {}", at(24, 9));
+        assert!(
+            at(24, 9) > 200,
+            "the arc is elliptical, not the smaller circle: {}",
+            at(24, 9)
+        );
         // Along the long axis the oval is wide: (13, 26) is inside it (an ellipse reaches x = 8 + 32 - 32 * sqrt(1 - ((26 - 26) / 18)^2)).
-        assert!(at(12, 26) < 30, "the oval's left tip is shadowed: {}", at(12, 26));
+        assert!(
+            at(12, 26) < 30,
+            "the oval's left tip is shadowed: {}",
+            at(12, 26)
+        );
         // Blurred: the box corner is much lighter than the middle of an edge the same distance in.
         let corner = at(12, 60);
         let edge = at(40, 60);
-        assert!(corner > edge + 40, "blurred corner {corner} against center {edge}");
+        assert!(
+            corner > edge + 40,
+            "blurred corner {corner} against center {edge}"
+        );
         // A sharp circle of radius 32 would reach (40, 8 + 4): the oval's top edge at x = 40 is y = 8.
-        assert!(at(40, 10) < 60, "the oval's top edge is shadowed: {}", at(40, 10));
+        assert!(
+            at(40, 10) < 60,
+            "the oval's top edge is shadowed: {}",
+            at(40, 10)
+        );
         // Under the element (an oval centered at (80, 26)) the shadow is clipped away, though
         // (64, 26) is inside the shadow's oval too. Left of the element's tip (x = 48) it stays.
-        assert!(at(64, 26) > 235, "no shadow under its element: {}", at(64, 26));
-        assert!(at(44, 26) < 20, "shadowed left of the element's tip: {}", at(44, 26));
+        assert!(
+            at(64, 26) > 235,
+            "no shadow under its element: {}",
+            at(64, 26)
+        );
+        assert!(
+            at(44, 26) < 20,
+            "shadowed left of the element's tip: {}",
+            at(44, 26)
+        );
         // (52, 12) is inside the element's box but outside its oval: the clip is the oval, not the box.
-        assert!(at(52, 12) < 20, "the clip follows the element's oval: {}", at(52, 12));
+        assert!(
+            at(52, 12) < 20,
+            "the clip follows the element's oval: {}",
+            at(52, 12)
+        );
     }
 }
 
@@ -4676,7 +4810,10 @@ pub mod elliptical_image_test_scene {
             tile,
             grayscale: false.into(),
             opacity: 1.,
-            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            bounds: Bounds::new(
+                point(ScaledPixels(8.), ScaledPixels(8.)),
+                size(ScaledPixels(64.), ScaledPixels(36.)),
+            ),
             content_mask: full,
             corner_radii: Corners::all(ScaledPixels(32.)),
             corner_radii_y: Corners::all(ScaledPixels(18.)),
@@ -4729,7 +4866,10 @@ pub mod image_sampling_test_scene {
                 tile,
                 grayscale: false.into(),
                 opacity: 1.,
-                bounds: Bounds::new(point(ScaledPixels(1.), ScaledPixels(y)), size(ScaledPixels(5.), ScaledPixels(5.))),
+                bounds: Bounds::new(
+                    point(ScaledPixels(1.), ScaledPixels(y)),
+                    size(ScaledPixels(5.), ScaledPixels(5.)),
+                ),
                 content_mask: full,
                 corner_radii: Corners::default(),
                 corner_radii_y: Corners::default(),
@@ -4746,12 +4886,22 @@ pub mod image_sampling_test_scene {
     pub fn check(pixel: impl Fn(u32, u32) -> [u8; 4]) {
         let mixed = |p: [u8; 4]| p[0] > 40 && p[2] > 40;
         let linear = pixel(3, 3);
-        assert!(mixed(linear), "linear blends across the texel boundary: {linear:?}");
+        assert!(
+            mixed(linear),
+            "linear blends across the texel boundary: {linear:?}"
+        );
         for x in 1..6 {
             let p = pixel(x, 8);
-            assert!(!mixed(p) && p[3] >= 254, "nearest pixel ({x}, 8) is one opaque texel: {p:?}");
+            assert!(
+                !mixed(p) && p[3] >= 254,
+                "nearest pixel ({x}, 8) is one opaque texel: {p:?}"
+            );
             if x != 3 {
-                assert_eq!(p[0] > 200, x < 3, "nearest pixel ({x}, 8) is red left of x 3, blue right: {p:?}");
+                assert_eq!(
+                    p[0] > 200,
+                    x < 3,
+                    "nearest pixel ({x}, 8) is red left of x 3, blue right: {p:?}"
+                );
             }
         }
     }
@@ -4769,12 +4919,21 @@ pub mod elliptical_backdrop_test_scene {
 
     /// The scene: a red page, and the filter over a 64 x 36 oval at (8, 8).
     pub fn scene() -> Scene {
-        let bounds = Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.)));
+        let bounds = Bounds::new(
+            point(ScaledPixels(8.), ScaledPixels(8.)),
+            size(ScaledPixels(64.), ScaledPixels(36.)),
+        );
         let full = ContentMask::from(Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
         ));
-        let red: Hsla = Rgba { r: 1., g: 0., b: 0., a: 1. }.into();
+        let red: Hsla = Rgba {
+            r: 1.,
+            g: 0.,
+            b: 0.,
+            a: 1.,
+        }
+        .into();
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds: full.bounds,
@@ -4806,7 +4965,11 @@ pub mod elliptical_backdrop_test_scene {
         let filtered = |p: [u8; 4]| p[0] < 200 && p[1] > 60;
         assert!(filtered(pixel(40, 26)), "centre {:?}", pixel(40, 26));
         assert!(!filtered(pixel(10, 10)), "box corner {:?}", pixel(10, 10));
-        assert!(!filtered(pixel(24, 9)), "above the elliptical arc {:?}", pixel(24, 9));
+        assert!(
+            !filtered(pixel(24, 9)),
+            "above the elliptical arc {:?}",
+            pixel(24, 9)
+        );
         assert!(filtered(pixel(12, 26)), "left tip {:?}", pixel(12, 26));
     }
 }
@@ -4827,7 +4990,13 @@ pub mod elliptical_shader_test_scene {
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(ScaledPixels(SIZE.0 as f32), ScaledPixels(SIZE.1 as f32)),
         ));
-        let white: Hsla = Rgba { r: 1., g: 1., b: 1., a: 1. }.into();
+        let white: Hsla = Rgba {
+            r: 1.,
+            g: 1.,
+            b: 1.,
+            a: 1.,
+        }
+        .into();
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds: full.bounds,
@@ -4835,10 +5004,14 @@ pub mod elliptical_shader_test_scene {
             background: white.into(),
             ..Default::default()
         });
-        let source = "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
+        let source =
+            "fn shade(input: ShaderInput) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
         let shader = scene.add_shader(&Shader::new(source), &[], ShaderInput::None, 1.);
         scene.insert_primitive(BackdropFilter {
-            bounds: Bounds::new(point(ScaledPixels(8.), ScaledPixels(8.)), size(ScaledPixels(64.), ScaledPixels(36.))),
+            bounds: Bounds::new(
+                point(ScaledPixels(8.), ScaledPixels(8.)),
+                size(ScaledPixels(64.), ScaledPixels(36.)),
+            ),
             content_mask: full,
             corner_radii: Corners::all(ScaledPixels(32.)),
             corner_radii_y: Corners::all(ScaledPixels(18.)),
@@ -4857,7 +5030,11 @@ pub mod elliptical_shader_test_scene {
         assert!(green(pixel(40, 26)), "centre {:?}", pixel(40, 26));
         assert!(green(pixel(12, 26)), "left tip {:?}", pixel(12, 26));
         assert!(!green(pixel(10, 10)), "box corner {:?}", pixel(10, 10));
-        assert!(!green(pixel(24, 9)), "above the elliptical arc {:?}", pixel(24, 9));
+        assert!(
+            !green(pixel(24, 9)),
+            "above the elliptical arc {:?}",
+            pixel(24, 9)
+        );
     }
 }
 
@@ -5967,9 +6144,18 @@ mod tests {
         assert!(!BlendMode::Multiply.clears_outside());
 
         assert_eq!(ColorFilter::LuminanceToAlpha.gpu(), (8, 0.));
-        assert!(close(luminance_to_alpha([1., 1., 1., 1.]), [0., 0., 0., 1.]));
-        assert!(close(luminance_to_alpha([0., 1., 0., 0.5]), [0., 0., 0., 0.3577]));
-        assert!(close(luminance_to_alpha([1., 0., 0., 1.]), [0., 0., 0., 0.2125]));
+        assert!(close(
+            luminance_to_alpha([1., 1., 1., 1.]),
+            [0., 0., 0., 1.]
+        ));
+        assert!(close(
+            luminance_to_alpha([0., 1., 0., 0.5]),
+            [0., 0., 0., 0.3577]
+        ));
+        assert!(close(
+            luminance_to_alpha([1., 0., 0., 1.]),
+            [0., 0., 0., 0.2125]
+        ));
     }
 
     #[test]
@@ -6375,7 +6561,11 @@ fn shade(input: ShaderInput) -> vec4<f32> {
         let full = ContentMask::from(bounds(0., 0., SIZE.0 as f32, SIZE.1 as f32));
         let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
         // Scale factor 2: the gradient's 8 logical pixels are 16 device pixels.
-        let input = if reads_backdrop { ShaderInput::Backdrop } else { ShaderInput::None };
+        let input = if reads_backdrop {
+            ShaderInput::Backdrop
+        } else {
+            ShaderInput::None
+        };
         let shader = scene.add_shader(&Shader::new(source), &bytes, input, 2.);
         scene.insert_primitive(BackdropFilter {
             bounds: at,
